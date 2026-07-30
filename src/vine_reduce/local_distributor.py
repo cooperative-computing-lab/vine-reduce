@@ -66,7 +66,7 @@ class LocalDistributor:
     def _dispatch(self) -> None:
         while self._pending and len(self._futures) < self._max_workers:
             _, _, result_id, func, args = heapq.heappop(self._pending)
-            dest_file = os.path.join(self._work_dir, f"{result_id}.pkl")
+            dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
             payload = cloudpickle.dumps((func, (dest_file, *args)))
             future = self._pool.submit(_run_cloudpickled, payload)
             self._futures[result_id] = future

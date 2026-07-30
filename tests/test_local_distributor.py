@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import pickle
-
 import pytest
 
+from vine_reduce import serialization
 from vine_reduce.defaults import default_chunk_to_args, default_executor, executor_wrapper
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.types import Chunk, Success
@@ -40,8 +39,7 @@ def test_submit_and_wait_round_trip(distributor):
 
     assert isinstance(outcome, Success)
     assert outcome.result_id == result_id
-    with open(outcome.file, "rb") as f:
-        assert pickle.load(f) == 5
+    assert serialization.load(outcome.file) == 5
 
 
 def test_wait_returns_none_when_nothing_pending(distributor):
@@ -52,11 +50,10 @@ def test_retrieve_copies_file(distributor, tmp_path):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
     outcome = distributor.wait(timeout=30)
 
-    dest = tmp_path / "copy.pkl"
+    dest = tmp_path / "copy.pkl.zst"
     distributor.retrieve(outcome.result_id, str(dest))
 
-    with open(dest, "rb") as f:
-        assert pickle.load(f) == 3
+    assert serialization.load(str(dest)) == 3
 
 
 def test_free_result_removes_file(distributor):

@@ -396,7 +396,7 @@ class Pipeline:
         should_retrieve = self._results_retrieve if is_final else self._checkpoint_retrieve
 
         if should_retrieve:
-            dest_path = os.path.join(dest_dir, f"{self.processor_name}__{uuid4().hex}.pkl")
+            dest_path = os.path.join(dest_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
             self._distributor.retrieve(new_item.source_result_id, dest_path)
             self._distributor.free_result(new_item.source_result_id)
             new_item.file = dest_path

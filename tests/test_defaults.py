@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import pickle
-
+from vine_reduce import serialization
 from vine_reduce.defaults import (
     default_datasets_to_chunks,
     executor_wrapper,
@@ -62,7 +61,7 @@ def test_default_datasets_to_chunks_reads_chunksize_fresh_per_file():
 
 
 def test_executor_wrapper_success(tmp_path):
-    dest = str(tmp_path / "out.pkl")
+    dest = str(tmp_path / "out.pkl.zst")
     chunk = Chunk("a.root", 0, 5)
     outcome = executor_wrapper(
         dest,
@@ -76,13 +75,12 @@ def test_executor_wrapper_success(tmp_path):
     )
     assert outcome.status == "success"
     assert outcome.file == dest
-    with open(dest, "rb") as f:
-        assert pickle.load(f) == 5
+    assert serialization.load(dest) == 5
     assert outcome.resources["wall_time_s"] >= 0
 
 
 def test_executor_wrapper_failure_captures_traceback(tmp_path):
-    dest = str(tmp_path / "out.pkl")
+    dest = str(tmp_path / "out.pkl.zst")
     chunk = Chunk("a.root", 0, 5)
     outcome = executor_wrapper(
         dest,
@@ -99,7 +97,7 @@ def test_executor_wrapper_failure_captures_traceback(tmp_path):
 
 
 def test_executor_wrapper_resource_exhaustion(tmp_path):
-    dest = str(tmp_path / "out.pkl")
+    dest = str(tmp_path / "out.pkl.zst")
     chunk = Chunk("a.root", 0, 5)
     outcome = executor_wrapper(
         dest,
@@ -117,31 +115,27 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
 def test_reducer_wrapper_folds_inputs(tmp_path):
     inputs = []
     for i, value in enumerate([1, 2, 3]):
-        path = str(tmp_path / f"in{i}.pkl")
-        with open(path, "wb") as f:
-            pickle.dump(value, f)
+        path = str(tmp_path / f"in{i}.pkl.zst")
+        serialization.dump(value, path)
         inputs.append(path)
 
-    dest = str(tmp_path / "out.pkl")
+    dest = str(tmp_path / "out.pkl.zst")
     outcome = reducer_wrapper(dest, sum_reducer, inputs, False, None)
     assert outcome.status == "success"
-    with open(dest, "rb") as f:
-        assert pickle.load(f) == 6
+    assert serialization.load(dest) == 6
 
 
 def test_reducer_wrapper_applies_postprocess_only_when_final(tmp_path):
     inputs = []
     for i, value in enumerate([1, 2]):
-        path = str(tmp_path / f"in{i}.pkl")
-        with open(path, "wb") as f:
-            pickle.dump(value, f)
+        path = str(tmp_path / f"in{i}.pkl.zst")
+        serialization.dump(value, path)
         inputs.append(path)
 
-    dest = str(tmp_path / "out.pkl")
+    dest = str(tmp_path / "out.pkl.zst")
     outcome = reducer_wrapper(dest, sum_reducer, inputs, True, double_postprocess)
     assert outcome.status == "success"
-    with open(dest, "rb") as f:
-        assert pickle.load(f) == 6  # (1+2) * 2
+    assert serialization.load(dest) == 6  # (1+2) * 2
 
 
 def test_make_default_is_result_true_only_when_all_events_covered():

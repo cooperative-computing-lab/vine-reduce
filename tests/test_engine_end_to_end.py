@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import pickle
 
 import pytest
 
-from vine_reduce import VineReduce
+from vine_reduce import VineReduce, serialization
 from vine_reduce.checkpoint_db import CheckpointDB, checksum_dataset
 from vine_reduce.local_distributor import LocalDistributor
 
@@ -23,8 +22,7 @@ def _read_only_result(results_dir, dataset_name):
     dataset_dir = os.path.join(results_dir, dataset_name)
     files = os.listdir(dataset_dir)
     assert len(files) == 1
-    with open(os.path.join(dataset_dir, files[0]), "rb") as f:
-        return pickle.load(f)
+    return serialization.load(os.path.join(dataset_dir, files[0]))
 
 
 def test_end_to_end_two_datasets_two_files_each(tmp_path, dataset_input, distributor):
@@ -57,9 +55,8 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     checkpoint_dir.mkdir()
     results_dir = tmp_path / "results" / "numbers"
     results_dir.mkdir(parents=True)
-    final_file = results_dir / "already_done.pkl"
-    with open(final_file, "wb") as f:
-        pickle.dump(999, f)
+    final_file = results_dir / "already_done.pkl.zst"
+    serialization.dump(999, str(final_file))
 
     db = CheckpointDB(str(checkpoint_dir / "vine_reduce.db"))
     db.dataset_changed("numbers", checksum_dataset(datasets["numbers"]))
@@ -80,4 +77,4 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     vr.compute()
 
     # unchanged: still just the pre-seeded final result, processor never ran
-    assert os.listdir(str(results_dir)) == ["already_done.pkl"]
+    assert os.listdir(str(results_dir)) == ["already_done.pkl.zst"]

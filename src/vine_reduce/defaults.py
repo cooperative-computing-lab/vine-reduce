@@ -4,9 +4,10 @@ Functions in this file run in two different places:
   - input_to_datasets, default_datasets_to_chunks, make_default_is_result:
     run locally, in the vine_reduce process.
   - default_chunk_to_args, default_executor, executor_wrapper, default_reducer,
-    reducer_wrapper: run remotely, on worker nodes. cloudpickle (rather than
-    stdlib pickle) is used to send them and their arguments to another
-    process or machine, so processor/reducer/etc. may be closures or lambdas.
+    reducer_wrapper: run remotely, on worker nodes. Results are written to
+    dest_file with vine_reduce.serialization (cloudpickle + zstd), so
+    processor/reducer/etc. may be closures or lambdas, and result files are
+    compressed on disk.
 """
 
 from __future__ import annotations
@@ -17,8 +18,7 @@ import time
 import traceback as traceback_module
 from typing import Any, Callable, Iterator
 
-import cloudpickle
-
+from . import serialization
 from .types import Chunk, RawOutcome
 
 
@@ -95,7 +95,7 @@ def executor_wrapper(
     executor: Callable[..., Any],
 ) -> RawOutcome:
     """Runs remotely. Calls chunk_to_args then executor, measures resources,
-    and cloudpickles the processing result to dest_file on success."""
+    and serializes the processing result to dest_file on success."""
     try:
 
         def run() -> Any:
@@ -116,8 +116,7 @@ def executor_wrapper(
             traceback=traceback_module.format_exc(),
         )
 
-    with open(dest_file, "wb") as f:
-        cloudpickle.dump(result, f)
+    serialization.dump(result, dest_file)
     return RawOutcome(status="success", resources=resources, file=dest_file)
 
 
@@ -133,17 +132,15 @@ def reducer_wrapper(
     is_final: bool,
     result_postprocess: Callable[[Any], Any] | None,
 ) -> RawOutcome:
-    """Runs remotely. Folds input_files (each a cloudpickled result) together
+    """Runs remotely. Folds input_files (each a serialized result) together
     with reducer, applies result_postprocess if this is a final result, and
-    cloudpickles the outcome to dest_file on success."""
+    serializes the outcome to dest_file on success."""
     try:
 
         def run() -> Any:
-            with open(input_files[0], "rb") as f:
-                acc = cloudpickle.load(f)
+            acc = serialization.load(input_files[0])
             for path in input_files[1:]:
-                with open(path, "rb") as f:
-                    other = cloudpickle.load(f)
+                other = serialization.load(path)
                 acc = reducer(acc, other)
                 del other
             if is_final and result_postprocess is not None:
@@ -162,8 +159,7 @@ def reducer_wrapper(
             traceback=traceback_module.format_exc(),
         )
 
-    with open(dest_file, "wb") as f:
-        cloudpickle.dump(result, f)
+    serialization.dump(result, dest_file)
     return RawOutcome(status="success", resources=resources, file=dest_file)
 
 

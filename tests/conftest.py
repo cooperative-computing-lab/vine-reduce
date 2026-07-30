@@ -29,7 +29,7 @@ class FakeDistributor:
 
     def submit(self, priority: int, category: str, func: Callable[..., Any], *args: Any) -> int:
         result_id = next(self._next_id)
-        dest_file = os.path.join(self._work_dir, f"{result_id}.pkl")
+        dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
         raw: RawOutcome = func(dest_file, *args)
         heapq.heappush(self._ready, (-priority, next(self._seq), result_id, raw))
         return result_id

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-import pickle
 
-from vine_reduce import defaults
+from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_db import CheckpointDB
 from vine_reduce.pipeline import Pipeline
 
@@ -83,8 +82,7 @@ def run_to_completion(pipeline, distributor, max_cycles=1000):
 
 def final_value(pipeline):
     assert len(pipeline.final_results) == 1
-    with open(pipeline.final_results[0].file, "rb") as f:
-        return pickle.load(f)
+    return serialization.load(pipeline.final_results[0].file)
 
 
 def test_pools_across_files_and_produces_one_final_result(fake_distributor, tmp_path):
@@ -147,9 +145,8 @@ def test_restart_skips_files_covered_by_a_non_final_checkpoint(fake_distributor,
 
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
-    seeded_file = checkpoint_dir / "seeded.pkl"
-    with open(seeded_file, "wb") as f:
-        pickle.dump(100, f)  # stands in for a's "already processed" partial result
+    seeded_file = checkpoint_dir / "seeded.pkl.zst"
+    serialization.dump(100, str(seeded_file))  # stands in for a's "already processed" result
     db.add_checkpoint("proc", "ds", ["a.root"], 5, 1.0, 1.0, False, str(seeded_file))
 
     pipeline, _ = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=10, db=db)
