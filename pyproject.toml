@@ -1,0 +1,96 @@
+[build-system]
+requires = ["setuptools>=45,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vine_reduce"
+version = "2025.12.1"
+description = "Dynamic MapReduce framework for data processing"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    {name = "Ben Tovar", email = "btovar@nd.edu"},
+]
+maintainers = [
+    {name = "Ben Tovar", email = "btovar@nd.edu"},
+]
+keywords = ["mapreduce", "data-processing", "distributed-computing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "awkward>=2.8.7",
+    "coffea>=2025.7.3",
+    "fsspec>=2026.7.0",
+    "fsspec-xrootd>=0.5.1",
+    "numpy>=2.4.6",
+    "rich>=14.2.0",
+    "uproot>=5.6.6",
+    "xrootd>=5.8.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+]
+conda = [
+    "ndcctools>=7.17.1",
+]
+
+[project.scripts]
+vine_reduce = "vine_reduce.main:main"
+
+[project.urls]
+Homepage = "https://github.com/btovar/vine_reduce"
+Repository = "https://github.com/btovar/vine_reduce.git"
+Documentation = "https://github.com/btovar/vine_reduce#readme"
+"Bug Tracker" = "https://github.com/btovar/vine_reduce/issues"
+
+[tool.setuptools_scm]
+write_to = "src/vine_reduce/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py313']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=vine_reduce --cov-report=term-missing"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+awkward = "==2.8.7"
+black = ">=21.0"
+coffea = "==2025.7.3"
+flake8 = ">=3.8"
+fsspec = ">=2026.7.0"
+fsspec-xrootd = ">=0.5.1"
+ndcctools = ">=7.17.1"
+numpy = ">=2.4.6"
+pytest = ">=6.0"
+pytest-cov = ">=2.0"
+python = ">=3.13"
+rich = ">=14.2.0"
+setuptools = "<81"
+uproot = ">=5.6.6"
+xrootd = ">=5.8.4"
+pixi-pack = ">=0.7.10,<0.8"
+
+[tool.pixi.pypi-dependencies]
+vine_reduce = { path = ".", editable = true }
+

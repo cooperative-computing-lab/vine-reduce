@@ -219,3 +219,39 @@ Success additionally carries:
   file str: path to the file, local to the worker node, where executor_wrapper/reducer_wrapper
             serialized its result.
 ```
+
+## Implementation Clarifications
+
+These resolve ambiguities in the plan above, decided during implementation:
+
+1. **Restart support**: Full restart-from-db is implemented. On startup, vine\_reduce reads
+   checkpoint rows for each (processor, dataset) from the sqlite db and skips files already
+   covered by a checkpoint. A per-dataset checksum is stored in the db; if the input dataset's
+   checksum changes, that dataset's checkpoints are discarded and it restarts from scratch.
+
+2. **Distributor API gains a fifth method**, `retrieve(result_id, dest_path)`, beyond the
+   submit/wait/free_result/hungry described above:
+   ```python
+   retrieve(result_id, dest_path): copy/materialize the file for a completed result_id to
+                                    dest_path, a path local to the vine_reduce process.
+   ```
+   vine\_reduce calls this (instead of assuming `Outcome.file` is directly readable) whenever
+   `checkpoint_retrieve` or `results_retrieve` is True. This keeps the interface correct for
+   distributors that don't share a filesystem with vine\_reduce, even though the local
+   distributor's worker processes do share one.
+
+3. **Reduction pooling across files**: once a file's chunks are all successfully processed, its
+   chunk results join a single pending pool for the (processor, dataset) pair (not reduced
+   file-by-file first). Whenever the pool reaches `reduction_size` items, the oldest
+   `reduction_size` are reduced together. When chunk generation for that pair is exhausted and
+   fewer than `reduction_size` items remain in the pool (including exactly one, e.g. a
+   single-chunk dataset), that remainder is still reduced/finalized as a smaller group — the
+   pool is always drained, it never stalls waiting for more input that isn't coming.
+
+4. **Checkpointing granularity**: `checkpoint_time`/`checkpoint_size` accumulate per reduction
+   lineage (the chain of reduction calls that produced a given pooled result), not globally per
+   (processor, dataset). Each pooled item tracks the file URLs it covers and the wall_time/memory
+   accumulated since its lineage was last checkpointed; crossing a threshold (or becoming a final
+   result) persists that item as a checkpoint row and resets its accumulator. When a new
+   checkpoint's inputs were themselves checkpoints, the superseded rows (and their files) are
+   deleted, per "checkpoints that are covered by other checkpoints ... should also be removed."

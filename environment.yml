@@ -1,0 +1,14 @@
+name: vine-cms-example-stack
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - awkward=2.8.7
+  - coffea=2025.7.3
+  - fsspec-xrootd=>0.5.1
+  - ndcctools>=7.17.1
+  - python>=3.13
+  - rich=>14.2.0
+  - uproot=>5.6.6
+  - xrootd=>5.8.4
+  - setuptools<81
