@@ -8,6 +8,9 @@ do. It is intentionally simple, not production-grade:
     be preempted by a higher-priority call submitted later.
   - "worker nodes" are local subprocesses that share vine_reduce's
     filesystem, so retrieve() is a plain file copy.
+  - func/args are cloudpickled before being handed to the pool (see
+    _run_cloudpickled below), so processor/reducer/etc. may be closures
+    or lambdas, not just module-level callables.
 """
 
 from __future__ import annotations
@@ -21,7 +24,19 @@ import tempfile
 from concurrent.futures import Future, ProcessPoolExecutor
 from typing import Any, Callable
 
+import cloudpickle
+
 from .types import Outcome, RawOutcome
+
+
+def _run_cloudpickled(payload: bytes) -> Any:
+    """Runs in the worker subprocess. ProcessPoolExecutor pickles whatever it
+    is given with stdlib pickle, which cannot handle closures or lambdas;
+    cloudpickle can, so func/args are cloudpickled into a byte string here
+    and only that string (plus this module-level function) crosses the
+    stdlib-pickle boundary."""
+    func, args = cloudpickle.loads(payload)
+    return func(*args)
 
 
 class LocalDistributor:
@@ -52,7 +67,8 @@ class LocalDistributor:
         while self._pending and len(self._futures) < self._max_workers:
             _, _, result_id, func, args = heapq.heappop(self._pending)
             dest_file = os.path.join(self._work_dir, f"{result_id}.pkl")
-            future = self._pool.submit(func, dest_file, *args)
+            payload = cloudpickle.dumps((func, (dest_file, *args)))
+            future = self._pool.submit(_run_cloudpickled, payload)
             self._futures[result_id] = future
             self._result_id_of[future] = result_id
 

@@ -4,19 +4,20 @@ Functions in this file run in two different places:
   - input_to_datasets, default_datasets_to_chunks, make_default_is_result:
     run locally, in the vine_reduce process.
   - default_chunk_to_args, default_executor, executor_wrapper, default_reducer,
-    reducer_wrapper: run remotely, on worker nodes. They must be plain,
-    picklable, module-level callables (no closures) since a distributor may
-    need to send them to another process or machine.
+    reducer_wrapper: run remotely, on worker nodes. cloudpickle (rather than
+    stdlib pickle) is used to send them and their arguments to another
+    process or machine, so processor/reducer/etc. may be closures or lambdas.
 """
 
 from __future__ import annotations
 
 import json
-import pickle
 import resource
 import time
 import traceback as traceback_module
 from typing import Any, Callable, Iterator
+
+import cloudpickle
 
 from .types import Chunk, RawOutcome
 
@@ -94,7 +95,7 @@ def executor_wrapper(
     executor: Callable[..., Any],
 ) -> RawOutcome:
     """Runs remotely. Calls chunk_to_args then executor, measures resources,
-    and pickles the processing result to dest_file on success."""
+    and cloudpickles the processing result to dest_file on success."""
     try:
 
         def run() -> Any:
@@ -116,7 +117,7 @@ def executor_wrapper(
         )
 
     with open(dest_file, "wb") as f:
-        pickle.dump(result, f)
+        cloudpickle.dump(result, f)
     return RawOutcome(status="success", resources=resources, file=dest_file)
 
 
@@ -132,17 +133,17 @@ def reducer_wrapper(
     is_final: bool,
     result_postprocess: Callable[[Any], Any] | None,
 ) -> RawOutcome:
-    """Runs remotely. Folds input_files (each a pickled result) together with
-    reducer, applies result_postprocess if this is a final result, and
-    pickles the outcome to dest_file on success."""
+    """Runs remotely. Folds input_files (each a cloudpickled result) together
+    with reducer, applies result_postprocess if this is a final result, and
+    cloudpickles the outcome to dest_file on success."""
     try:
 
         def run() -> Any:
             with open(input_files[0], "rb") as f:
-                acc = pickle.load(f)
+                acc = cloudpickle.load(f)
             for path in input_files[1:]:
                 with open(path, "rb") as f:
-                    other = pickle.load(f)
+                    other = cloudpickle.load(f)
                 acc = reducer(acc, other)
                 del other
             if is_final and result_postprocess is not None:
@@ -162,7 +163,7 @@ def reducer_wrapper(
         )
 
     with open(dest_file, "wb") as f:
-        pickle.dump(result, f)
+        cloudpickle.dump(result, f)
     return RawOutcome(status="success", resources=resources, file=dest_file)
 
 

@@ -1,6 +1,6 @@
-"""Picklable, module-level toy functions shared across tests. They must be
-importable by name so ProcessPoolExecutor can send them to worker
-subprocesses (closures/lambdas can't be pickled)."""
+"""Toy functions shared across tests. Kept as plain, importable, module-level
+callables (cloudpickle can serialize closures/lambdas too, but these are
+reused across several test modules, so a shared name is simpler)."""
 
 from __future__ import annotations
 
