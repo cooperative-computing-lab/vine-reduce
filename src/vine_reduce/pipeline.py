@@ -255,6 +255,7 @@ class Pipeline:
         result_id = self._distributor.submit(
             self._process_priority,
             self._process_category,
+            "processor",
             self._executor_wrapper,
             self._processor,
             chunk,
@@ -290,6 +291,7 @@ class Pipeline:
         result_id = self._distributor.submit(
             self._reduce_priority,
             self._reduce_category,
+            "reducer",
             self._reducer_wrapper,
             self._reducer,
             [item.file for item in group],

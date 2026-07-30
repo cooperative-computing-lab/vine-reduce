@@ -7,3 +7,4 @@ __pycache__/
 _version.py
 checkpoints/
 results/
+vine-run-info/

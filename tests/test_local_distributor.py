@@ -21,6 +21,7 @@ def _submit_chunk(distributor, priority, chunk):
     return distributor.submit(
         priority,
         "test:process",
+        "processor",
         executor_wrapper,
         count_events,
         chunk,

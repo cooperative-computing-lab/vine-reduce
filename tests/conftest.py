@@ -27,7 +27,9 @@ class FakeDistributor:
         self._ready: list[tuple[int, int, int, RawOutcome]] = []
         self._files: dict[int, str] = {}
 
-    def submit(self, priority: int, category: str, func: Callable[..., Any], *args: Any) -> int:
+    def submit(
+        self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
+    ) -> int:
         result_id = next(self._next_id)
         dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
         raw: RawOutcome = func(dest_file, *args)

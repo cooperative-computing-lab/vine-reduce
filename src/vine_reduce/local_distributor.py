@@ -57,7 +57,9 @@ class LocalDistributor:
         self._result_id_of: dict[Future, int] = {}
         self._files: dict[int, str] = {}  # result_id -> file, for completed Successes
 
-    def submit(self, priority: int, category: str, func: Callable[..., Any], *args: Any) -> int:
+    def submit(
+        self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
+    ) -> int:
         result_id = next(self._next_id)
         heapq.heappush(self._pending, (-priority, next(self._seq), result_id, func, args))
         self._dispatch()

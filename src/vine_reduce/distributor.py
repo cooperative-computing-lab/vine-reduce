@@ -15,16 +15,27 @@ picks the path, it only ever sees it echoed back on `Outcome.file`.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from .types import Outcome
 
+TaskKind = Literal["processor", "reducer"]
+
 
 class Distributor(Protocol):
-    def submit(self, priority: int, category: str, func: Callable[..., Any], *args: Any) -> int:
+    def submit(
+        self,
+        priority: int,
+        category: str,
+        kind: TaskKind,
+        func: Callable[..., Any],
+        *args: Any,
+    ) -> int:
         """Submit a call for remote execution. Larger priority runs first.
         category groups calls belonging to the same processing/reduction set
-        (e.g. for logging or scheduling heuristics). Returns a result_id."""
+        (e.g. for logging or scheduling heuristics). kind says whether this is
+        a processor or reducer call, so a distributor can apply different
+        resource requests to each. Returns a result_id."""
         ...
 
     def wait(self, timeout: float | None = None) -> Outcome | None:

@@ -158,7 +158,7 @@ function: reducer\_wrapper: Calls the reduction function and generates its outco
 A distributor has these methods:
 
 ```python
-result_id = submit(priority, category, executor_wrapper | reducer\_wrapper, *args): submit a processor or reduction function call. Category is a string that identifies functions of the same processing/reduction set. Returns a result_id, used later to free_result.
+result_id = submit(priority, category, kind, executor_wrapper | reducer\_wrapper, *args): submit a processor or reduction function call. Category is a string that identifies functions of the same processing/reduction set. kind is "processor" or "reducer", letting a distributor apply different resource requests to each. Returns a result_id, used later to free_result.
 outcome = wait(timeout): wait for a result to be available and return its Outcome (RuntimeFailure | ResourceExhaustion | Success). On timeout return None. outcome.result_id identifies which submit() call this outcome corresponds to.
 free_result(result_id): remove resources associated with result_id
 chunks_wanted = hungry(): number of additional chunks the distributor could handle given the current resources.
@@ -280,3 +280,64 @@ These resolve ambiguities in the plan above, decided during implementation:
      flexible processor shapes (list/dict/`.process`-object) - callers pass `dict[str, Callable]`
      directly, matching base VineReduce; and preprocessing-time `step_size`/`task_splitter` chunk
      splitting - superseded by VineReduce's existing `chunksize` + resource-exhaustion halving.
+
+7. **`TaskVineDistributor`** (`src/vine_reduce/taskvine_distributor.py`) implements the
+   `Distributor` protocol on top of `ndcctools.taskvine`, for running across a real cluster
+   instead of local subprocesses. Modeled after an older taskvine-specific prototype (a
+   `DynamicDataReduction`/`vine.Manager` class that did its own chunking, checkpointing, and
+   reduction bookkeeping directly against taskvine), but only the distributor-level mechanics
+   were kept - chunking/checkpointing/reduction-pooling stay in pipeline.py, unchanged. Resolved
+   via `AskUserQuestion` since these are genuine architecture decisions, not derivable from
+   PLAN.md or the prototype alone:
+   - **Manager-only, external workers**: the constructor starts a `vine.Manager` and nothing
+     else; `vine_worker` processes/factories/batch submission are the caller's responsibility,
+     the normal way TaskVine is used. (Rejected: auto-spawning local workers like
+     `LocalDistributor` does, since that's extra process-management complexity for what's meant
+     to be the "real cluster" distributor, not a self-contained dev/test one.)
+   - **File-passing via opaque tokens**: `distributor.py`'s protocol passes result "files" around
+     as plain strings that `reducer_wrapper` opens directly - fine for `LocalDistributor` since
+     its subprocesses share vine_reduce's filesystem, but TaskVine workers generally don't share
+     one with the manager or each other. Every result is a `manager.declare_temp()` file (kept
+     at/near the worker, never pulled back automatically); `Outcome.file` is an opaque token this
+     class mints (e.g. `"result_7.p"`), not a real path. When that token later appears inside a
+     later `submit()` call's args (`reducer_wrapper`'s `input_files` list), `_remap_files`
+     recognizes it, attaches the underlying `vine.File` as a task input under a fresh sandbox
+     name, and substitutes that name into the args actually sent - so `reducer_wrapper` opens a
+     name that exists in its own sandbox, never the manager-side token. `retrieve()` is the only
+     place bytes are actually pulled to the manager, via `manager.fetch_file()` +
+     `File.contents()` (confirmed empirically to be binary-safe; `Manager.fetch_file()`'s own
+     return value is not - it round-trips through a C string and truncates on embedded NUL
+     bytes). (Rejected: extending the `Distributor` protocol with an explicit
+     "as-input" method, to keep `distributor.py`/`pipeline.py` and `LocalDistributor` untouched.)
+   - **Infra-level resource exhaustion is mapped, not just Python-level**: TaskVine's resource
+     monitor (`enable_monitoring(watchdog=True)`, on unconditionally) can kill and report a task
+     that overruns its resource allocation - something `LocalDistributor`'s plain
+     `ProcessPoolExecutor` can't detect at all. `wait()` checks `task.successful()` first; only
+     then does it trust the `RawOutcome` that `executor_wrapper`/`reducer_wrapper` returned
+     (their own in-process exception handling). Otherwise it maps TaskVine's own `task.result`
+     string (`"resource exhaustion"`, `"max wall time"`, `"disk alloc full"` -> `ResourceExhaustion`;
+     anything else -> `RuntimeFailure`) so pipeline.py's chunksize/reduction_size halving is
+     reachable from real cluster failures, not just simulated `MemoryError`.
+   - Resource requests are two fixed per-distributor-instance constructor args,
+     `resources_processor`/`resources_reducer` (each an optional `{"cores": ..., "memory_mb": ...,
+     "disk_mb": ...}` dict; any key left out is simply not passed through, so TaskVine falls back
+     to its own default for that resource). These are applied via
+     `manager.set_category_resources_max(category, rmd)` - a category-level TaskVine setting, not
+     a per-task one - the first time each distinct category string is seen in `submit()`, not on
+     every task. `task.set_category(category)` uses the caller-supplied category string as-is
+     (e.g. `"{processor_name}:{dataset_name}:process"` from pipeline.py); `kind` (see below), not
+     the category string, selects which of `resources_processor`/`resources_reducer` gets applied
+     to it. No per-category autolabeling/tuning (e.g. dynmapred's `"min waste"` category modes).
+     An optional poncho `environment` is likewise a single fixed constructor arg applied to every
+     task.
+   - **`submit()` gains a `kind` parameter** (`"processor"` or `"reducer"`, see `distributor.py`'s
+     `TaskKind`), inserted between `category` and `func`, so `TaskVineDistributor` knows which of
+     `resources_processor`/`resources_reducer` to apply without having to infer it from the
+     category string's naming convention or from comparing `func` against
+     `executor_wrapper`/`reducer_wrapper`. This changes the `Distributor` protocol itself, so
+     `LocalDistributor` and `FakeDistributor` (tests/conftest.py) also take and ignore `kind` -
+     only `TaskVineDistributor` acts on it. Chosen over inferring from category suffix or from
+     `func` identity, both of which would work today but rely on conventions the protocol doesn't
+     enforce.
+   - Tested against a real `vine_worker` subprocess (external, per the design above), not a fake;
+     `tests/test_taskvine_distributor.py` is skipped if `vine_worker` isn't on `PATH`.
