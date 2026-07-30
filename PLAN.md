@@ -255,3 +255,28 @@ These resolve ambiguities in the plan above, decided during implementation:
    result) persists that item as a checkpoint row and resets its accumulator. When a new
    checkpoint's inputs were themselves checkpoints, the superseded rows (and their files) are
    deleted, per "checkpoints that are covered by other checkpoints ... should also be removed."
+
+5. **`VineReduce.input` accepts a dict, not just a file path**: the field type is
+   `str | dict[str, Any]`, and `default_input_to_datasets` returns the dict as-is when it isn't a
+   string, instead of always treating it as a json path. This lets specializations pass an
+   already-in-memory dataset description straight through, without a serialize/reload round trip.
+
+6. **`VineReduceCoffea(VineReduce)`** (`src/vine_reduce/coffea.py`) specializes vine\_reduce for
+   coffea workflows over NanoEvents. It only supplies the coffea-specific pieces; chunking,
+   checkpointing, and restart are inherited unchanged:
+   - `input_to_datasets` defaults to `coffea_input_to_datasets`, which converts the output of
+     coffea's own `preprocess()` (files described by `{"num_entries": ..., "steps": ..., "uuid":
+     ...}`) into vine\_reduce's `{url: num_entries}` shape. Accepts that dict directly, or a path
+     to a json file holding it.
+   - `chunk_to_args`/`executor` are not dataclass fields the caller sets directly; `__post_init__`
+     builds them from `schema`/`mode`/`uproot_options`/`object_path` (chunk_to_args opens
+     `NanoEventsFactory.from_root` over `[chunk.start, chunk.stop)`) and from `processor_args`
+     (executor calls `processor(events, **processor_args)` then recursively materializes any
+     virtual awkward arrays in the result before it's pickled).
+   - `reducer` defaults to `default_reducer`, a coffea-flavored accumulator (handles addables,
+     `MutableSet`, and recursive `MutableMapping` merging) since base VineReduce's `a += b` default
+     can't merge the dict-shaped outputs coffea processors typically return.
+   - Deliberately *not* ported from the older taskvine-specific prototype this was modeled after:
+     flexible processor shapes (list/dict/`.process`-object) - callers pass `dict[str, Callable]`
+     directly, matching base VineReduce; and preprocessing-time `step_size`/`task_splitter` chunk
+     splitting - superseded by VineReduce's existing `chunksize` + resource-exhaustion halving.

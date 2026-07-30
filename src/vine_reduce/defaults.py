@@ -22,10 +22,13 @@ from . import serialization
 from .types import Chunk, RawOutcome
 
 
-def default_input_to_datasets(input_path: str) -> dict[str, Any]:
-    """Loads the input description as a json file. Expected shape:
+def default_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]:
+    """Loads the input description, either as an already-parsed dict or from
+    a json file path. Expected shape in both cases:
     {dataset_name: {"metadata": {...}, "files": {url: num_entries, ...}}}."""
-    with open(input_path) as f:
+    if isinstance(input_data, dict):
+        return input_data
+    with open(input_data) as f:
         return json.load(f)
 
 

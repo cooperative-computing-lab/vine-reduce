@@ -38,8 +38,8 @@ def _resolve_sized_config(
 @dataclass
 class VineReduce:
     processors: dict[str, Callable[[Any], Any]]
-    input: str
-    input_to_datasets: Callable[[str], dict[str, Any]] | None = None
+    input: str | dict[str, Any]
+    input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] | None = None
     datasets_to_chunks: Callable | None = None
     chunk_to_args: Callable = defaults.default_chunk_to_args
     executor: Callable = defaults.default_executor
