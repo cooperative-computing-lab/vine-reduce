@@ -6,25 +6,25 @@ This file describes a building plan for the vine reduce python module to generat
 
 Typical HEP workflows consists on orthogonal processing functions applied to collision events. Processing functions and collision events are naturally parallel in that one processing function does not affect others, nor the processing of an event affect another. Since the processing of an event is very fast, events are grouped into sets called chunks and processing functions are applied to the chunks. The data is organized into datasets. A dataset consists of a name, metadata and a set of URLs. The URLs identify files that contain the events. Events in a file are numbered from [0, num\_entries) from which chunks can be formed. 
 
-### Generating Final Results and Accumulation
+### Generating Final Results and Reduction
 
-The result of processing functions is not used as is, but they are merged together with an accumulator function. Accumulators are associative, distributive, commutative, and generate the same data type as processing function. No two chunks of different datasets should be accumulated together, and chunks of a file should not be accumulated until all the chunks of that file has been succesfully processed. Chunks never cross file boundaries. In the default case each dataset will generate a single result from final accumualtion, however some workflows generate several results per dataset.
+The result of processing functions is not used as is, but they are merged together with an reducer function. Reducers are associative, distributive, commutative, and generate the same data type as processing function. No two chunks of different datasets should be reduced together, and chunks of a file should not be reduced until all the chunks of that file has been succesfully processed. Chunks never cross file boundaries. In the default case each dataset will generate a single result from final reduction, however some workflows generate several results per dataset.
 
-Whether a dataset generates one or several final results is decided by an `is_result` function. Before an accumulation call for a given (processor, dataset) is submitted, `is_result(num_events, total_time, total_memory)` is invoked, where the three arguments describe the group of not-yet-final results about to be accumulated: the number of events they cover, their total execution time, and their total size in memory (see Outcome.resources below). If `is_result` returns True, that group is accumulated one final time, `result_postprocess` is applied to the output, and the output becomes a final result that is no longer eligible for further accumulation; a new group then starts forming for the same (processor, dataset). The default `is_result` returns True only once all chunks of the dataset have been consumed and accumulated, i.e. one final result per dataset.
+Whether a dataset generates one or several final results is decided by an `is_result` function. Before an reduction call for a given (processor, dataset) is submitted, `is_result(num_events, total_time, total_memory)` is invoked, where the three arguments describe the group of not-yet-final results about to be reduced: the number of events they cover, their total execution time, and their total size in memory (see Outcome.resources below). If `is_result` returns True, that group is reduced one final time, `result_postprocess` is applied to the output, and the output becomes a final result that is no longer eligible for further reduction; a new group then starts forming for the same (processor, dataset). The default `is_result` returns True only once all chunks of the dataset have been consumed and reduced, i.e. one final result per dataset.
 
-Accumulation functions accumulate accumlation\_size results per call. accumulation\_size should be at least two, but for the edge case of a dataset that consists of a single chunk. In such case, the accumulation task functions like a final checkpoint (see next). accumulation\_size is managed per processing function x dataset, with a default for all of 10. accumulation\_size should be halved if the distributor reports resource exhaustion. The default accumulator is `f(a, b): a += b; return a`, called as many times as necessary. Care should be taken so that arguments not needed anymore are freed to reduce memory consumption.
+Reduction functions reduce reduction\_size results per call. reduction\_size should be at least two, but for the edge case of a dataset that consists of a single chunk. In such case, the reduction task functions like a final checkpoint (see next). reduction\_size is managed per processing function x dataset, with a default for all of 10. reduction\_size should be halved if the distributor reports resource exhaustion. The default reducer is `f(a, b): a += b; return a`, called as many times as necessary. Care should be taken so that arguments not needed anymore are freed to reduce memory consumption.
 
 ## Temporary Results, Checkpoints, and Results Log
 
-It is assumed that any intermediate result from processing functions or accumulations that are not a final results are temporary. Checkpoints may be generated for a (processor, dataset) once either of two thresholds is crossed: checkpoint\_time (cumulative wall\_time, in seconds) or checkpoint\_size (cumulative memory, in MB). Both are summed from the `resources` field of the Outcomes (see below) of results not yet covered by a checkpoint; either threshold, when set, can independently trigger a checkpoint, and a threshold left as None disables that trigger. vine\_reduce itself does not generate the checkpoint, just manages it and tells the distributor to generate it. Final results are a special kind of checkpoint where their events are not considered for accumualtion anymore (see `is_result` above). Once a checkpoint is succefully generated, the temporary results related to it can be removed from the cluster via free\_result. Checkpoints that are covered by other checkpoints as results are merged should be also removed from the cluster.
+It is assumed that any intermediate result from processing functions or reductions that are not a final results are temporary. Checkpoints may be generated for a (processor, dataset) once either of two thresholds is crossed: checkpoint\_time (cumulative wall\_time, in seconds) or checkpoint\_size (cumulative memory, in MB). Both are summed from the `resources` field of the Outcomes (see below) of results not yet covered by a checkpoint; either threshold, when set, can independently trigger a checkpoint, and a threshold left as None disables that trigger. vine\_reduce itself does not generate the checkpoint, just manages it and tells the distributor to generate it. Final results are a special kind of checkpoint where their events are not considered for reduction anymore (see `is_result` above). Once a checkpoint is succefully generated, the temporary results related to it can be removed from the cluster via free\_result. Checkpoints that are covered by other checkpoints as results are merged should be also removed from the cluster.
 
 When checkpoints are generated, information to a sqlite database ("the db from now on") should be updated. This database should be used so that, if the workflow is interrupted, it can be restarted from where it left off.
 
-From the distributor perspective there is a distiction between a workflow result and function outcome. A workflow result is the data the user is interested in producing. A function outcome is a union data type that may be success, failure, or resource exhaustion, and every variant carries a `result_id` (matching the id returned by the `submit` call it answers) and a `resources` dictionary reporting what the task actually used, e.g. `{"cores": ..., "memory_mb": ..., "wall_time_s": ...}`; this is measured by executor\_wrapper/accumulator\_wrapper using core python modules where possible (e.g. `resource.getrusage`, `time.monotonic`). The failure case additionally contains the traceback of the processing/accumualtion function when it failed and should contain the information for debugging. vine\_reduce itself responds to function outcomes and not workflow results. Workflow results should never be read into memory by vine\_reduce, only remotely by the distributor because they may be too large in terms of memory or deserialization time.
+From the distributor perspective there is a distiction between a workflow result and function outcome. A workflow result is the data the user is interested in producing. A function outcome is a union data type that may be success, failure, or resource exhaustion, and every variant carries a `result_id` (matching the id returned by the `submit` call it answers) and a `resources` dictionary reporting what the task actually used, e.g. `{"cores": ..., "memory_mb": ..., "wall_time_s": ...}`; this is measured by executor\_wrapper/reducer\_wrapper using core python modules where possible (e.g. `resource.getrusage`, `time.monotonic`). The failure case additionally contains the traceback of the processing/reduction function when it failed and should contain the information for debugging. vine\_reduce itself responds to function outcomes and not workflow results. Workflow results should never be read into memory by vine\_reduce, only remotely by the distributor because they may be too large in terms of memory or deserialization time.
 
 ## Priorities
 
-All processing functions of the same processor per dataset will have the same priority for execution (the larger the integer number, the better priority). A processor declared earlier will have better priority than a later one. Accumulation functions function in the same way, only that they have better priority than any processing function. The purpose of this priority is to finish processing a (processor, dataset) before moving to the next one, but allow overlapping on long tails if there are resources available.
+All processing functions of the same processor per dataset will have the same priority for execution (the larger the integer number, the better priority). A processor declared earlier will have better priority than a later one. Reduction functions function in the same way, only that they have better priority than any processing function. The purpose of this priority is to finish processing a (processor, dataset) before moving to the next one, but allow overlapping on long tails if there are resources available.
 
 ## Chunksize
 
@@ -38,7 +38,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 │ input description (file, user given)                                         │
 │   │                                                                          │
 │   ▼                                                                          │
-│ input_to_dataset()                                                           │
+│ input_to_datasets()                                                          │
 │   │ ──► datasets {name: {metadata, files: {url: num_entries}}}               │
 │   ▼                                                                          │
 │ datasets_to_chunks()   generator, restarted per processor                    │
@@ -47,7 +47,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 │   │     max_chunks_cycle; chunksize halved on resource exhaustion            │
 │   ▼                                                                          │
 │ is_result(num_events, total_time, total_memory)                              │
-│   │ ──► decides: keep accumulating, or emit a final result                   │
+│   │ ──► decides: keep reducing, or emit a final result                       │
 │   ▼                                                                          │
 │ checkpoint logic (checkpoint_time / checkpoint_size thresholds)              │
 │   ├──► sqlite db          (progress, checksums, restart state)               │
@@ -58,7 +58,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 └──────────────────────────────────────────────────────────────────────────────┘
                              │
                              │  submit(priority, category, executor_wrapper
-                             │         | accumulator_wrapper, ...)
+                             │         | reducer_wrapper, ...)
                              ▼
         distributor dispatches the call to a worker node
                              ▲
@@ -82,10 +82,10 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 │                                                                              │
 │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─      │
 │                                                                              │
-│ accumulator_wrapper(accumulator, results, is_final)                          │
+│ reducer_wrapper(reducer, results, is_final)                                  │
 │   │                                                                          │
 │   ▼                                                                          │
-│ accumulator(a, b) ──► accumulated result                                     │
+│ reducer(a, b) ──► reduced result                                             │
 │   │                                                                          │
 │   ▼  (only if is_result() returned True for this group)                      │
 │ result_postprocess(result)                                                   │
@@ -99,7 +99,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 
 data:     input description:  an arbitrary text file that describes dataset, files and metadata per dataset.
                               User given.
-function: input\_to\_dataset: converts input description into a dictionary where keys are datasets, and
+function: input\_to\_datasets: converts input description into a dictionary where keys are datasets, and
                               values are dictionaries with metadata and files values. The value of the key
                               files is also a dictionary where keys are urls and values are (at least)
                               num\_entries. This function executes locally with the process running vine\_reduce.
@@ -141,15 +141,15 @@ function: executor\_wrapper   calls chunk\_to\_args and executor as above, and g
                               this file on Success, not the result itself, so vine\_reduce never has to
                               deserialize or hold workflow results in memory.
 function: is_result           Decides whether the group of not-yet-final results about to be
-                              accumulated for a (processor, dataset) should become a final result.
+                              reduced for a (processor, dataset) should become a final result.
                               Called locally by vine\_reduce with (num\_events, total\_time,
-                              total\_memory) before submitting that accumulation call, using the
+                              total\_memory) before submitting that reduction call, using the
                               resources reported in the Outcomes of the results being merged.
                               This function executes locally with the process running vine\_reduce.
-function: result\_postprocess An optional function to apply to the result of accumulations that are 
+function: result\_postprocess An optional function to apply to the result of reductions that are 
                               final results (i.e., where is_result returned True).
                               This function is user defined and executed remotely at the worker nodes.
-function: accumulator\_wrapper: Calls the accumulation function and generates its outcome as needed.
+function: reducer\_wrapper: Calls the reduction function and generates its outcome as needed.
                               If succesful, and after applying result\_postprocess if this is a final
                               result, it writes the result (not the outcome) to a file given as an argument.
 
@@ -158,7 +158,7 @@ function: accumulator\_wrapper: Calls the accumulation function and generates it
 A distributor has these methods:
 
 ```python
-result_id = submit(priority, category, executor_wrapper | accumualtor\_wrapper, *args): submit a processor or accumulation function call. Category is a string that identifies functions of the same processing/accumulation set. Returns a result_id, used later to free_result.
+result_id = submit(priority, category, executor_wrapper | reducer\_wrapper, *args): submit a processor or reduction function call. Category is a string that identifies functions of the same processing/reduction set. Returns a result_id, used later to free_result.
 outcome = wait(timeout): wait for a result to be available and return its Outcome (RuntimeFailure | ResourceExhaustion | Success). On timeout return None. outcome.result_id identifies which submit() call this outcome corresponds to.
 free_result(result_id): remove resources associated with result_id
 chunks_wanted = hungry(): number of additional chunks the distributor could handle given the current resources.
@@ -175,16 +175,16 @@ input_to_datasets Optional[Callable]: Convert input into the dictionary of datas
 datasets_to_chunks Optional[Generator[Chunk]]: Generate chunks per dataset. Reset per processor.
 chunk_to_args Callable: Instantiate chunks.
 executor Optional[Callable]: Call processor on instantiated chunks
-accumulator Optional[Callable]: Function to merge to results together.
-accumulation_size int = 10: Results to accumulate together in a single accumualtion call. 
+reducer Optional[Callable]: Function to merge to results together.
+reduction_size int = 10: Results to reduce together in a single reduction call. 
 is_result Optional[Callable] = None: is_result(num_events, total_time, total_memory) decides whether
-                               the output of an accumulation call for a (processor, dataset) is a
-                               final result, or should keep being accumulated with later results.
+                               the output of an reduction call for a (processor, dataset) is a
+                               final result, or should keep being reduced with later results.
                                Default: True only once all chunks of the dataset are consumed.
 result_postprocess Callable: Function to apply to results that are final results.
-checkpoint_time Optional[int]: Total wall_time (seconds) of results in an accumulation not yet
+checkpoint_time Optional[int]: Total wall_time (seconds) of results in an reduction not yet
                                covered by a checkpoint that would trigger a checkpoint.
-checkpoint_size Optional[int]: Total memory (MB) of results in an accumulation not yet covered
+checkpoint_size Optional[int]: Total memory (MB) of results in an reduction not yet covered
                                by a checkpoint that would trigger a checkpoint.
 checkpoint_dir str = "checkpoints": Local directory to write checkpoints.
 checkpoint_retrieve bool = True: Whether the distributor should copy the checkpoints to checkpoint_dir.
@@ -209,13 +209,13 @@ Outcome: Union of RuntimeFailure, ResourceExhaustion, Success. All variants carr
   result_id: id returned by the submit() call this outcome corresponds to.
   resources Dict[str, Any]: resources used by the task, e.g.
                             {"cores": ..., "memory_mb": ..., "wall_time_s": ...}.
-                            Measured by executor_wrapper/accumulator_wrapper using core python
+                            Measured by executor_wrapper/reducer_wrapper using core python
                             modules where possible (e.g. resource.getrusage, time.monotonic).
 
 RuntimeFailure additionally carries:
-  traceback str: captured traceback of the processing/accumulation function failure.
+  traceback str: captured traceback of the processing/reduction function failure.
 
 Success additionally carries:
-  file str: path to the file, local to the worker node, where executor_wrapper/accumulator_wrapper
+  file str: path to the file, local to the worker node, where executor_wrapper/reducer_wrapper
             serialized its result.
 ```
