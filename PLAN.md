@@ -32,6 +32,71 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 
 ## Data Flow
 
+```
+┌─ LOCAL  (vine_reduce process) ───────────────────────────────────────────────┐
+│                                                                              │
+│ input description (file, user given)                                         │
+│   │                                                                          │
+│   ▼                                                                          │
+│ input_to_dataset()                                                           │
+│   │ ──► datasets {name: {metadata, files: {url: num_entries}}}               │
+│   ▼                                                                          │
+│ datasets_to_chunks()   generator, restarted per processor                    │
+│   │ ──► Chunk(url, start, stop)                                              │
+│   │     throttled by distributor.hungry(), max_chunks_active,                │
+│   │     max_chunks_cycle; chunksize halved on resource exhaustion            │
+│   ▼                                                                          │
+│ is_result(num_events, total_time, total_memory)                              │
+│   │ ──► decides: keep accumulating, or emit a final result                   │
+│   ▼                                                                          │
+│ checkpoint logic (checkpoint_time / checkpoint_size thresholds)              │
+│   ├──► sqlite db          (progress, checksums, restart state)               │
+│   ├──► distributor.free_result(result_id)  (superseded temp results)         │
+│   └──► checkpoint_dir/ , results_dir/  (distributor copies files here        │
+│         if checkpoint_retrieve / results_retrieve is True)                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                             │
+                             │  submit(priority, category, executor_wrapper
+                             │         | accumulator_wrapper, ...)
+                             ▼
+        distributor dispatches the call to a worker node
+                             ▲
+                             │  wait() ──► Outcome(result_id, resources, ...)
+                             │
+┌─ REMOTE  (worker nodes, one instance per submitted call) ────────────────────┐
+│                                                                              │
+│ executor_wrapper(chunk, dataset_metadata, distributor_metadata,              │
+│                   executor_metadata)                                         │
+│   │                                                                          │
+│   ▼                                                                          │
+│ chunk_to_args(chunk, dataset_metadata, distributor_metadata) ──► args        │
+│   │                                                                          │
+│   ▼                                                                          │
+│ executor(processor, args, dataset_metadata, distributor_metadata,            │
+│          executor_metadata)                                                  │
+│   │ ──► processor(args) ──► processing result                                │
+│   ▼                                                                          │
+│ result serialized to a file local to the worker node                         │
+│   ──► Outcome{result_id, resources, file | traceback}                        │
+│                                                                              │
+│ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─      │
+│                                                                              │
+│ accumulator_wrapper(accumulator, results, is_final)                          │
+│   │                                                                          │
+│   ▼                                                                          │
+│ accumulator(a, b) ──► accumulated result                                     │
+│   │                                                                          │
+│   ▼  (only if is_result() returned True for this group)                      │
+│ result_postprocess(result)                                                   │
+│   │                                                                          │
+│   ▼                                                                          │
+│ result serialized to a file local to the worker node                         │
+│   ──► Outcome{result_id, resources, file | traceback}                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 data:     input description:  an arbitrary text file that describes dataset, files and metadata per dataset.
                               User given.
 function: input\_to\_dataset: converts input description into a dictionary where keys are datasets, and
