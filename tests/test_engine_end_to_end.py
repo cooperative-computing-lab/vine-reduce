@@ -6,9 +6,14 @@ import pytest
 
 from vine_reduce import VineReduce, serialization
 from vine_reduce.checkpoint_db import CheckpointDB, checksum_dataset
+from vine_reduce.engine import _resolve_sized_config
 from vine_reduce.local_distributor import LocalDistributor
 
 from helpers import count_events, sum_reducer
+
+
+def double_count_events(chunk):
+    return 2 * (chunk.stop - chunk.start)
 
 
 @pytest.fixture
@@ -18,11 +23,80 @@ def distributor(tmp_path):
     dist.shutdown()
 
 
-def _read_only_result(results_dir, dataset_name):
-    dataset_dir = os.path.join(results_dir, dataset_name)
+def _read_only_result(results_dir, dataset_name, processor_name="count"):
+    dataset_dir = os.path.join(results_dir, dataset_name, processor_name)
     files = os.listdir(dataset_dir)
     assert len(files) == 1
     return serialization.load(os.path.join(dataset_dir, files[0]))
+
+
+def test_resolve_sized_config_passes_through_plain_int():
+    assert _resolve_sized_config(5, "proc", "ds") == 5
+
+
+def test_resolve_sized_config_passes_through_none():
+    assert _resolve_sized_config(None, "proc", "ds") is None
+
+
+def test_resolve_sized_config_dataset_beats_processor_beats_default():
+    config = {"default": 1, "processors": {"proc": 2}, "datasets": {"ds": 3}}
+    assert _resolve_sized_config(config, "proc", "ds") == 3
+    assert _resolve_sized_config(config, "proc", "other_ds") == 2
+    assert _resolve_sized_config(config, "other_proc", "other_ds") == 1
+
+
+def test_resolve_sized_config_missing_keys_fall_back_to_default():
+    assert _resolve_sized_config({"default": 7}, "proc", "ds") == 7
+    assert _resolve_sized_config({}, "proc", "ds") is None
+
+
+def test_end_to_end_two_processors_two_datasets(tmp_path, dataset_input, distributor):
+    input_path = dataset_input(
+        {
+            "numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}},
+            "more_numbers": {"metadata": {}, "files": {"c.root": 4}},
+        }
+    )
+
+    vr = VineReduce(
+        processors={"count": count_events, "double_count": double_count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+    vr.compute()
+
+    # each (processor, dataset) pair gets its own pipeline, and its own
+    # results_dir/dataset/processor subdirectory, so results never collide.
+    assert _read_only_result(vr.results_dir, "numbers", "count") == 10
+    assert _read_only_result(vr.results_dir, "more_numbers", "count") == 4
+    assert _read_only_result(vr.results_dir, "numbers", "double_count") == 20
+    assert _read_only_result(vr.results_dir, "more_numbers", "double_count") == 8
+
+
+def test_per_dataset_reduction_size_config_is_respected(tmp_path, dataset_input, distributor):
+    input_path = dataset_input(
+        {
+            "small_groups": {"metadata": {}, "files": {"a.root": 1, "b.root": 1, "c.root": 1}},
+            "one_group": {"metadata": {}, "files": {"d.root": 1, "e.root": 1, "f.root": 1}},
+        }
+    )
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        reduction_size={"datasets": {"small_groups": 2}, "default": 10},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+    vr.compute()
+
+    assert _read_only_result(vr.results_dir, "small_groups") == 3
+    assert _read_only_result(vr.results_dir, "one_group") == 3
 
 
 def test_end_to_end_two_datasets_two_files_each(tmp_path, dataset_input, distributor):
@@ -53,7 +127,7 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
 
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
-    results_dir = tmp_path / "results" / "numbers"
+    results_dir = tmp_path / "results" / "numbers" / "count"
     results_dir.mkdir(parents=True)
     final_file = results_dir / "already_done.pkl.zst"
     serialization.dump(999, str(final_file))

@@ -156,7 +156,7 @@ def test_engine_end_to_end_via_taskvine(tmp_path, dataset_input, distributor):
     )
     vr.compute()
 
-    dataset_dir = os.path.join(vr.results_dir, "numbers")
+    dataset_dir = os.path.join(vr.results_dir, "numbers", "count")
     files = os.listdir(dataset_dir)
     assert len(files) == 1
     assert serialization.load(os.path.join(dataset_dir, files[0])) == 10

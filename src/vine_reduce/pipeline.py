@@ -110,7 +110,7 @@ class Pipeline:
         self._checkpoint_size = checkpoint_size
         self._checkpoint_dir = checkpoint_dir
         self._checkpoint_retrieve = checkpoint_retrieve
-        self._results_dir = os.path.join(results_dir, dataset_name)
+        self._results_dir = os.path.join(results_dir, dataset_name, processor_name)
         self._results_retrieve = results_retrieve
         self._process_priority = process_priority
         self._reduce_priority = reduce_priority

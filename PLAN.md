@@ -189,7 +189,9 @@ checkpoint_size Optional[int]: Total memory (MB) of results in an reduction not 
 checkpoint_dir str = "checkpoints": Local directory to write checkpoints.
 checkpoint_retrieve bool = True: Whether the distributor should copy the checkpoints to checkpoint_dir.
                                  If False, it is assumed that the distributor has its own permanent storage.
-results_dir str = "results": Local directory to write results, with one subdirectory per dataset.
+results_dir str = "results": Local directory to write results, with one subdirectory per dataset
+                              and, within that, one subdirectory per processor (so multiple
+                              processors run over the same dataset don't collide).
 results_retrieve bool = True: Whether the distributors should copy results to results_dir.
                               If False, it is assumed that the either the distributor has its own 
                               permanent storage, or that result_postprocess copied the result to an 
