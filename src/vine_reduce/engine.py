@@ -158,7 +158,11 @@ class VineReduce:
                     self.max_chunks_cycle,
                 ),
             )
-            for pipeline in sorted(remaining, key=lambda p: -p.process_priority):
+            # _build_pipelines emits pipelines in descending process_priority
+            # order already (outer loop over processors, highest first), and
+            # `remaining` is a priority-order-preserving filter of that list,
+            # so no re-sort is needed here.
+            for pipeline in remaining:
                 if capacity <= 0:
                     break
                 capacity -= pipeline.feed(capacity)

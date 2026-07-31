@@ -87,26 +87,10 @@ def _measure(fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
     return result, {"cores": 1, "memory_mb": memory_mb, "wall_time_s": wall_time_s}
 
 
-def executor_wrapper(
-    dest_file: str,
-    processor: Callable[[Any], Any],
-    chunk: Chunk,
-    dataset_metadata: dict[str, Any],
-    distributor_metadata: dict[str, Any] | None,
-    executor_metadata: dict[str, Any] | None,
-    chunk_to_args: Callable[..., Any],
-    executor: Callable[..., Any],
-) -> RawOutcome:
-    """Runs remotely. Calls chunk_to_args then executor, measures resources,
-    and serializes the processing result to dest_file on success."""
+def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
+    """Runs `run`, measuring resources, and serializes its result to dest_file
+    on success. Shared tail for executor_wrapper and reducer_wrapper."""
     try:
-
-        def run() -> Any:
-            args = chunk_to_args(chunk, dataset_metadata, distributor_metadata)
-            return executor(
-                processor, args, dataset_metadata, distributor_metadata, executor_metadata
-            )
-
         result, resources = _measure(run)
     except MemoryError:
         return RawOutcome(
@@ -121,6 +105,26 @@ def executor_wrapper(
 
     serialization.dump(result, dest_file)
     return RawOutcome(status="success", resources=resources, file=dest_file)
+
+
+def executor_wrapper(
+    dest_file: str,
+    processor: Callable[[Any], Any],
+    chunk: Chunk,
+    dataset_metadata: dict[str, Any],
+    distributor_metadata: dict[str, Any] | None,
+    executor_metadata: dict[str, Any] | None,
+    chunk_to_args: Callable[..., Any],
+    executor: Callable[..., Any],
+) -> RawOutcome:
+    """Runs remotely. Calls chunk_to_args then executor, measures resources,
+    and serializes the processing result to dest_file on success."""
+
+    def run() -> Any:
+        args = chunk_to_args(chunk, dataset_metadata, distributor_metadata)
+        return executor(processor, args, dataset_metadata, distributor_metadata, executor_metadata)
+
+    return _run_and_wrap(dest_file, run)
 
 
 def default_reducer(a: Any, b: Any) -> Any:
@@ -138,32 +142,18 @@ def reducer_wrapper(
     """Runs remotely. Folds input_files (each a serialized result) together
     with reducer, applies result_postprocess if this is a final result, and
     serializes the outcome to dest_file on success."""
-    try:
 
-        def run() -> Any:
-            acc = serialization.load(input_files[0])
-            for path in input_files[1:]:
-                other = serialization.load(path)
-                acc = reducer(acc, other)
-                del other
-            if is_final and result_postprocess is not None:
-                acc = result_postprocess(acc)
-            return acc
+    def run() -> Any:
+        acc = serialization.load(input_files[0])
+        for path in input_files[1:]:
+            other = serialization.load(path)
+            acc = reducer(acc, other)
+            del other
+        if is_final and result_postprocess is not None:
+            acc = result_postprocess(acc)
+        return acc
 
-        result, resources = _measure(run)
-    except MemoryError:
-        return RawOutcome(
-            status="exhausted", resources={"cores": 1, "memory_mb": 0, "wall_time_s": 0}
-        )
-    except Exception:
-        return RawOutcome(
-            status="failure",
-            resources={"cores": 1, "memory_mb": 0, "wall_time_s": 0},
-            traceback=traceback_module.format_exc(),
-        )
-
-    serialization.dump(result, dest_file)
-    return RawOutcome(status="success", resources=resources, file=dest_file)
+    return _run_and_wrap(dest_file, run)
 
 
 def make_default_is_result(total_events: int) -> Callable[[int, float, float], bool]:

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 from uuid import uuid4
 
-from .checkpoint_db import CheckpointDB
+from .checkpoint_db import CheckpointDB, CheckpointRow
 from .distributor import Distributor
 from .types import Chunk, Outcome, ResourceExhaustion, RuntimeFailure, Success
 
@@ -52,6 +52,9 @@ class _ChunkTask:
 class _ReduceTask:
     group: list[PoolItem]
     is_final: bool
+    num_events: int
+    total_time: float
+    total_memory: float
 
 
 class Pipeline:
@@ -131,6 +134,19 @@ class Pipeline:
 
     # -- restart -----------------------------------------------------------
 
+    @staticmethod
+    def _pool_item_from_checkpoint(row: CheckpointRow) -> PoolItem:
+        return PoolItem(
+            file=row.path,
+            num_events=row.num_events,
+            wall_time_s=row.wall_time_s,
+            memory_mb=row.memory_mb,
+            files=frozenset(row.covers_files),
+            since_checkpoint_time=0,
+            since_checkpoint_memory=0,
+            checkpoint_row_id=row.id,
+        )
+
     def _seed_from_checkpoints(self) -> None:
         rows = self._db.checkpoints_for(self.processor_name, self.dataset_name)
         all_files = set(self._dataset["files"].keys())
@@ -139,18 +155,7 @@ class Pipeline:
         for row in rows:
             if row.is_final:
                 finalized_files |= set(row.covers_files)
-                self.final_results.append(
-                    PoolItem(
-                        file=row.path,
-                        num_events=row.num_events,
-                        wall_time_s=row.wall_time_s,
-                        memory_mb=row.memory_mb,
-                        files=frozenset(row.covers_files),
-                        since_checkpoint_time=0,
-                        since_checkpoint_memory=0,
-                        checkpoint_row_id=row.id,
-                    )
-                )
+                self.final_results.append(self._pool_item_from_checkpoint(row))
 
         remaining_files = all_files - finalized_files
         if not remaining_files:
@@ -162,18 +167,7 @@ class Pipeline:
         for row in rows:
             if row.is_final:
                 continue
-            self.pool.append(
-                PoolItem(
-                    file=row.path,
-                    num_events=row.num_events,
-                    wall_time_s=row.wall_time_s,
-                    memory_mb=row.memory_mb,
-                    files=frozenset(row.covers_files),
-                    since_checkpoint_time=0,
-                    since_checkpoint_memory=0,
-                    checkpoint_row_id=row.id,
-                )
-            )
+            self.pool.append(self._pool_item_from_checkpoint(row))
             covered_by_nonfinal |= set(row.covers_files)
 
         self._skip_files = finalized_files | covered_by_nonfinal
@@ -198,13 +192,11 @@ class Pipeline:
         """Catches pipelines that are done without ever producing an outcome
         to react to, e.g. an empty dataset, or one fully covered by seeded
         checkpoints for every file but not yet marked finished at construction."""
-        if (
-            not self.finished
-            and self.chunks_all_done
-            and not self.pool
-            and self.in_flight_count() == 0
-        ):
+        if not self.finished and self._is_done():
             self.finished = True
+
+    def _is_done(self) -> bool:
+        return self.chunks_all_done and not self.pool and self.in_flight_count() == 0
 
     @property
     def chunks_all_done(self) -> bool:
@@ -298,7 +290,13 @@ class Pipeline:
             is_final,
             self._result_postprocess,
         )
-        self._in_flight[result_id] = _ReduceTask(group=group, is_final=is_final)
+        self._in_flight[result_id] = _ReduceTask(
+            group=group,
+            is_final=is_final,
+            num_events=num_events,
+            total_time=total_time,
+            total_memory=total_memory,
+        )
 
     # -- outcome handling ------------------------------------------------------
 
@@ -308,9 +306,7 @@ class Pipeline:
             self._handle_chunk_outcome(task, outcome)
         else:
             self._handle_reduce_outcome(task, outcome)
-        self.finished = self.finished or (
-            self.chunks_all_done and not self.pool and self.in_flight_count() == 0
-        )
+        self.finished = self.finished or self._is_done()
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
@@ -362,11 +358,9 @@ class Pipeline:
 
         new_item = PoolItem(
             file=outcome.file,
-            num_events=sum(item.num_events for item in group),
-            wall_time_s=sum(item.wall_time_s for item in group)
-            + outcome.resources.get("wall_time_s", 0.0),
-            memory_mb=sum(item.memory_mb for item in group)
-            + outcome.resources.get("memory_mb", 0.0),
+            num_events=task.num_events,
+            wall_time_s=task.total_time + outcome.resources.get("wall_time_s", 0.0),
+            memory_mb=task.total_memory + outcome.resources.get("memory_mb", 0.0),
             files=frozenset().union(*(item.files for item in group)),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group)
             + outcome.resources.get("wall_time_s", 0.0),

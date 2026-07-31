@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import ndcctools.taskvine as vine
@@ -49,6 +50,12 @@ _RESOURCE_EXHAUSTION_RESULTS = {"resource exhaustion", "max wall time", "disk al
 # them onto the resource_monitor's rmsummary field names expected by
 # Manager.set_category_resources_max.
 _RESOURCE_KEY_TO_RMSUMMARY = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
+
+
+@dataclass
+class _InFlight:
+    result_id: int
+    kind: TaskKind
 
 
 class TaskVineDistributor:
@@ -72,9 +79,7 @@ class TaskVineDistributor:
         self._next_id = itertools.count(1)
         self._files_by_token: dict[str, vine.File] = {}
         self._token_by_result_id: dict[int, str] = {}
-        self._tasks_by_taskvine_id: dict[int, vine.PythonTask] = {}
-        self._result_id_by_taskvine_id: dict[int, int] = {}
-        self._kind_by_taskvine_id: dict[int, TaskKind] = {}
+        self._in_flight_by_taskvine_id: dict[int, _InFlight] = {}
         self._categories_configured: set[str] = set()
 
     @property
@@ -107,9 +112,7 @@ class TaskVineDistributor:
         taskvine_id = self._manager.submit(task)
         self._files_by_token[dest_token] = result_file
         self._token_by_result_id[result_id] = dest_token
-        self._tasks_by_taskvine_id[taskvine_id] = task
-        self._result_id_by_taskvine_id[taskvine_id] = result_id
-        self._kind_by_taskvine_id[taskvine_id] = kind
+        self._in_flight_by_taskvine_id[taskvine_id] = _InFlight(result_id=result_id, kind=kind)
         return result_id
 
     def _configure_category(self, category: str, kind: TaskKind) -> None:
@@ -156,9 +159,8 @@ class TaskVineDistributor:
         if task is None:
             return None
 
-        result_id = self._result_id_by_taskvine_id.pop(task.id)
-        self._tasks_by_taskvine_id.pop(task.id)
-        kind = self._kind_by_taskvine_id.pop(task.id)
+        entry = self._in_flight_by_taskvine_id.pop(task.id)
+        result_id, kind = entry.result_id, entry.kind
 
         if task.successful():
             raw: RawOutcome = task.output
