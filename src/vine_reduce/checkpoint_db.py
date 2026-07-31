@@ -36,6 +36,11 @@ class CheckpointRow:
 class CheckpointDB:
     def __init__(self, db_path: str):
         self._conn = sqlite3.connect(db_path)
+        # This DB is a work-resumption aid, not a record that must survive a
+        # power loss: on crash, a checkpoint just fails to record and the
+        # work it covered is redone. Skipping the fsync makes that trade for
+        # write throughput, since correctness doesn't depend on durability.
+        self._conn.execute("PRAGMA synchronous = OFF")
         self._create_tables()
 
     def _create_tables(self) -> None:
@@ -89,7 +94,11 @@ class CheckpointDB:
         memory_mb: float,
         is_final: bool,
         path: str,
+        commit: bool = True,
     ) -> int:
+        """commit=False lets a caller that also has delete_checkpoint calls
+        for the same event (e.g. replacing checkpoints on a reduction) batch
+        them into one transaction via a single trailing self.commit()."""
         cur = self._conn.execute(
             "INSERT INTO checkpoints"
             " (processor, dataset, covers_files, num_events, wall_time_s, memory_mb,"
@@ -106,11 +115,16 @@ class CheckpointDB:
                 path,
             ),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         return cur.lastrowid
 
-    def delete_checkpoint(self, row_id: int) -> None:
+    def delete_checkpoint(self, row_id: int, commit: bool = True) -> None:
         self._conn.execute("DELETE FROM checkpoints WHERE id = ?", (row_id,))
+        if commit:
+            self._conn.commit()
+
+    def commit(self) -> None:
         self._conn.commit()
 
     def checkpoints_for(self, processor: str, dataset: str) -> list[CheckpointRow]:

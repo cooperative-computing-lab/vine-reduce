@@ -399,6 +399,10 @@ class Pipeline:
             new_item.source_result_id = None
         # else: the distributor keeps its own permanent copy; nothing to move.
 
+        # Batch the new row and the superseded rows' deletes into one
+        # transaction, so this checkpoint event either fully lands or, on a
+        # crash mid-way, fully doesn't (never leaves both old and new rows
+        # covering the same files on disk).
         row_id = self._db.add_checkpoint(
             self.processor_name,
             self.dataset_name,
@@ -408,16 +412,18 @@ class Pipeline:
             new_item.memory_mb,
             is_final,
             new_item.file,
+            commit=False,
         )
 
         for item in inputs:
             if item.checkpoint_row_id is not None:
-                self._db.delete_checkpoint(item.checkpoint_row_id)
+                self._db.delete_checkpoint(item.checkpoint_row_id, commit=False)
                 if item.file.startswith(self._checkpoint_dir + os.sep):
                     try:
                         os.remove(item.file)
                     except FileNotFoundError:
                         pass
+        self._db.commit()
 
         new_item.checkpoint_row_id = row_id
         new_item.since_checkpoint_time = 0
