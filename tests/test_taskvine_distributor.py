@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 
+import ndcctools.taskvine as vine
 import pytest
 
 from vine_reduce import VineReduce, serialization
@@ -19,33 +19,34 @@ from vine_reduce.types import Chunk, Success
 from helpers import count_events, sum_reducer
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("vine_worker") is None, reason="vine_worker not on PATH"
+    shutil.which("vine_factory") is None, reason="vine_factory not on PATH"
 )
 
 WAIT_TIMEOUT = 30  # generous, to absorb the worker's first-connect latency
 
 
 @pytest.fixture
-def distributor():
-    dist = TaskVineDistributor(port=0, resources_processor={"cores": 1}, resources_reducer={"cores": 1})
+def distributor(monkeypatch):
     # The worker is a real separate process, unlike LocalDistributor's forked
     # ProcessPoolExecutor workers, which inherit the test process's already-
     # imported modules for free. cloudpickle pickles tests/helpers.py's
     # functions by reference, so the worker needs tests/ on its own
-    # PYTHONPATH to import them when unpickling.
-    env = dict(os.environ, PYTHONPATH=os.path.dirname(__file__))
-    worker = subprocess.Popen(
-        ["vine_worker", "--cores", "2", "-t", str(WAIT_TIMEOUT), "localhost", str(dist.port)],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
+    # PYTHONPATH to import them when unpickling. vine.Factory launches
+    # vine_factory (and, transitively, vine_worker and the per-task Python
+    # subprocess it forks) by inheriting this process's environment as-is,
+    # so setting PYTHONPATH here is enough - no need to route it through
+    # Factory's own --env option.
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+
+    dist = TaskVineDistributor(port=0, resources_processor={"cores": 1}, resources_reducer={"cores": 1})
+    workers = vine.Factory(manager=dist._manager)
+    workers.cores = 2
+    workers.min_workers = 1
+    workers.max_workers = 1
+    workers.timeout = WAIT_TIMEOUT
+    with workers:
         yield dist
-    finally:
-        worker.terminate()
-        worker.wait(timeout=10)
-        dist.shutdown()
+    dist.shutdown()
 
 
 def _submit_chunk(distributor, priority, chunk):
