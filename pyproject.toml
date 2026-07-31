@@ -75,15 +75,11 @@ platforms = ["linux-64", "osx-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
 awkward = "==2.8.7"
-black = ">=21.0"
 coffea = "==2025.7.3"
-flake8 = ">=3.8"
 fsspec = ">=2026.7.0"
 fsspec-xrootd = ">=0.5.1"
 ndcctools = ">=7.17.1"
 numpy = ">=2.4.6"
-pytest = ">=6.0"
-pytest-cov = ">=2.0"
 python = ">=3.13"
 rich = ">=14.2.0"
 setuptools = "<81"
@@ -95,4 +91,16 @@ zstandard = ">=0.25.0,<0.26"
 
 [tool.pixi.pypi-dependencies]
 vine_reduce = { path = ".", editable = true }
+
+[tool.pixi.feature.dev.dependencies]
+pytest = ">=6.0"
+pytest-cov = ">=2.0"
+black = ">=21.0"
+flake8 = ">=3.8"
+clang-tools = "*"
+pyright = "*"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
 
