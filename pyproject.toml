@@ -97,7 +97,6 @@ pytest = ">=6.0"
 pytest-cov = ">=2.0"
 black = ">=21.0"
 flake8 = ">=3.8"
-clang-tools = "*"
 pyright = "*"
 
 [tool.pixi.environments]
