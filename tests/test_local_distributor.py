@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from vine_reduce import serialization
-from vine_reduce.defaults import default_chunk_to_args, default_executor, executor_wrapper
+from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
+from vine_reduce.executor import simple_executor
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.types import Chunk, Success
 
@@ -29,7 +30,7 @@ def _submit_chunk(distributor, priority, chunk):
         None,
         None,
         default_chunk_to_args,
-        default_executor,
+        simple_executor,
     )
 
 

@@ -16,6 +16,7 @@ from typing import Any, Callable
 from . import defaults
 from .checkpoint_db import CheckpointDB, checksum_dataset
 from .distributor import Distributor
+from .executor import simple_executor
 from .pipeline import Pipeline, VineReduceError
 
 __all__ = ["VineReduce", "VineReduceError"]
@@ -42,7 +43,7 @@ class VineReduce:
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] | None = None
     datasets_to_chunks: Callable | None = None
     chunk_to_args: Callable = defaults.default_chunk_to_args
-    executor: Callable = defaults.default_executor
+    executor: Callable = simple_executor
     reducer: Callable = defaults.default_reducer
     reduction_size: int | dict = 10
     is_result: Callable[[int, float, float], bool] | None = None

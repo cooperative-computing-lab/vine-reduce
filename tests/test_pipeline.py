@@ -4,6 +4,7 @@ import os
 
 from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_db import CheckpointDB
+from vine_reduce.executor import simple_executor
 from vine_reduce.pipeline import Pipeline
 
 from helpers import count_events, sum_reducer
@@ -43,7 +44,7 @@ def make_pipeline(
             db=db,
             datasets_to_chunks=defaults.default_datasets_to_chunks,
             chunk_to_args=defaults.default_chunk_to_args,
-            executor=defaults.default_executor,
+            executor=simple_executor,
             executor_wrapper=defaults.executor_wrapper,
             reducer=reducer,
             reducer_wrapper=defaults.reducer_wrapper,

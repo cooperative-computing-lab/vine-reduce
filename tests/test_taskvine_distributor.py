@@ -9,10 +9,10 @@ import pytest
 from vine_reduce import VineReduce, serialization
 from vine_reduce.defaults import (
     default_chunk_to_args,
-    default_executor,
     executor_wrapper,
     reducer_wrapper,
 )
+from vine_reduce.executor import simple_executor
 from vine_reduce.taskvine_distributor import TaskVineDistributor
 from vine_reduce.types import Chunk, Success
 
@@ -61,7 +61,7 @@ def _submit_chunk(distributor, priority, chunk):
         None,
         None,
         default_chunk_to_args,
-        default_executor,
+        simple_executor,
     )
 
 

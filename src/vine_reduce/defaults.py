@@ -3,11 +3,14 @@
 Functions in this file run in two different places:
   - input_to_datasets, default_datasets_to_chunks, make_default_is_result:
     run locally, in the vine_reduce process.
-  - default_chunk_to_args, default_executor, executor_wrapper, default_reducer,
-    reducer_wrapper: run remotely, on worker nodes. Results are written to
-    dest_file with vine_reduce.serialization (cloudpickle + zstd), so
-    processor/reducer/etc. may be closures or lambdas, and result files are
-    compressed on disk.
+  - default_chunk_to_args, executor_wrapper, default_reducer, reducer_wrapper:
+    run remotely, on worker nodes. Results are written to dest_file with
+    vine_reduce.serialization (cloudpickle + zstd), so processor/reducer/etc.
+    may be closures or lambdas, and result files are compressed on disk.
+
+The `executor` step itself (what executor_wrapper calls to actually run
+processor(args)) lives in executor.py, not here - see simple_executor,
+cloudpickle_executor, and dask_executor.
 """
 
 from __future__ import annotations
@@ -66,16 +69,6 @@ def default_chunk_to_args(
     read events [chunk.start, chunk.stop) into whatever shape the processor
     expects."""
     return chunk
-
-
-def default_executor(
-    processor: Callable[[Any], Any],
-    args: Any,
-    dataset_metadata: dict[str, Any],
-    distributor_metadata: dict[str, Any] | None = None,
-    executor_metadata: dict[str, Any] | None = None,
-) -> Any:
-    return processor(args)
 
 
 def _measure(fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
