@@ -341,3 +341,12 @@ These resolve ambiguities in the plan above, decided during implementation:
      enforce.
    - Tested against a real `vine_worker` subprocess (external, per the design above), not a fake;
      `tests/test_taskvine_distributor.py` is skipped if `vine_worker` isn't on `PATH`.
+
+8. **Checkpoint db durability**: `CheckpointDB` sets `PRAGMA synchronous = OFF` and batches each
+   checkpoint event's insert plus its superseded-row deletes into a single transaction
+   (`add_checkpoint`/`delete_checkpoint` take `commit=False`; `Pipeline._checkpoint` commits once
+   after all of them). The db is a restart aid, not a durability guarantee: on crash before a
+   commit, the worst case is a checkpoint that never got recorded, so its work is redone on
+   restart - the same cost as any interval that hasn't been checkpointed yet, not new data loss.
+   What the single-transaction batching does protect is atomicity: a restart should never see a
+   superseded checkpoint row deleted without its replacement present, or vice versa.
