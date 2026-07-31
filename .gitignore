@@ -8,3 +8,5 @@ _version.py
 checkpoints/
 results/
 vine-run-info/
+vine-factory-*/
+examples/quick_start/data/
