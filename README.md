@@ -96,7 +96,7 @@ NanoEvents-reading, awkward-array materialization, and coffea-style
 accumulator merging, while chunking, checkpointing, and restart are
 inherited unchanged from `VineReduce`. See `src/vine_reduce/coffea.py`.
 
-`examples/coffea_skim/vr_cortado.py` is a runnable example built on it,
+`examples/cortado/vr_cortado.py` is a runnable example built on it,
 adapted from the ["cortado"
 example](https://github.com/cooperative-computing-lab/dynamic_data_reduction/tree/main/examples/cortado)
 in `dynamic_data_reduction`, the project this one's dynamic map-reduce loop
@@ -106,7 +106,7 @@ the surviving events per dataset with a custom awkward-array-concatenating
 reducer.
 
 ```bash
-cd examples/coffea_skim
+cd examples/cortado
 pixi run python vr_cortado.py
 ```
 
