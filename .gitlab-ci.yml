@@ -1,0 +1,17 @@
+stages:
+  - test
+
+test:
+  stage: test
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+    - curl -fsSL https://pixi.sh/install.sh | bash
+    - export PATH="$HOME/.pixi/bin:$PATH"
+  script:
+    - pixi install -e dev
+    - pixi run -e dev black --check .
+    - pixi run -e dev flake8
+    - pixi run -e dev pytest tests/ -v
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"
