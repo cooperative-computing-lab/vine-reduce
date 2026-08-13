@@ -69,6 +69,25 @@ vr = VineReduce(
 vr.compute()
 ```
 
+## Executors
+
+`chunk_to_args`'s output for a chunk becomes the argument each processor
+call runs remotely on. The `executor` argument to `VineReduce` controls how
+that call actually runs, at the execution site:
+
+- `simple_executor` (default) — calls `processor(args)` directly.
+- `cloudpickle_executor` — runs `processor(args)` in its own subprocess, so a
+  crash or memory leak in `processor` doesn't take down the worker task
+  itself. Supports closures and lambdas as `processor`, unlike the stdlib
+  `pickle` a plain `ProcessPoolExecutor` would require.
+- `dask_executor` — for a `processor` that returns a dask-delayed object (or
+  dask array/dataframe) rather than a plain value; computes it at the
+  execution site using one subprocess per core allocated to the task. `dask`
+  is not a `vine_reduce` dependency and must already be installed wherever
+  this executor runs.
+
+All three live in `src/vine_reduce/executor.py`.
+
 ## HEP / coffea workflows
 
 `vine_reduce.VineReduceCoffea` is a specialization for
@@ -76,6 +95,31 @@ vr.compute()
 NanoEvents-reading, awkward-array materialization, and coffea-style
 accumulator merging, while chunking, checkpointing, and restart are
 inherited unchanged from `VineReduce`. See `src/vine_reduce/coffea.py`.
+
+`examples/coffea_skim/vr_cortado.py` is a runnable example built on it,
+adapted from the ["cortado"
+example](https://github.com/cooperative-computing-lab/dynamic_data_reduction/tree/main/examples/cortado)
+in `dynamic_data_reduction`, the project this one's dynamic map-reduce loop
+descends from: it generates synthetic NanoAOD-like ROOT files for two
+datasets, skims each down to events with at least four leptons, and merges
+the surviving events per dataset with a custom awkward-array-concatenating
+reducer.
+
+```bash
+cd examples/coffea_skim
+pixi run python vr_cortado.py
+```
+
+## Development
+
+```bash
+pixi run -e dev pytest tests/ -v   # run tests
+pixi run -e dev black .            # format
+pixi run -e dev flake8             # lint
+```
+
+CI (GitHub Actions and a mirrored GitLab CI pipeline) runs all three on
+every push and pull request.
 
 ## License
 
