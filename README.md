@@ -1,121 +1,83 @@
 # VineReduce
 
-A flexible framework for distributed data processing using MapReduce patterns.
+A dynamic MapReduce framework for data processing, built on top of
+[TaskVine](https://cctools.readthedocs.io/en/latest/taskvine/).
+
+For each `(processor, dataset)` pair, `VineReduce` splits every file in the
+dataset into chunks, runs your processor over each chunk remotely (the "map"
+step), then repeatedly folds pooled processor outputs together with a
+reducer (the "reduce" step) until one final result covers the whole
+dataset. Progress is checkpointed along the way, so an interrupted run can
+resume without redoing finished work. See [PLAN.md](PLAN.md) for the full
+design.
 
 ## Installation
 
-### Prerequisites
-
-This project requires Python 3.13+ and uses conda/pixi for dependency management. We recommend using the provided `environment.yml` or `pyproject.toml` files to create a consistent development environment.
-
-### Setting up the Conda Environment
-
-## Conda
-
-1. **Create the conda environment from the provided environment.yml file:**
-   ```bash
-   conda env create -f environment.yml
-   ```
-
-2. **Activate the environment:**
-   ```bash
-   conda activate vine_reduce
-   ```
-
-## Pixi
-
-MISSING
-
-## Verify Installation
-   ```bash
-   python --version  # Should show Python 3.13.2
-   conda list | grep -E "(coffea|ndcctools)"  # Should show the installed packages
-   ```
-
-
-### From PyPI
-```bash
-pip install vine_reduce
-```
-
-### Installing from Source
-
-Once you have the conda environment set up:
+This project requires Python 3.13+ and is managed with
+[pixi](https://pixi.sh/).
 
 ```bash
 # Clone the repository
 git clone https://github.com/cooperative-computing-lab/vine_reduce.git
 cd vine_reduce
 
-# Activate the conda environment (if not already active)
-conda activate vine_reduce
+# Install the default environment (runtime dependencies only)
+pixi install
 
-# Install the package in development mode
-pip install -e .
+# Or install the dev environment (adds pytest, black, flake8, pyright)
+pixi install -e dev
 ```
 
+All commands should be run through pixi so they pick up the managed
+environment, e.g. `pixi run python your_script.py`.
 
 ## Quick Start
 
-Minimal toy example to get started:
+`examples/quick_start/quick_start.py` is a self-contained, runnable example:
+it generates some toy binary data, starts a `TaskVineDistributor` with a
+single local worker (no cluster or separate `vine_worker` process needed),
+runs three processors over two datasets, and checks the results for
+consistency.
 
-```python
-from vine_reduce import DynamicDataReduction
-import ndcctools.taskvine as vine
-import getpass
-
-# Simple data: process two datasets
-data = {
-    "datasets": {
-        "numbers": {"values": [1, 2, 3, 4, 5]},
-        "more_numbers": {"values": [10, 20, 30]}
-    }
-}
-
-# Define functions
-def preprocess(dataset_info, **kwargs):
-    for val in dataset_info["values"]:
-        yield (val, 1)
-
-def postprocess(val, **kwargs):
-    return val  # Just return the value
-
-def processor(x):
-    return x * 2  # Double each number
-
-def reducer(a, b):
-    return a + b  # Sum the results
-
-# Run
-mgr = vine.Manager(port=[9123, 9129], name=f"{getpass.getuser()}-quick-start-vine_reduce")
-print(f"Manager started on port {mgr.port}")
-vine_reduce = DynamicDataReduction(mgr,
-                           data=data,
-                           source_preprocess=preprocess, 
-                           source_postprocess=postprocess,
-                           processors=processor, 
-                           accumulator=reducer)
-
-# Use local workers, condor, slurm, or sge for scale
-workers = vine.Factory("local", manager=mgr)
-workers.max_workers = 2
-workers.min_workers = 0
-workers.cores = 4
-workers.memory = 2000
-workers.disk = 8000
-with workers:
-    result = vine_reduce.compute()
-
-print(f"Result: {result}")  # Expected: (1+2+3+4+5)*2 + (10+20+30)*2 = 150
+```bash
+cd examples/quick_start
+pixi run python quick_start.py
 ```
 
-## Usage
+Reading through that file top-to-bottom (it's heavily commented) is the
+fastest way to see how the pieces fit together: `build_datasets` describes
+the input shape `VineReduce` expects, `numbers_chunk_to_args` turns a
+`Chunk` into processor arguments, and `main()` wires a `TaskVineDistributor`
+and `VineReduce` together and calls `compute()`.
 
-- General use example: [examples/simple/simple-example.py](https://github.com/cooperative-computing-lab/vine_reduce/blob/main/examples/simple/simple-example.py)
-- Using Coffea Processors Classes Directly: [examples/coffea_processor/example_with_preprocess.py](https://github.com/cooperative-computing-lab/vine_reduce/blob/main/examples/coffea_processor/example_with_preprocess.py)
-- Coffea use in analysis: [examples/cortado/vine_reduce_cortado.py](https://github.com/cooperative-computing-lab/vine_reduce/blob/main/examples/cortado/vine_reduce_cortado.py)
+The shape of a minimal call looks like this:
 
+```python
+from vine_reduce import VineReduce
+
+vr = VineReduce(
+    processors={"my_processor": my_processor_fn},
+    input=datasets,  # {name: {"metadata": {...}, "files": {path: num_entries}}}
+    chunk_to_args=my_chunk_to_args,
+    chunksize=10_000,
+    results_dir="results",
+    checkpoint_dir="checkpoints",
+    # distributor defaults to a local ProcessPoolExecutor-backed
+    # LocalDistributor if omitted; pass a TaskVineDistributor to run on a
+    # real TaskVine cluster instead.
+)
+vr.compute()
+```
+
+## HEP / coffea workflows
+
+`vine_reduce.VineReduceCoffea` is a specialization for
+[coffea](https://coffeateam.github.io/coffea/)-based analyses: it supplies
+NanoEvents-reading, awkward-array materialization, and coffea-style
+accumulator merging, while chunking, checkpointing, and restart are
+inherited unchanged from `VineReduce`. See `src/vine_reduce/coffea.py`.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+This project is licensed under the Apache License 2.0 - see the
+[LICENSE](LICENSE) file for details.
