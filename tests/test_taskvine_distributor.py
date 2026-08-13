@@ -38,7 +38,9 @@ def distributor(monkeypatch):
     # Factory's own --env option.
     monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
 
-    dist = TaskVineDistributor(port=0, resources_processor={"cores": 1}, resources_reducer={"cores": 1})
+    dist = TaskVineDistributor(
+        port=0, resources_processor={"cores": 1}, resources_reducer={"cores": 1}
+    )
     workers = vine.Factory(manager=dist._manager)
     workers.cores = 2
     workers.min_workers = 1

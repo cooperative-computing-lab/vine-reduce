@@ -1,0 +1,6 @@
+[flake8]
+max-line-length = 100
+extend-exclude = .pixi,build,dist
+# E203 (whitespace before ':') conflicts with black's slice formatting;
+# black's own docs recommend disabling it for flake8.
+extend-ignore = E203
