@@ -65,6 +65,14 @@ target-version = ['py313']
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --cov=vine_reduce --cov-report=term-missing"
+filterwarnings = [
+    # ProcessPoolExecutor (executor.py, local_distributor.py) starts its own
+    # management thread before forking worker processes, which trips
+    # Python 3.12+'s "fork() in a multi-threaded process" check. That thread
+    # is the pool's own bookkeeping, not user state the fork could corrupt,
+    # so this is benign here.
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child:DeprecationWarning",
+]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
