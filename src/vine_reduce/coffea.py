@@ -48,11 +48,11 @@ def default_reducer(a: Accumulatable, b: Accumulatable) -> Accumulatable:
             raise ValueError(
                 f"Cannot add two mappings of incompatible type ({type(a)} vs. {type(b)})"
             )
-        lhs, rhs = set(a), set(b)
-        for key in lhs:
-            if key in rhs:
-                a[key] = default_reducer(a[key], b[key])
-        for key in rhs - lhs:
+        # Snapshot both key sets up front, since the loops below mutate `a`.
+        a_keys, b_keys = set(a), set(b)
+        for key in a_keys & b_keys:
+            a[key] = default_reducer(a[key], b[key])
+        for key in b_keys - a_keys:
             a[key] = copy.deepcopy(b[key])
         return a
     raise ValueError(f"Cannot add accumulators of incompatible type ({type(a)} vs. {type(b)})")

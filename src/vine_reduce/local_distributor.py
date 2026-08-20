@@ -53,11 +53,10 @@ class LocalDistributor:
 
         self._next_id = itertools.count(1)
         self._seq = itertools.count()
-        self._pending: list[tuple[int, int, int, Callable, tuple]] = (
-            []
-        )  # heap of (-priority, seq, id, func, args)
-        self._futures: dict[int, Future] = {}
-        self._result_id_of: dict[Future, int] = {}
+        # Heap of (-priority, seq, result_id, func, args): negated priority so
+        # the largest one pops first, seq to break ties in submission order.
+        self._pending: list[tuple[int, int, int, Callable, tuple]] = []
+        self._running: dict[Future, int] = {}  # future -> result_id, while dispatched
         self._files: dict[int, str] = {}  # result_id -> file, for completed Successes
         self._env_vars: dict[str, str] = {}
 
@@ -70,26 +69,23 @@ class LocalDistributor:
         return result_id
 
     def _dispatch(self) -> None:
-        while self._pending and len(self._futures) < self._max_workers:
+        while self._pending and len(self._running) < self._max_workers:
             _, _, result_id, func, args = heapq.heappop(self._pending)
             dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
             payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
-            future = self._pool.submit(_run_cloudpickled, payload)
-            self._futures[result_id] = future
-            self._result_id_of[future] = result_id
+            self._running[self._pool.submit(_run_cloudpickled, payload)] = result_id
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
-        if not self._futures:
+        if not self._running:
             return None
         done, _ = concurrent.futures.wait(
-            self._futures.values(), timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED
+            self._running, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED
         )
         if not done:
             return None
 
         future = next(iter(done))
-        result_id = self._result_id_of.pop(future)
-        del self._futures[result_id]
+        result_id = self._running.pop(future)
 
         raw: RawOutcome = future.result()
         if raw.status == "success":
@@ -106,7 +102,7 @@ class LocalDistributor:
 
     def hungry(self) -> int:
         target_queue_depth = 2 * self._max_workers
-        in_flight = len(self._futures) + len(self._pending)
+        in_flight = len(self._running) + len(self._pending)
         return max(0, target_queue_depth - in_flight)
 
     def retrieve(self, result_id: int, dest_path: str) -> None:

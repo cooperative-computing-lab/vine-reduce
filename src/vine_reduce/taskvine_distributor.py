@@ -53,6 +53,12 @@ _RESOURCE_EXHAUSTION_RESULTS = {"resource exhaustion", "max wall time", "disk al
 _RESOURCE_KEY_TO_RMSUMMARY = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
 
 
+def _result_token(result_id: int) -> str:
+    """The opaque manager-side name for a result (see module docstring). Derived
+    from result_id rather than stored, so the two can never drift apart."""
+    return f"result_{result_id}.p"
+
+
 @dataclass
 class _InFlight:
     result_id: int
@@ -85,7 +91,6 @@ class TaskVineDistributor:
 
         self._next_id = itertools.count(1)
         self._files_by_token: dict[str, vine.File] = {}
-        self._token_by_result_id: dict[int, str] = {}
         self._in_flight_by_taskvine_id: dict[int, _InFlight] = {}
         self._categories_configured: set[str] = set()
 
@@ -102,15 +107,14 @@ class TaskVineDistributor:
         self, priority: int, category: str, kind: TaskKind, func: Callable[..., Any], *args: Any
     ) -> int:
         result_id = next(self._next_id)
-        dest_token = f"result_{result_id}.p"
+        dest_token = _result_token(result_id)
 
         remapped_args, extra_inputs = self._remap_files(args)
 
         task = vine.PythonTask(func, dest_token, *remapped_args)
         task.set_priority(priority)
         task.set_category(category)
-        if category not in self._categories_configured:
-            self._configure_category(category, kind)
+        self._configure_category(category, kind)
 
         if self._environment is not None:
             task.add_environment(self._environment)
@@ -129,7 +133,6 @@ class TaskVineDistributor:
 
         taskvine_id = self._manager.submit(task)
         self._files_by_token[dest_token] = result_file
-        self._token_by_result_id[result_id] = dest_token
         self._in_flight_by_taskvine_id[taskvine_id] = _InFlight(result_id=result_id, kind=kind)
         return result_id
 
@@ -138,13 +141,14 @@ class TaskVineDistributor:
         TaskVine, once, the first time that category is submitted to -
         category is a resource-allocation grouping in TaskVine, not a
         per-task setting."""
-        resources = self._resources_by_kind[kind]
-        rmd = {
+        if category in self._categories_configured:
+            return
+        limits = {
             _RESOURCE_KEY_TO_RMSUMMARY[key]: value
-            for key, value in resources.items()
+            for key, value in self._resources_by_kind[kind].items()
             if key in _RESOURCE_KEY_TO_RMSUMMARY
         }
-        self._manager.set_category_resources_max(category, rmd)
+        self._manager.set_category_resources_max(category, limits)
         self._categories_configured.add(category)
 
     def _remap_files(
@@ -163,9 +167,12 @@ class TaskVineDistributor:
                 return sandbox_name
             return value
 
-        remapped = [
-            [remap_one(v) for v in arg] if isinstance(arg, list) else remap_one(arg) for arg in args
-        ]
+        remapped: list[Any] = []
+        for arg in args:
+            if isinstance(arg, list):
+                remapped.append([remap_one(value) for value in arg])
+            else:
+                remapped.append(remap_one(arg))
         return remapped, extra_inputs
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
@@ -205,10 +212,7 @@ class TaskVineDistributor:
         }
 
     def free_result(self, result_id: int) -> None:
-        token = self._token_by_result_id.pop(result_id, None)
-        if token is None:
-            return
-        file = self._files_by_token.pop(token, None)
+        file = self._files_by_token.pop(_result_token(result_id), None)
         if file is not None:
             self._manager.undeclare_file(file)
 
@@ -216,7 +220,7 @@ class TaskVineDistributor:
         return self._manager.hungry()
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
-        file = self._files_by_token[self._token_by_result_id[result_id]]
+        file = self._files_by_token[_result_token(result_id)]
         self._manager.fetch_file(file)
         with open(dest_path, "wb") as f:
             f.write(file.contents())

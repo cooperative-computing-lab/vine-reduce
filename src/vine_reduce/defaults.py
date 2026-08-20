@@ -80,19 +80,23 @@ def _measure(fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
     return result, {"cores": 1, "memory_mb": memory_mb, "wall_time_s": wall_time_s}
 
 
+def _unmeasured_resources() -> dict[str, Any]:
+    """Placeholder usage for a call that failed before _measure could report
+    anything real. A fresh dict each time, since it ends up on a RawOutcome."""
+    return {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
+
+
 def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
     """Runs `run`, measuring resources, and serializes its result to dest_file
     on success. Shared tail for executor_wrapper and reducer_wrapper."""
     try:
         result, resources = _measure(run)
     except MemoryError:
-        return RawOutcome(
-            status="exhausted", resources={"cores": 1, "memory_mb": 0, "wall_time_s": 0}
-        )
+        return RawOutcome(status="exhausted", resources=_unmeasured_resources())
     except Exception:
         return RawOutcome(
             status="failure",
-            resources={"cores": 1, "memory_mb": 0, "wall_time_s": 0},
+            resources=_unmeasured_resources(),
             traceback=traceback_module.format_exc(),
         )
 

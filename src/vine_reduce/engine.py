@@ -149,16 +149,15 @@ class VineReduce:
         return pipelines
 
     def _run(self, pipelines: list[Pipeline], distributor: Distributor) -> None:
-        def active() -> list[Pipeline]:
-            return [p for p in pipelines if not p.finished]
-
         while True:
-            remaining = active()
-            for pipeline in remaining:
+            for pipeline in pipelines:
+                if pipeline.finished:
+                    continue
                 pipeline.submit_ready_reductions()
                 pipeline.maybe_drain_final_group()
                 pipeline.refresh_finished()
-            remaining = active()
+
+            remaining = [p for p in pipelines if not p.finished]
             if not remaining:
                 break
 

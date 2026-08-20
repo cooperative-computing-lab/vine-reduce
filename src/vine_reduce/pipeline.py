@@ -124,6 +124,7 @@ class Pipeline:
         self._in_flight: dict[int, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
+        self._skip_files: set[str] = set()
         self.finished = False
 
         self._seed_from_checkpoints()
@@ -148,39 +149,29 @@ class Pipeline:
         )
 
     def _seed_from_checkpoints(self) -> None:
+        """Restart support: replay the checkpoint rows on file as final results
+        and pool items, and record which dataset files they already cover so
+        chunk generation can skip them."""
         rows = self._db.checkpoints_for(self.processor_name, self.dataset_name)
-        all_files = set(self._dataset["files"].keys())
+        final_rows = [row for row in rows if row.is_final]
+        partial_rows = [row for row in rows if not row.is_final]
 
-        finalized_files: set[str] = set()
-        for row in rows:
-            if row.is_final:
-                finalized_files |= set(row.covers_files)
-                self.final_results.append(self._pool_item_from_checkpoint(row))
+        all_files = set(self._dataset["files"])
+        finalized_files = {url for row in final_rows for url in row.covers_files}
+        self.final_results = [self._pool_item_from_checkpoint(row) for row in final_rows]
 
-        remaining_files = all_files - finalized_files
-        if not remaining_files:
+        if all_files <= finalized_files:
+            # Every file already has a final result, so there is nothing left
+            # to run and any partial checkpoints are moot.
             self.finished = True
             self._skip_files = all_files
             return
 
-        covered_by_nonfinal: set[str] = set()
-        for row in rows:
-            if row.is_final:
-                continue
-            self.pool.append(self._pool_item_from_checkpoint(row))
-            covered_by_nonfinal |= set(row.covers_files)
-
-        self._skip_files = finalized_files | covered_by_nonfinal
+        self.pool = [self._pool_item_from_checkpoint(row) for row in partial_rows]
+        covered_by_partial = {url for row in partial_rows for url in row.covers_files}
+        self._skip_files = finalized_files | covered_by_partial
 
     # -- chunk generation ----------------------------------------------------
-
-    @property
-    def total_events(self) -> int:
-        return sum(self._dataset["files"].values())
-
-    @property
-    def process_priority(self) -> int:
-        return self._process_priority
 
     def in_flight_count(self) -> int:
         return len(self._in_flight)
@@ -219,26 +210,33 @@ class Pipeline:
 
         submitted = 0
         while submitted < budget:
-            if self._retry_chunks:
-                chunk = self._retry_chunks.pop()
-                # A retry chunk may predate the last chunksize halving; re-split
-                # it so we actually retry at the smaller size, not the size that
-                # just failed.
-                if self.chunksize is not None and chunk.num_events > self.chunksize:
-                    split_point = chunk.start + self.chunksize
-                    self._retry_chunks.append(Chunk(chunk.url, split_point, chunk.stop))
-                    chunk = Chunk(chunk.url, chunk.start, split_point)
-            elif not self._generator_exhausted:
-                chunk = next(self._generator, None)
-                if chunk is None:
-                    self._generator_exhausted = True
-                    continue
-            else:
+            chunk = self._next_chunk()
+            if chunk is None:
                 break
-
             self._submit_chunk(chunk)
             submitted += 1
         return submitted
+
+    def _next_chunk(self) -> Chunk | None:
+        """The next chunk to submit - retries first, then freshly generated
+        ones - or None when there is nothing left to submit right now."""
+        if self._retry_chunks:
+            chunk = self._retry_chunks.pop()
+            # A retry chunk may predate the last chunksize halving; re-split it
+            # so we actually retry at the smaller size, not the size that just
+            # failed.
+            if self.chunksize is not None and chunk.num_events > self.chunksize:
+                split_point = chunk.start + self.chunksize
+                self._retry_chunks.append(Chunk(chunk.url, split_point, chunk.stop))
+                chunk = Chunk(chunk.url, chunk.start, split_point)
+            return chunk
+
+        if self._generator_exhausted:
+            return None
+        chunk = next(self._generator, None)
+        if chunk is None:
+            self._generator_exhausted = True
+        return chunk
 
     def _submit_chunk(self, chunk: Chunk) -> None:
         self._files_in_progress.setdefault(
@@ -321,17 +319,20 @@ class Pipeline:
             return
 
         assert isinstance(outcome, Success)
+        wall_time_s = outcome.resources.get("wall_time_s", 0.0)
+        memory_mb = outcome.resources.get("memory_mb", 0.0)
+
         progress = self._files_in_progress[chunk.url]
         progress.covered_events += chunk.num_events
         progress.staged_items.append(
             PoolItem(
                 file=outcome.file,
                 num_events=chunk.num_events,
-                wall_time_s=outcome.resources.get("wall_time_s", 0.0),
-                memory_mb=outcome.resources.get("memory_mb", 0.0),
+                wall_time_s=wall_time_s,
+                memory_mb=memory_mb,
                 files=frozenset({chunk.url}),
-                since_checkpoint_time=outcome.resources.get("wall_time_s", 0.0),
-                since_checkpoint_memory=outcome.resources.get("memory_mb", 0.0),
+                since_checkpoint_time=wall_time_s,
+                since_checkpoint_memory=memory_mb,
                 source_result_id=outcome.result_id,
             )
         )
@@ -356,36 +357,41 @@ class Pipeline:
             if item.source_result_id is not None:
                 self._distributor.free_result(item.source_result_id)
 
+        wall_time_s = outcome.resources.get("wall_time_s", 0.0)
+        memory_mb = outcome.resources.get("memory_mb", 0.0)
         new_item = PoolItem(
             file=outcome.file,
             num_events=task.num_events,
-            wall_time_s=task.total_time + outcome.resources.get("wall_time_s", 0.0),
-            memory_mb=task.total_memory + outcome.resources.get("memory_mb", 0.0),
+            wall_time_s=task.total_time + wall_time_s,
+            memory_mb=task.total_memory + memory_mb,
             files=frozenset().union(*(item.files for item in group)),
-            since_checkpoint_time=sum(item.since_checkpoint_time for item in group)
-            + outcome.resources.get("wall_time_s", 0.0),
-            since_checkpoint_memory=sum(item.since_checkpoint_memory for item in group)
-            + outcome.resources.get("memory_mb", 0.0),
+            since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
+            since_checkpoint_memory=sum(item.since_checkpoint_memory for item in group) + memory_mb,
             source_result_id=outcome.result_id,
         )
 
-        crosses_checkpoint = is_final or (
-            (
-                self._checkpoint_time is not None
-                and new_item.since_checkpoint_time >= self._checkpoint_time
-            )
-            or (
-                self._checkpoint_size is not None
-                and new_item.since_checkpoint_memory >= self._checkpoint_size
-            )
-        )
-        if crosses_checkpoint:
+        if is_final or self._checkpoint_due(new_item):
             self._checkpoint(new_item, group, is_final)
 
         if is_final:
             self.final_results.append(new_item)
         else:
             self.pool.append(new_item)
+
+    def _checkpoint_due(self, item: PoolItem) -> bool:
+        """Whether enough work has piled up since the last checkpoint - in wall
+        time or in memory - to be worth writing this item out."""
+        if (
+            self._checkpoint_time is not None
+            and item.since_checkpoint_time >= self._checkpoint_time
+        ):
+            return True
+        if (
+            self._checkpoint_size is not None
+            and item.since_checkpoint_memory >= self._checkpoint_size
+        ):
+            return True
+        return False
 
     def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
         dest_dir = self._results_dir if is_final else self._checkpoint_dir

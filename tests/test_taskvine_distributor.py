@@ -13,7 +13,7 @@ from vine_reduce.defaults import (
     reducer_wrapper,
 )
 from vine_reduce.executor import simple_executor
-from vine_reduce.taskvine_distributor import TaskVineDistributor
+from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token
 from vine_reduce.types import Chunk, Success
 
 from helpers import count_events, read_env_var, read_shipped_file, sum_reducer
@@ -102,7 +102,7 @@ def test_free_result_allows_reuse(distributor):
     distributor.free_result(outcome.result_id)
     # free_result is fire-and-forget cleanup; the main guarantee is that it
     # doesn't raise, and that the distributor's own bookkeeping is cleared.
-    assert outcome.result_id not in distributor._token_by_result_id
+    assert _result_token(outcome.result_id) not in distributor._files_by_token
 
 
 def test_hungry_reports_a_non_negative_capacity(distributor):
