@@ -110,6 +110,21 @@ cd examples/cortado
 pixi run python vr_cortado.py
 ```
 
+## Production use: ttbarEFT
+
+[`TopEFT/ttbarEFT`](https://github.com/TopEFT/ttbarEFT) is a CMS
+top-quark EFT search that runs its analysis stage through `vine_reduce`
+on top of TaskVine, distributing histogram-filling processors over an
+HTCondor pool.
+[`examples/ttBar/run_processor_with_vr.py`](examples/ttBar/run_processor_with_vr.py)
+shows how that integration looked in practice: driving a `ttbarEFT`
+`AnalysisProcessor` per lepton channel through `vine_reduce`. It predates
+the current `VineReduceCoffea`/`TaskVineDistributor` API described above
+(it was written against an earlier `vine_reduce` release), so treat it as
+a reference for how a full physics analysis wires up channels,
+Wilson-coefficient/histogram selection, and X509 proxy handling around
+`vine_reduce`, not as a runnable script against the current API.
+
 ## Development
 
 ```bash
