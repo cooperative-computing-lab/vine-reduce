@@ -104,7 +104,11 @@ black = ">=21.0"
 flake8 = ">=3.8"
 pyright = "*"
 
+[tool.pixi.feature.pack.pypi-dependencies]
+vine_reduce = { path = ".", editable = false }
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
+pack = { features = ["pack"], solve-group = "default" }
 
