@@ -10,7 +10,7 @@ this module is just the scheduling loop and priority/config wiring.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import defaults
@@ -59,6 +59,8 @@ class VineReduce:
     max_chunks_active: int = 1000
     max_chunks_cycle: int = 100
     db_path: str | None = None
+    extra_files: list[str] = field(default_factory=list)
+    environment_variables: dict[str, str] = field(default_factory=dict)
 
     def compute(self) -> None:
         distributor = self.distributor
@@ -67,6 +69,16 @@ class VineReduce:
             from .local_distributor import LocalDistributor
 
             distributor = LocalDistributor()
+
+        # Communicated to the distributor once, up front, so every
+        # processor/reducer call it submits from here on has these files and
+        # environment variables available - see Distributor.add_file/
+        # set_env_var (distributor.py) for what each implementation does
+        # with them.
+        for path in self.extra_files:
+            distributor.add_file(path)
+        for name, value in self.environment_variables.items():
+            distributor.set_env_var(name, value)
 
         input_to_datasets = self.input_to_datasets or defaults.default_input_to_datasets
         datasets_to_chunks = self.datasets_to_chunks or defaults.default_datasets_to_chunks

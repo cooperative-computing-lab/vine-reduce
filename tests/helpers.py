@@ -4,6 +4,17 @@ reused across several test modules, so a shared name is simpler)."""
 
 from __future__ import annotations
 
+import os
+
+
+def read_env_var(chunk):
+    return os.environ.get("VINE_REDUCE_TEST_VAR", "")
+
+
+def read_shipped_file(chunk):
+    with open("shipped.txt") as f:
+        return f.read()
+
 
 def count_events(chunk):
     return chunk.stop - chunk.start

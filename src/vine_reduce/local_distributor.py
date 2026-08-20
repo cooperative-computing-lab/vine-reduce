@@ -34,8 +34,11 @@ def _run_cloudpickled(payload: bytes) -> Any:
     is given with stdlib pickle, which cannot handle closures or lambdas;
     cloudpickle can, so func/args are cloudpickled into a byte string here
     and only that string (plus this module-level function) crosses the
-    stdlib-pickle boundary."""
-    func, args = cloudpickle.loads(payload)
+    stdlib-pickle boundary. env_vars is applied here, in the worker process,
+    rather than in the parent, so it takes effect regardless of when the
+    pool actually forked this worker relative to set_env_var being called."""
+    func, args, env_vars = cloudpickle.loads(payload)
+    os.environ.update(env_vars)
     return func(*args)
 
 
@@ -56,6 +59,7 @@ class LocalDistributor:
         self._futures: dict[int, Future] = {}
         self._result_id_of: dict[Future, int] = {}
         self._files: dict[int, str] = {}  # result_id -> file, for completed Successes
+        self._env_vars: dict[str, str] = {}
 
     def submit(
         self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
@@ -69,7 +73,7 @@ class LocalDistributor:
         while self._pending and len(self._futures) < self._max_workers:
             _, _, result_id, func, args = heapq.heappop(self._pending)
             dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
-            payload = cloudpickle.dumps((func, (dest_file, *args)))
+            payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
             future = self._pool.submit(_run_cloudpickled, payload)
             self._futures[result_id] = future
             self._result_id_of[future] = result_id
@@ -107,6 +111,14 @@ class LocalDistributor:
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
         shutil.copy(self._files[result_id], dest_path)
+
+    def add_file(self, local_path: str) -> None:
+        """No-op: worker subprocesses already share vine_reduce's filesystem
+        (see module docstring), so local_path is already visible to them
+        under that same path without shipping anything."""
+
+    def set_env_var(self, name: str, value: str) -> None:
+        self._env_vars[name] = value
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)

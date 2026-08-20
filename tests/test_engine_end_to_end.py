@@ -9,7 +9,7 @@ from vine_reduce.checkpoint_db import CheckpointDB, checksum_dataset
 from vine_reduce.engine import _resolve_sized_config
 from vine_reduce.local_distributor import LocalDistributor
 
-from helpers import count_events, sum_reducer
+from helpers import count_events, read_env_var, sum_reducer
 
 
 def double_count_events(chunk):
@@ -152,3 +152,65 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
 
     # unchanged: still just the pre-seeded final result, processor never ran
     assert os.listdir(str(results_dir)) == ["already_done.pkl.zst"]
+
+
+def test_environment_variables_reach_the_processor(tmp_path, dataset_input, distributor):
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 1}}})
+
+    vr = VineReduce(
+        processors={"env": read_env_var},
+        input=input_path,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+        environment_variables={"VINE_REDUCE_TEST_VAR": "xyz"},
+    )
+    vr.compute()
+
+    assert _read_only_result(vr.results_dir, "numbers", "env") == "xyz"
+
+
+def test_extra_files_and_environment_variables_are_passed_to_the_distributor(
+    tmp_path, dataset_input
+):
+    """VineReduce itself is distributor-agnostic - it just forwards
+    extra_files/environment_variables to distributor.add_file/set_env_var
+    once, before compute() submits anything. This checks that forwarding
+    directly, independent of what a given distributor does with them (see
+    test_local_distributor.py/test_taskvine_distributor.py for that)."""
+
+    class RecordingDistributor(LocalDistributor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.added_files = []
+            self.env_vars = {}
+
+        def add_file(self, local_path):
+            self.added_files.append(local_path)
+            super().add_file(local_path)
+
+        def set_env_var(self, name, value):
+            self.env_vars[name] = value
+            super().set_env_var(name, value)
+
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 1}}})
+    shipped = tmp_path / "shipped.txt"
+    shipped.write_text("hi")
+
+    dist = RecordingDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
+    try:
+        vr = VineReduce(
+            processors={"count": count_events},
+            input=input_path,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            results_dir=str(tmp_path / "results"),
+            distributor=dist,
+            extra_files=[str(shipped)],
+            environment_variables={"VINE_REDUCE_TEST_VAR": "xyz"},
+        )
+        vr.compute()
+    finally:
+        dist.shutdown()
+
+    assert dist.added_files == [str(shipped)]
+    assert dist.env_vars == {"VINE_REDUCE_TEST_VAR": "xyz"}

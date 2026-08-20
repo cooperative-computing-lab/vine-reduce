@@ -8,7 +8,7 @@ from vine_reduce.executor import simple_executor
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.types import Chunk, Success
 
-from helpers import count_events
+from helpers import count_events, read_env_var
 
 
 @pytest.fixture
@@ -74,3 +74,34 @@ def test_hungry_reports_available_capacity(distributor):
     assert distributor.hungry() == 4
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 100000))
     assert distributor.hungry() == 3
+
+
+def test_add_file_is_a_no_op_that_does_not_raise(distributor, tmp_path):
+    # Worker subprocesses already share vine_reduce's filesystem, so there's
+    # nothing to ship - this only guards against add_file raising.
+    shipped = tmp_path / "shipped.txt"
+    shipped.write_text("hi")
+    distributor.add_file(str(shipped))
+
+
+def test_set_env_var_is_visible_to_submitted_calls(distributor):
+    distributor.set_env_var("VINE_REDUCE_TEST_VAR", "xyz")
+
+    result_id = distributor.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        read_env_var,
+        Chunk("a.root", 0, 1),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+    )
+    outcome = distributor.wait(timeout=30)
+
+    assert isinstance(outcome, Success)
+    assert outcome.result_id == result_id
+    assert serialization.load(outcome.file) == "xyz"

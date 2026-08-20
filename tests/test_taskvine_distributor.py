@@ -16,7 +16,7 @@ from vine_reduce.executor import simple_executor
 from vine_reduce.taskvine_distributor import TaskVineDistributor
 from vine_reduce.types import Chunk, Success
 
-from helpers import count_events, sum_reducer
+from helpers import count_events, read_env_var, read_shipped_file, sum_reducer
 
 pytestmark = pytest.mark.skipif(
     shutil.which("vine_factory") is None, reason="vine_factory not on PATH"
@@ -107,6 +107,88 @@ def test_free_result_allows_reuse(distributor):
 
 def test_hungry_reports_a_non_negative_capacity(distributor):
     assert distributor.hungry() >= 0
+
+
+def test_constructor_reuses_a_pre_built_manager(monkeypatch):
+    # A caller-built manager (e.g. vine.DaskVine, so coffea's own
+    # dataset_tools.preprocess() and this distributor share one manager/port/
+    # worker pool - see PLAN.md) must be used as-is, not replaced by a second
+    # one built from port/name.
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    manager = vine.Manager(port=0)
+
+    dist = TaskVineDistributor(
+        manager=manager, resources_processor={"cores": 1}, resources_reducer={"cores": 1}
+    )
+    assert dist._manager is manager
+
+    workers = vine.Factory(manager=manager)
+    workers.cores = 2
+    workers.min_workers = 1
+    workers.max_workers = 1
+    workers.timeout = WAIT_TIMEOUT
+    with workers:
+        result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 4))
+        outcome = dist.wait(timeout=WAIT_TIMEOUT)
+    dist.shutdown()
+
+    assert isinstance(outcome, Success)
+    assert outcome.result_id == result_id
+
+
+def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
+    # add_file places the file under its basename in the task's own sandbox,
+    # so the processor must open it by that relative name (see
+    # helpers.read_shipped_file), not by its local path.
+    shipped = tmp_path / "shipped.txt"
+    shipped.write_text("hello from add_file")
+    distributor.add_file(str(shipped))
+
+    result_id = distributor.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        read_shipped_file,
+        Chunk("a.root", 0, 1),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+    )
+    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+
+    assert isinstance(outcome, Success)
+    assert outcome.result_id == result_id
+    dest = tmp_path / "copy.pkl.zst"
+    distributor.retrieve(outcome.result_id, str(dest))
+    assert serialization.load(str(dest)) == "hello from add_file"
+
+
+def test_set_env_var_is_visible_to_every_task(distributor, tmp_path):
+    distributor.set_env_var("VINE_REDUCE_TEST_VAR", "abc123")
+
+    result_id = distributor.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        read_env_var,
+        Chunk("a.root", 0, 1),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+    )
+    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+
+    assert isinstance(outcome, Success)
+    assert outcome.result_id == result_id
+    dest = tmp_path / "copy.pkl.zst"
+    distributor.retrieve(outcome.result_id, str(dest))
+    assert serialization.load(str(dest)) == "abc123"
 
 
 def test_reduction_chains_across_two_tasks(distributor, tmp_path):

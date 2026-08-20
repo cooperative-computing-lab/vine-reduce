@@ -162,6 +162,9 @@ result_id = submit(priority, category, kind, executor_wrapper | reducer\_wrapper
 outcome = wait(timeout): wait for a result to be available and return its Outcome (RuntimeFailure | ResourceExhaustion | Success). On timeout return None. outcome.result_id identifies which submit() call this outcome corresponds to.
 free_result(result_id): remove resources associated with result_id
 chunks_wanted = hungry(): number of additional chunks the distributor could handle given the current resources.
+add_file(local_path): make local_path available, under its basename, wherever every call submitted
+                       from now on runs.
+set_env_var(name, value): set an environment variable for every call submitted from now on.
 ```
 
 
@@ -197,6 +200,12 @@ results_retrieve bool = True: Whether the distributors should copy results to re
                               permanent storage, or that result_postprocess copied the result to an 
                               appropiate location.
 distributor Optional[Distributor]: The distributor to use. The default distributor is a local default.
+extra_files List[str] = []: Local paths made available, under their basename, to every processor/
+                            reducer call. Passed to the distributor via add_file() once, at the
+                            start of compute().
+environment_variables Dict[str, str] = {}: Environment variables set for every processor/reducer
+                                           call. Passed to the distributor via set_env_var() once,
+                                           at the start of compute().
 ```
 
 ```python
@@ -332,6 +341,13 @@ These resolve ambiguities in the plan above, decided during implementation:
      to it. No per-category autolabeling/tuning (e.g. dynmapred's `"min waste"` category modes).
      An optional poncho `environment` is likewise a single fixed constructor arg applied to every
      task.
+   - **Constructor takes an optional pre-built `manager`**: when given, it's used as-is instead of
+     `TaskVineDistributor` constructing its own `vine.Manager(port=port, name=name)` (`port`/`name`
+     are then ignored). This is for reusing one manager/port/worker pool across coffea's own
+     `dataset_tools.preprocess(fileset, scheduler=...)` (which accepts a dask scheduler - a
+     `vine.DaskVine` manager's `.get` method qualifies) and this distributor's own map/reduce
+     tasks, rather than standing up two separate managers/worker pools for one script. See
+     `examples/ttBar/run_processor_with_vr.py`.
    - **`submit()` gains a `kind` parameter** (`"processor"` or `"reducer"`, see `distributor.py`'s
      `TaskKind`), inserted between `category` and `func`, so `TaskVineDistributor` knows which of
      `resources_processor`/`resources_reducer` to apply without having to infer it from the
@@ -352,3 +368,25 @@ These resolve ambiguities in the plan above, decided during implementation:
    restart - the same cost as any interval that hasn't been checkpointed yet, not new data loss.
    What the single-transaction batching does protect is atomicity: a restart should never see a
    superseded checkpoint row deleted without its replacement present, or vice versa.
+
+9. **`VineReduce.extra_files`/`environment_variables`**: added so a caller can hand a processor
+   its supporting files (e.g. a data file it reads by relative path, an auth token/proxy) and
+   env vars (e.g. `X509_USER_PROXY`) without writing distributor-specific code. `VineReduce`
+   itself stays distributor-agnostic - it just calls `distributor.add_file(path)`/
+   `distributor.set_env_var(name, value)` once per entry, at the very start of `compute()`,
+   before any task is submitted. This extends the `Distributor` protocol with those two methods
+   (see "API vine_reduce <-> distributor" above):
+   - `LocalDistributor.add_file` is a no-op - its subprocesses already share vine_reduce's
+     filesystem (see its module docstring), so a local path is already visible under that same
+     path without shipping anything; no separate "remote name" exists to place it under.
+     `set_env_var` stores into a dict applied via `os.environ.update()` inside the worker
+     subprocess itself (`_run_cloudpickled`), not in the parent process, so it takes effect
+     regardless of whether the pool already forked that worker by the time `set_env_var` was
+     called.
+   - `TaskVineDistributor.add_file` calls `manager.declare_file()` once and remembers the
+     `(basename, vine.File)` pair; every `submit()` call from then on adds it as a task input
+     under that basename, alongside whatever `_remap_files` already attaches. `set_env_var`
+     similarly remembers `{name: value}` and calls `task.set_env_var(name, value)` for every task
+     submitted after. Only a plain basename is supported (no caller-chosen remote name) - the
+     common case (a processor module, a data file, a proxy) is opened by a fixed relative name
+     the processor code already expects, and a second knob for renaming isn't needed yet.

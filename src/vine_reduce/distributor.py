@@ -55,3 +55,15 @@ class Distributor(Protocol):
         """Copy the file for a completed (Success) result_id to dest_path, a
         path local to the vine_reduce process."""
         ...
+
+    def add_file(self, local_path: str) -> None:
+        """Make local_path (readable from the vine_reduce process) available,
+        under its basename, wherever every processor/reducer call submitted
+        after this point runs. For a distributor whose workers already share
+        vine_reduce's filesystem, this can be a no-op."""
+        ...
+
+    def set_env_var(self, name: str, value: str) -> None:
+        """Set an environment variable for every processor/reducer call
+        submitted after this point."""
+        ...

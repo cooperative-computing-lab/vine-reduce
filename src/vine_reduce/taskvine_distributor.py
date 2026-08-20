@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -61,13 +62,19 @@ class _InFlight:
 class TaskVineDistributor:
     def __init__(
         self,
-        port: int = 9123,
+        port: int | tuple[int, int] = 9123,
         name: str | None = None,
         resources_processor: dict[str, int] | None = None,
         resources_reducer: dict[str, int] | None = None,
         environment: str | None = None,
+        manager: vine.Manager | None = None,
     ):
-        self._manager = vine.Manager(port=port, name=name)
+        # manager lets a caller hand in an already-constructed vine.Manager
+        # (or a subclass, e.g. vine.DaskVine) instead of having this class
+        # build its own - the way to run coffea's own preprocess() and this
+        # distributor's tasks against the same manager/port, sharing workers
+        # between the two. port/name are ignored when manager is given.
+        self._manager = manager if manager is not None else vine.Manager(port=port, name=name)
         self._manager.enable_monitoring(watchdog=True)
 
         self._resources_by_kind: dict[TaskKind, dict[str, int]] = {
@@ -81,6 +88,11 @@ class TaskVineDistributor:
         self._token_by_result_id: dict[int, str] = {}
         self._in_flight_by_taskvine_id: dict[int, _InFlight] = {}
         self._categories_configured: set[str] = set()
+
+        # Files/env vars added via add_file/set_env_var, attached to every
+        # task submitted from then on - see those methods below.
+        self._extra_files: list[tuple[str, vine.File]] = []
+        self._extra_env: dict[str, str] = {}
 
     @property
     def port(self) -> int:
@@ -105,6 +117,12 @@ class TaskVineDistributor:
 
         for sandbox_name, vine_file in extra_inputs:
             task.add_input(vine_file, sandbox_name)
+
+        for remote_name, vine_file in self._extra_files:
+            task.add_input(vine_file, remote_name)
+
+        for name, value in self._extra_env.items():
+            task.set_env_var(name, value)
 
         result_file = self._manager.declare_temp()
         task.add_output(result_file, dest_token)
@@ -202,6 +220,16 @@ class TaskVineDistributor:
         self._manager.fetch_file(file)
         with open(dest_path, "wb") as f:
             f.write(file.contents())
+
+    def add_file(self, local_path: str) -> None:
+        """Declare local_path once, and attach it as an input - under its
+        basename - to every task submitted from now on."""
+        remote_name = os.path.basename(local_path)
+        self._extra_files.append((remote_name, self._manager.declare_file(local_path)))
+
+    def set_env_var(self, name: str, value: str) -> None:
+        """Set an environment variable on every task submitted from now on."""
+        self._extra_env[name] = value
 
     def shutdown(self) -> None:
         """No-op: workers are owned by the caller, not this distributor, so
