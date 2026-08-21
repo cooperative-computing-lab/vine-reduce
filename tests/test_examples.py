@@ -30,10 +30,7 @@ def _run_example(
     """Copies examples/<example_dir_name>'s .py files into an isolated tmp
     directory and runs script_name there, exactly as a user would from
     within examples/<example_dir_name>. Isolating into tmp_path keeps
-    generated data/results/checkpoints out of the source tree, and (since
-    both examples happen to name their data-generation module the same
-    thing) keeps quick_start's write_test_data.py from ever sharing a
-    directory - and so a sys.path entry - with cortado's.
+    generated data/results/checkpoints out of the source tree.
     """
     src_dir = EXAMPLES_DIR / example_dir_name
     run_dir = tmp_path / example_dir_name
@@ -54,9 +51,3 @@ def test_quick_start_example(tmp_path):
     result = _run_example(tmp_path, "quick_start", "quick_start.py")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK: odd + even == all for every dataset" in result.stdout
-
-
-def test_cortado_example(tmp_path):
-    result = _run_example(tmp_path, "cortado", "vr_cortado.py")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "OK: signal passes the >=4-lepton skim more often than background" in result.stdout

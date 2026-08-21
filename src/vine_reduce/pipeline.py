@@ -82,6 +82,7 @@ class Pipeline:
         reduction_size: int,
         checkpoint_time: float | None,
         checkpoint_size: float | None,
+        checkpoint_accumulations: bool,
         checkpoint_dir: str,
         checkpoint_retrieve: bool,
         results_dir: str,
@@ -108,6 +109,7 @@ class Pipeline:
         self.reduction_size = reduction_size
         self._checkpoint_time = checkpoint_time
         self._checkpoint_size = checkpoint_size
+        self._checkpoint_accumulations = checkpoint_accumulations
         self._checkpoint_dir = checkpoint_dir
         self._checkpoint_retrieve = checkpoint_retrieve
         self._results_dir = os.path.join(results_dir, dataset_name, processor_name)
@@ -380,7 +382,11 @@ class Pipeline:
 
     def _checkpoint_due(self, item: PoolItem) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall
-        time or in memory - to be worth writing this item out."""
+        time or in memory - to be worth writing this item out. When
+        checkpoint_accumulations is set, every accumulation (non-final
+        reduction) result is checkpointed regardless of the thresholds."""
+        if self._checkpoint_accumulations:
+            return True
         if (
             self._checkpoint_time is not None
             and item.since_checkpoint_time >= self._checkpoint_time

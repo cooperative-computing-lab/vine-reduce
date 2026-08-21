@@ -46,13 +46,10 @@ conda = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/btovar/vine_reduce"
-Repository = "https://github.com/btovar/vine_reduce.git"
-Documentation = "https://github.com/btovar/vine_reduce#readme"
-"Bug Tracker" = "https://github.com/btovar/vine_reduce/issues"
-
-[tool.setuptools_scm]
-write_to = "src/vine_reduce/_version.py"
+Homepage = "https://github.com/cooperative-computing-lab/vine_reduce"
+Repository = "https://github.com/cooperative-computing-lab/vine_reduce.git"
+Documentation = "https://github.com/cooperative-computing-lab/vine_reduce#readme"
+"Bug Tracker" = "https://github.com/cooperative-computing-lab/vine_reduce/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -103,6 +100,8 @@ pytest-cov = ">=2.0"
 black = ">=21.0"
 flake8 = ">=3.8"
 pyright = "*"
+python-build = ">=1.5.0,<2"
+twine = ">=7.0.0,<8"
 
 [tool.pixi.feature.pack.pypi-dependencies]
 vine_reduce = { path = ".", editable = false }

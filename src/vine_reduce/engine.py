@@ -50,6 +50,7 @@ class VineReduce:
     result_postprocess: Callable[[Any], Any] | None = None
     checkpoint_time: float | None = None
     checkpoint_size: float | None = None
+    checkpoint_accumulations: bool = False
     checkpoint_dir: str = "checkpoints"
     checkpoint_retrieve: bool = True
     results_dir: str = "results"
@@ -138,6 +139,7 @@ class VineReduce:
                         ),
                         checkpoint_time=self.checkpoint_time,
                         checkpoint_size=self.checkpoint_size,
+                        checkpoint_accumulations=self.checkpoint_accumulations,
                         checkpoint_dir=self.checkpoint_dir,
                         checkpoint_retrieve=self.checkpoint_retrieve,
                         results_dir=self.results_dir,

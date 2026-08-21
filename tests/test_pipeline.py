@@ -29,6 +29,7 @@ def make_pipeline(
     chunksize=None,
     checkpoint_time=None,
     checkpoint_size=None,
+    checkpoint_accumulations=False,
     db=None,
     dataset_name="ds",
 ):
@@ -54,6 +55,7 @@ def make_pipeline(
             reduction_size=reduction_size,
             checkpoint_time=checkpoint_time,
             checkpoint_size=checkpoint_size,
+            checkpoint_accumulations=checkpoint_accumulations,
             checkpoint_dir=str(tmp_path / "checkpoints"),
             checkpoint_retrieve=True,
             results_dir=str(tmp_path / "results"),
@@ -137,6 +139,31 @@ def test_checkpoint_time_threshold_persists_and_supersedes_intermediates(
     # and its file, plus every superseded checkpoint file, should be cleaned
     # off disk (final results live in results_dir, not checkpoint_dir).
     assert os.listdir(str(tmp_path / "checkpoints")) == []
+    db.close()
+
+
+def test_checkpoint_accumulations_checkpoints_every_intermediate_reduction(
+    fake_distributor, tmp_path
+):
+    dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_accumulations=True
+    )
+    checkpoint_calls = []
+    original_checkpoint = pipeline._checkpoint
+
+    def spy_checkpoint(new_item, inputs, is_final):
+        checkpoint_calls.append(is_final)
+        original_checkpoint(new_item, inputs, is_final)
+
+    pipeline._checkpoint = spy_checkpoint
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 4
+    # a.root+b.root and c.root+d.root each reduce to a non-final checkpoint,
+    # then those two reduce to the final one - three reductions, all checkpointed.
+    assert checkpoint_calls == [False, False, True]
     db.close()
 
 

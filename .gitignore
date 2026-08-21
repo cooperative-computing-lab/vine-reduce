@@ -5,6 +5,8 @@ __pycache__/
 .coverage
 .pixi/
 _version.py
+build/
+dist/
 checkpoints/
 results/
 vine-run-info/
