@@ -101,11 +101,7 @@ builds that tarball for you, via `poncho_package_create`:
 ```python
 from vine_reduce import TaskVineDistributor, get_environment
 
-environment = get_environment(
-    # any pip-recognized install spec: a PyPI name, a version pin, a local
-    # path, a "name @ git+URL" direct reference, ...
-    extra_pip=["/path/to/my-analysis-repo"],
-)
+environment = get_environment()
 distributor = TaskVineDistributor(
     port=0,
     resources_processor={"cores": 1},
@@ -113,19 +109,22 @@ distributor = TaskVineDistributor(
 )
 ```
 
-By default the packed environment contains just `vine_reduce` itself;
-`extra_conda`/`extra_pip` add whatever else your workers need on top of
-that. Builds are cached on disk (keyed by the resolved package spec) and
-reused across runs. If `vine_reduce` - or another package named via
-`pip_local_to_watch` - is installed editable in the environment calling
-`get_environment()` and has uncommitted changes there, the next call
-rebuilds automatically rather than risk shipping stale code (pass
-`unstaged="fail"` to raise `UnstagedChanges` instead):
+`get_environment()` packs whatever is currently installed in the calling
+conda environment (`$CONDA_PREFIX` by default, or pass `conda_env_path=`) -
+nothing more. Install whatever your workers need (conda install, pip
+install, a pixi dependency, ...) into that environment before calling it.
+Builds are cached on disk (keyed by a hash of the environment's installed
+packages) and reused across runs. Editable pip installs can't be packed
+as-is, so any package currently installed editable (`vine_reduce` itself,
+typically) is temporarily reinstalled non-editable for the pack step and
+reinstalled editable again immediately afterwards. If `vine_reduce` - or
+another package named via `pip_editable` - has uncommitted changes in its
+checkout, the next call rebuilds automatically rather than risk shipping
+stale code (pass `unstaged="fail"` to raise `UnstagedChanges` instead):
 
 ```python
 environment = get_environment(
-    extra_pip=["/path/to/my-analysis-repo"],
-    pip_local_to_watch={"my-analysis-repo": ["src", "pyproject.toml"]},
+    pip_editable={"my-analysis-repo": ["src", "pyproject.toml"]},
 )
 ```
 

@@ -1,71 +1,64 @@
 """Build a relocatable, packed Python environment to ship to remote workers.
 
 Most commonly this is the poncho package handed to
-`TaskVineDistributor(environment=...)` (see taskvine_distributor.py and
-DOC.md's "Packaging the environment for TaskVine workers"), but nothing
-here is TaskVine-specific: `get_environment()` just resolves a package spec
+`TaskVineDistributor(environment=...)` (see taskvine_distributor.py and the
+README's "Packaging an environment for remote workers"), but nothing here
+is TaskVine-specific: `get_environment()` just resolves a conda environment
 to a tarball path on disk. Any current or future `Distributor` that wants a
 shipped environment can use it the same way; a distributor whose workers
 already share vine_reduce's filesystem (e.g. LocalDistributor) simply has
 no use for the result.
 
 Adapted from TopEFT/topcoffea's `topcoffea/modules/remote_environment.py`
-(https://github.com/TopEFT/topcoffea), generalized so the default package
-set is vine_reduce itself rather than a fixed HEP analysis stack - callers
-add whatever else their workers need via extra_conda/extra_pip.
+(https://github.com/TopEFT/topcoffea), simplified to pack whatever is
+already installed in the calling conda environment (normally $CONDA_PREFIX)
+rather than resolving a separate package spec - add whatever your workers
+need by installing it into that environment before calling get_environment,
+not through this module.
 
 Building goes through `poncho_package_create` (part of `ndcctools`/cctools,
 same as TaskVine itself - see the `conda` extra in pyproject.toml), which
-takes a conda+pip spec and produces a single relocatable tarball. Two things
-make repeated calls cheap:
-  - Results are cached on disk, keyed by a hash of the resolved spec plus
-    the state of any locally-editable packages being watched (see below).
-    A cache hit just returns the existing tarball path immediately.
+packs a conda environment directory into a single relocatable tarball. Two
+things make repeated calls cheap:
+  - Results are cached on disk, keyed by a hash of the environment's
+    installed packages plus the state of any locally-editable packages (see
+    below). A cache hit just returns the existing tarball path immediately.
   - Any locally-editable pip install found via `pip list --editable`
     (vine_reduce itself by default, or whatever else is listed in
-    pip_local_to_watch) has its git commit hash folded into that cache key,
-    and unstaged changes to the paths being watched are treated as "always
+    pip_editable) has its git commit hash folded into that cache key, and
+    unstaged changes to the paths being watched are treated as "always
     rebuild" (or raise UnstagedChanges, depending on `unstaged=`) - so a
     tarball never silently ships stale code from an editable checkout.
+
+Editable installs can't be packed as-is - conda-pack needs real files in
+site-packages, not a .pth pointing back at a checkout that won't exist on a
+remote worker - so any package currently installed editable is temporarily
+reinstalled non-editable for the pack step, then reinstalled editable again
+immediately afterwards (see _create_env).
 """
 
 from __future__ import annotations
 
 import glob
 import hashlib
+import importlib.util
 import json
 import logging
 import os
-import re
+import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_PY_VERSION = "{}.{}.{}".format(*sys.version_info[:3])
-
 _DEFAULT_CACHE_DIR = Path.cwd() / "vine_reduce-envs"
-
-_DEFAULT_MODULES: dict[str, Any] = {
-    "conda": {
-        "channels": ["conda-forge"],
-        "packages": [f"python={_PY_VERSION}", "pip", "conda-pack", "ndcctools>=7.17.1"],
-    },
-    # Not yet on PyPI, so installed straight from its own repository (a
-    # plain PEP 508 direct reference, same as this project's own
-    # [tool.pixi.pypi-dependencies] entry for itself) - switch to a bare
-    # "vine_reduce" once it's published there.
-    "pip": ["vine_reduce @ git+https://github.com/cooperative-computing-lab/vine_reduce.git"],
-}
 
 # package name (as reported by `pip list --editable`, i.e. its distribution
 # name, not an install spec) -> paths relative to its repo root whose git
 # status decides whether an editable install of that package counts as
 # "changed" for the cache key - see _local_pip_commits.
-_DEFAULT_PIP_LOCAL_TO_WATCH: dict[str, list[str]] = {"vine_reduce": ["src", "pyproject.toml"]}
+_DEFAULT_PIP_EDITABLE: dict[str, list[str]] = {"vine_reduce": ["src", "pyproject.toml"]}
 
 
 class UnstagedChanges(Exception):
@@ -87,42 +80,36 @@ def _current_conda_package_versions(conda_env_path: str | None = None) -> dict[s
     }
 
 
-def _pin_versions_from_current_env(spec: dict[str, Any]) -> dict[str, Any]:
-    """For any package in `spec` that isn't already version-pinned, pin it to
-    whatever version is active in the current conda environment, if any -
-    so the packed environment matches local development rather than
-    resolving possibly-different versions at pack time."""
-    with tempfile.NamedTemporaryFile() as f:
-        subprocess.check_call(
-            ["conda", "env", "export", "--json"], stdout=f, stdin=subprocess.DEVNULL
+def _environment_state_hash(conda_env_path: str) -> str:
+    """Hash of every package currently installed in conda_env_path (conda
+    and pip packages alike - pip installs show up in `conda list` too), used
+    as part of the cache key so a rebuild is triggered whenever the
+    environment's contents change."""
+    versions = _current_conda_package_versions(conda_env_path)
+    return hashlib.sha256("".join(sorted(versions.values())).encode()).hexdigest()[:8]
+
+
+def _check_pack_dependencies() -> None:
+    """Raise a clear error if poncho_package_create (from ndcctools) or its
+    conda-pack dependency aren't installed, rather than failing deep inside
+    a subprocess call with a cryptic error."""
+    missing = []
+    if shutil.which("poncho_package_create") is None:
+        missing.append("ndcctools (provides poncho_package_create)")
+    if importlib.util.find_spec("conda_pack") is None:
+        missing.append("conda-pack")
+    if missing:
+        raise RuntimeError(
+            "Cannot build a packed environment, missing: "
+            + ", ".join(missing)
+            + ". Install them (e.g. `pixi add ndcctools conda-pack`, or this project's "
+            "'conda' extra) before calling get_environment()."
         )
-        with open(f.name) as spec_file:
-            current_spec = json.load(spec_file)
-        current_spec["pinning"] = {"conda": _current_conda_package_versions()}
-
-        dependencies = current_spec.get("dependencies", [])
-        conda_deps = {
-            re.sub("[!~=<>].*$", "", x): x for x in dependencies if not isinstance(x, dict)
-        }
-        pip_deps = {
-            re.sub("[!~=<>].*$", "", y): y
-            for x in dependencies
-            if isinstance(x, dict) and "pip" in x
-            for y in x["pip"]
-        }
-
-        for i, package in enumerate(spec["conda"]["packages"]):
-            if not re.search("[!~=<>].*$", package) and package in conda_deps:
-                spec["conda"]["packages"][i] = conda_deps[package]
-
-        for i, package in enumerate(spec["pip"]):
-            if not re.search("[!~=<>].*$", package) and package in pip_deps:
-                spec["pip"][i] = pip_deps[package]
-
-    return spec
 
 
-def _create_env(env_path: str, spec: dict[str, Any], force: bool = False) -> str:
+def _create_env(
+    env_path: str, conda_env_path: str, editable: dict[str, str], force: bool = False
+) -> str:
     if force:
         logger.info("Forcing rebuild of %s", env_path)
         Path(env_path).unlink(missing_ok=True)
@@ -130,24 +117,40 @@ def _create_env(env_path: str, spec: dict[str, Any], force: bool = False) -> str
         logger.info("Found in cache: %s", env_path)
         return env_path
 
-    logger.info("Checking current conda environment")
-    spec = _pin_versions_from_current_env(spec)
+    _check_pack_dependencies()
 
-    with tempfile.NamedTemporaryFile() as f:
-        packages_json = json.dumps(spec)
-        logger.info("base env specification: %s", packages_json)
-        f.write(packages_json.encode())
-        f.flush()
-        logger.info("Creating environment %s", env_path)
+    for package, path in editable.items():
+        logger.info("Reinstalling %s non-editable for packing", package)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", path],
+            stdin=subprocess.DEVNULL,
+        )
 
-        try:
-            subprocess.check_output(
-                ["poncho_package_create", f.name, env_path], stderr=subprocess.STDOUT
+    try:
+        logger.info("Creating environment %s from %s", env_path, conda_env_path)
+        subprocess.check_output(
+            ["poncho_package_create", conda_env_path, env_path], stderr=subprocess.STDOUT
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("poncho package creation failed with code %s", e.returncode)
+        logger.error(e.output.decode())
+        raise
+    finally:
+        for package, path in editable.items():
+            logger.info("Reinstalling %s editable", package)
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    "--force-reinstall",
+                    "-e",
+                    path,
+                ],
+                stdin=subprocess.DEVNULL,
             )
-        except subprocess.CalledProcessError as e:
-            logger.error("poncho package creation failed with code %s", e.returncode)
-            logger.error(e.output.decode())
-            raise
 
     return env_path
 
@@ -170,7 +173,7 @@ def _find_editable_pip_installs() -> dict[str, str]:
 
 
 def _local_pip_commits(
-    paths_by_package: dict[str, str], pip_local_to_watch: dict[str, list[str]]
+    paths_by_package: dict[str, str], pip_editable: dict[str, list[str]]
 ) -> dict[str, str]:
     """For each editable package, the git commit of its checkout, or the
     sentinel "HEAD" if the watched paths have uncommitted changes (or the
@@ -178,7 +181,7 @@ def _local_pip_commits(
     commits: dict[str, str] = {}
     for package, path in paths_by_package.items():
         try:
-            watch_paths = pip_local_to_watch.get(package)
+            watch_paths = pip_editable.get(package)
             pathspecs = [f":(top){p}" for p in watch_paths] if watch_paths else []
 
             commit = (
@@ -240,9 +243,8 @@ def _trim_cache(cache_dir: Path, cache_size: int, *keep: str) -> None:
 
 
 def get_environment(
-    extra_conda: list[str] | None = None,
-    extra_pip: list[str] | None = None,
-    pip_local_to_watch: dict[str, list[str]] | None = None,
+    conda_env_path: str | Path | None = None,
+    pip_editable: dict[str, list[str]] | None = None,
     cache_dir: str | Path | None = None,
     force: bool = False,
     unstaged: str = "rebuild",
@@ -252,50 +254,46 @@ def get_environment(
     with poncho_package_create if needed, and return its path - suitable to
     pass straight to `TaskVineDistributor(environment=...)`.
 
-    extra_conda/extra_pip add packages beyond the vine_reduce-only default -
-    each pip entry can be a plain requirement or any pip-recognized install
-    spec (a version pin, a local path, a `name @ git+URL` direct reference,
-    ...), e.g. `extra_pip=["/path/to/my-analysis-repo"]` to also pack a
-    locally-checked-out analysis package that isn't published anywhere.
+    conda_env_path defaults to $CONDA_PREFIX: the environment packed is
+    whatever is currently installed there, nothing more. Add packages your
+    workers need by installing them into that environment (conda install,
+    pip install, a pixi dependency, ...) before calling this.
 
-    pip_local_to_watch merges on top of the default (vine_reduce's own
+    pip_editable merges on top of the default (vine_reduce's own
     `src`/pyproject.toml): package name (as reported by
     `pip list --editable`, not an install spec - see _find_editable_pip_installs)
     -> list of paths, relative to that package's repo root, to `git status`.
-    If any of those packages is currently installed editable *and* has
-    uncommitted changes there, the build is treated as stale (see
-    `unstaged` below) regardless of whether it was also named in extra_pip.
+    Every package currently installed editable is reinstalled non-editable
+    for the pack step and back to editable afterwards, regardless of whether
+    it's named here; pip_editable only narrows which paths are watched to
+    decide if that package counts as "changed" for the cache key (a package
+    installed editable but not named here still gets watched, over its
+    whole repo).
 
     unstaged controls what happens when a watched editable install has
     uncommitted changes: "rebuild" (default) forces a fresh build, "fail"
     raises UnstagedChanges instead.
     """
+    conda_env_path = str(conda_env_path) if conda_env_path else os.environ.get("CONDA_PREFIX")
+    if not conda_env_path:
+        raise RuntimeError(
+            "No conda environment to pack: pass conda_env_path or activate one (so "
+            "$CONDA_PREFIX is set)"
+        )
+
     cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    spec: dict[str, Any] = {
-        "conda": {
-            "channels": list(_DEFAULT_MODULES["conda"]["channels"]),
-            "packages": list(_DEFAULT_MODULES["conda"]["packages"]),
-        },
-        "pip": list(_DEFAULT_MODULES["pip"]),
-    }
-    watch = dict(_DEFAULT_PIP_LOCAL_TO_WATCH)
-    if pip_local_to_watch:
-        watch.update(pip_local_to_watch)
-
-    if extra_conda:
-        spec["conda"]["packages"].extend(extra_conda)
-    if extra_pip:
-        spec["pip"].extend(extra_pip)
-
-    packages_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:8]
+    watch = dict(_DEFAULT_PIP_EDITABLE)
+    if pip_editable:
+        watch.update(pip_editable)
 
     paths_by_package = _find_editable_pip_installs()
     commits = _local_pip_commits(paths_by_package, watch)
     pip_check = _combined_commit_key(paths_by_package, commits)
 
-    env_path = str(cache_dir / f"env_spec_{packages_hash}_edit_{pip_check}.tar.gz")
+    env_hash = _environment_state_hash(conda_env_path)
+    env_path = str(cache_dir / f"env_{env_hash}_edit_{pip_check}.tar.gz")
     _trim_cache(cache_dir, cache_size, env_path)
 
     if pip_check == "HEAD":
@@ -309,4 +307,4 @@ def get_environment(
                 ", ".join(Path(paths_by_package[p]).name for p in changed),
             )
 
-    return _create_env(env_path, spec, force)
+    return _create_env(env_path, conda_env_path, paths_by_package, force)
