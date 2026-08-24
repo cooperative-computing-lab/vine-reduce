@@ -88,6 +88,52 @@ that call actually runs, at the execution site:
 
 All three live in `src/vine_reduce/executor.py`.
 
+## Packaging an environment for remote workers
+
+`TaskVineDistributor` accepts an `environment=` argument — a path to a
+packed, relocatable [poncho package](https://cctools.readthedocs.io/en/stable/poncho)
+tarball — which it ships to every worker alongside each task, so worker
+nodes need nothing beyond TaskVine itself pre-installed.
+
+`vine_reduce.get_environment()` (`src/vine_reduce/remote_environment.py`)
+builds that tarball for you, via `poncho_package_create`:
+
+```python
+from vine_reduce import TaskVineDistributor, get_environment
+
+environment = get_environment(
+    # any pip-recognized install spec: a PyPI name, a version pin, a local
+    # path, a "name @ git+URL" direct reference, ...
+    extra_pip=["/path/to/my-analysis-repo"],
+)
+distributor = TaskVineDistributor(
+    port=0,
+    resources_processor={"cores": 1},
+    environment=environment,
+)
+```
+
+By default the packed environment contains just `vine_reduce` itself;
+`extra_conda`/`extra_pip` add whatever else your workers need on top of
+that. Builds are cached on disk (keyed by the resolved package spec) and
+reused across runs. If `vine_reduce` - or another package named via
+`pip_local_to_watch` - is installed editable in the environment calling
+`get_environment()` and has uncommitted changes there, the next call
+rebuilds automatically rather than risk shipping stale code (pass
+`unstaged="fail"` to raise `UnstagedChanges` instead):
+
+```python
+environment = get_environment(
+    extra_pip=["/path/to/my-analysis-repo"],
+    pip_local_to_watch={"my-analysis-repo": ["src", "pyproject.toml"]},
+)
+```
+
+`get_environment` is not TaskVine-specific: it just resolves a tarball
+path, so it works the same way regardless of which `Distributor`
+ultimately uses that path. Building requires `poncho_package_create` and
+`conda` on `PATH` - see the `conda` extra in `pyproject.toml`.
+
 ## HEP / coffea workflows
 
 `vine_reduce.VineReduceCoffea` is a specialization for

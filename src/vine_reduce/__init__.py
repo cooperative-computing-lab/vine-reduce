@@ -4,6 +4,7 @@ from .distributor import Distributor
 from .engine import VineReduce
 from .local_distributor import LocalDistributor
 from .pipeline import VineReduceError
+from .remote_environment import UnstagedChanges, get_environment
 from .types import Chunk, Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
 
 if TYPE_CHECKING:
@@ -19,8 +20,10 @@ __all__ = [
     "RuntimeFailure",
     "Success",
     "TaskVineDistributor",
+    "UnstagedChanges",
     "VineReduce",
     "VineReduceError",
+    "get_environment",
 ]
 
 
