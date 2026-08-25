@@ -108,10 +108,11 @@ class LocalDistributor:
     def retrieve(self, result_id: int, dest_path: str) -> None:
         shutil.copy(self._files[result_id], dest_path)
 
-    def add_file(self, local_path: str) -> None:
+    def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """No-op: worker subprocesses already share vine_reduce's filesystem
         (see module docstring), so local_path is already visible to them
-        under that same path without shipping anything."""
+        under that same path without shipping anything. remote_path is
+        accepted for interface compatibility but unused."""
 
     def set_env_var(self, name: str, value: str) -> None:
         self._env_vars[name] = value

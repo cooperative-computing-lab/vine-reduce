@@ -225,10 +225,11 @@ class TaskVineDistributor:
         with open(dest_path, "wb") as f:
             f.write(file.contents())
 
-    def add_file(self, local_path: str) -> None:
-        """Declare local_path once, and attach it as an input - under its
-        basename - to every task submitted from now on."""
-        remote_name = os.path.basename(local_path)
+    def add_file(self, local_path: str, remote_path: str | None = None) -> None:
+        """Declare local_path once, and attach it as an input - under
+        remote_path, defaulting to local_path's basename - to every task
+        submitted from now on."""
+        remote_name = remote_path or os.path.basename(local_path)
         self._extra_files.append((remote_name, self._manager.declare_file(local_path)))
 
     def set_env_var(self, name: str, value: str) -> None:

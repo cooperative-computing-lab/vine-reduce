@@ -56,11 +56,12 @@ class Distributor(Protocol):
         path local to the vine_reduce process."""
         ...
 
-    def add_file(self, local_path: str) -> None:
+    def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """Make local_path (readable from the vine_reduce process) available,
-        under its basename, wherever every processor/reducer call submitted
-        after this point runs. For a distributor whose workers already share
-        vine_reduce's filesystem, this can be a no-op."""
+        under remote_path (defaulting to local_path's basename), wherever
+        every processor/reducer call submitted after this point runs. For a
+        distributor whose workers already share vine_reduce's filesystem,
+        this can be a no-op."""
         ...
 
     def set_env_var(self, name: str, value: str) -> None:
