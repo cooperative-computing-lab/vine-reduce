@@ -3,7 +3,7 @@ requires = ["setuptools>=45,<81", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vine_reduce"
+name = "vine-reduce"
 version = "2026.8.25"
 description = "Dynamic MapReduce framework for data processing"
 readme = "README.md"
@@ -14,9 +14,9 @@ authors = [
 maintainers = [
     {name = "Ben Tovar", email = "btovar@nd.edu"},
 ]
-keywords = ["mapreduce", "data-processing", "distributed-computing"]
+keywords = ["dynamic-data-reduction", "mapreduce", "data-processing", "distributed-computing"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
