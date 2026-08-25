@@ -43,11 +43,11 @@ class Distributor(Protocol):
         return None if timeout elapses first."""
         ...
 
-    def free_result(self, result_id: int) -> None:
+    def release_result(self, result_id: int) -> None:
         """Release any resources (e.g. worker-local files) held for result_id."""
         ...
 
-    def hungry(self) -> int:
+    def capacity(self) -> int:
         """How many more chunks the distributor could usefully accept right now."""
         ...
 

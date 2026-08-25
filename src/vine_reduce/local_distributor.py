@@ -95,12 +95,12 @@ class LocalDistributor:
         self._dispatch()
         return outcome
 
-    def free_result(self, result_id: int) -> None:
+    def release_result(self, result_id: int) -> None:
         path = self._files.pop(result_id, None)
         if path is not None and os.path.exists(path):
             os.remove(path)
 
-    def hungry(self) -> int:
+    def capacity(self) -> int:
         target_queue_depth = 2 * self._max_workers
         in_flight = len(self._running) + len(self._pending)
         return max(0, target_queue_depth - in_flight)
@@ -120,3 +120,9 @@ class LocalDistributor:
         self._pool.shutdown(wait=True)
         if self._owns_work_dir:
             shutil.rmtree(self._work_dir, ignore_errors=True)
+
+    def __enter__(self) -> "LocalDistributor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.shutdown()

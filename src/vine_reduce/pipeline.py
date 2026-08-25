@@ -33,7 +33,7 @@ class PoolItem:
     since_checkpoint_time: float
     since_checkpoint_memory: float
     checkpoint_row_id: int | None = None
-    source_result_id: int | None = None  # distributor result_id to free once consumed
+    source_result_id: int | None = None  # distributor result_id to release once consumed
 
 
 @dataclass
@@ -357,7 +357,7 @@ class Pipeline:
         assert isinstance(outcome, Success)
         for item in group:
             if item.source_result_id is not None:
-                self._distributor.free_result(item.source_result_id)
+                self._distributor.release_result(item.source_result_id)
 
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
@@ -406,7 +406,7 @@ class Pipeline:
         if should_retrieve:
             dest_path = os.path.join(dest_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
             self._distributor.retrieve(new_item.source_result_id, dest_path)
-            self._distributor.free_result(new_item.source_result_id)
+            self._distributor.release_result(new_item.source_result_id)
             new_item.file = dest_path
             new_item.source_result_id = None
         # else: the distributor keeps its own permanent copy; nothing to move.

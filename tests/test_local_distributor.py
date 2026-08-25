@@ -58,22 +58,22 @@ def test_retrieve_copies_file(distributor, tmp_path):
     assert serialization.load(str(dest)) == 3
 
 
-def test_free_result_removes_file(distributor):
+def test_release_result_removes_file(distributor):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
     outcome = distributor.wait(timeout=30)
 
-    distributor.free_result(outcome.result_id)
+    distributor.release_result(outcome.result_id)
 
     import os
 
     assert not os.path.exists(outcome.file)
 
 
-def test_hungry_reports_available_capacity(distributor):
+def test_capacity_reports_available_capacity(distributor):
     # 2 workers -> target queue depth of 4, nothing in flight yet
-    assert distributor.hungry() == 4
+    assert distributor.capacity() == 4
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 100000))
-    assert distributor.hungry() == 3
+    assert distributor.capacity() == 3
 
 
 def test_add_file_is_a_no_op_that_does_not_raise(distributor, tmp_path):

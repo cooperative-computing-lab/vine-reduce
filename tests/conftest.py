@@ -19,9 +19,9 @@ class FakeDistributor:
     testing vine_reduce's own logic in isolation - it executes closures
     directly rather than pickling them to a subprocess."""
 
-    def __init__(self, work_dir: str, hungry_amount: int = 1000):
+    def __init__(self, work_dir: str, capacity_amount: int = 1000):
         self._work_dir = work_dir
-        self._hungry_amount = hungry_amount
+        self._capacity_amount = capacity_amount
         self._next_id = itertools.count(1)
         self._seq = itertools.count()
         self._ready: list[tuple[int, int, int, RawOutcome]] = []
@@ -44,11 +44,11 @@ class FakeDistributor:
             self._files[result_id] = raw.file
         return raw.to_outcome(result_id)
 
-    def free_result(self, result_id: int) -> None:
+    def release_result(self, result_id: int) -> None:
         self._files.pop(result_id, None)
 
-    def hungry(self) -> int:
-        return self._hungry_amount
+    def capacity(self) -> int:
+        return self._capacity_amount
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
         shutil.copy(self._files[result_id], dest_path)

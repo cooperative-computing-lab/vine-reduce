@@ -211,12 +211,12 @@ class TaskVineDistributor:
             "wall_time_s": (measured.wall_time or 0) / 1e6,
         }
 
-    def free_result(self, result_id: int) -> None:
+    def release_result(self, result_id: int) -> None:
         file = self._files_by_token.pop(_result_token(result_id), None)
         if file is not None:
             self._manager.undeclare_file(file)
 
-    def hungry(self) -> int:
+    def capacity(self) -> int:
         return self._manager.hungry()
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
@@ -239,3 +239,9 @@ class TaskVineDistributor:
         """No-op: workers are owned by the caller, not this distributor, so
         there is nothing here to tear down beyond letting the vine.Manager be
         garbage collected."""
+
+    def __enter__(self) -> "TaskVineDistributor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.shutdown()

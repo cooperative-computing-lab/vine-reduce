@@ -167,7 +167,7 @@ class VineReduce:
             capacity = max(
                 0,
                 min(
-                    distributor.hungry(),
+                    distributor.capacity(),
                     self.max_chunks_active - in_flight_total,
                     self.max_chunks_cycle,
                 ),

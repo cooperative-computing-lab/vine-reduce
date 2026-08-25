@@ -43,7 +43,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 │   ▼                                                                          │
 │ datasets_to_chunks()   generator, restarted per processor                    │
 │   │ ──► Chunk(url, start, stop)                                              │
-│   │     throttled by distributor.hungry(), max_chunks_active,                │
+│   │     throttled by distributor.capacity(), max_chunks_active,              │
 │   │     max_chunks_cycle; chunksize halved on resource exhaustion            │
 │   ▼                                                                          │
 │ is_result(num_events, total_time, total_memory)                              │
@@ -51,7 +51,7 @@ Management of chunksize is per processor x dataset. Initial chunksizes can be gi
 │   ▼                                                                          │
 │ checkpoint logic (checkpoint_time / checkpoint_size thresholds)              │
 │   ├──► sqlite db          (progress, checksums, restart state)               │
-│   ├──► distributor.free_result(result_id)  (superseded temp results)         │
+│   ├──► distributor.release_result(result_id)  (superseded temp results)      │
 │   └──► checkpoint_dir/ , results_dir/  (distributor copies files here        │
 │         if checkpoint_retrieve / results_retrieve is True)                   │
 │                                                                              │
@@ -111,10 +111,10 @@ generator: datasets\_to\_chunks Generate one by one the chunks from the datasets
                               restarted per processing function. Not all chunks should be generated at once
                               to allow the chunksize to adapt accordingly. A parameter of max\_chunks\_active can be set
                               to limit the number of chunks currently being processed by the distributor
-                              (i.e., submitted but not yet freed). Also max\_chunks\_cycle sets a limit on
+                              (i.e., submitted but not yet released). Also max\_chunks\_cycle sets a limit on
                               how many chunks can be given to the distributor in a single call to
                               datasets\_to\_chunks. The distributor should return the number of chunks it
-                              can currently handle from a call to its hungry method; this number is capped
+                              can currently handle from a call to its capacity method; this number is capped
                               by max\_chunks\_active minus chunks currently in flight, and by
                               max\_chunks\_cycle per call.
                               This function executes locally with the process running vine\_reduce.
@@ -158,10 +158,10 @@ function: reducer\_wrapper: Calls the reduction function and generates its outco
 A distributor has these methods:
 
 ```python
-result_id = submit(priority, category, kind, executor_wrapper | reducer\_wrapper, *args): submit a processor or reduction function call. Category is a string that identifies functions of the same processing/reduction set. kind is "processor" or "reducer", letting a distributor apply different resource requests to each. Returns a result_id, used later to free_result.
+result_id = submit(priority, category, kind, executor_wrapper | reducer\_wrapper, *args): submit a processor or reduction function call. Category is a string that identifies functions of the same processing/reduction set. kind is "processor" or "reducer", letting a distributor apply different resource requests to each. Returns a result_id, used later to release_result.
 outcome = wait(timeout): wait for a result to be available and return its Outcome (RuntimeFailure | ResourceExhaustion | Success). On timeout return None. outcome.result_id identifies which submit() call this outcome corresponds to.
-free_result(result_id): remove resources associated with result_id
-chunks_wanted = hungry(): number of additional chunks the distributor could handle given the current resources.
+release_result(result_id): remove resources associated with result_id
+chunks_wanted = capacity(): number of additional chunks the distributor could handle given the current resources.
 add_file(local_path): make local_path available, under its basename, wherever every call submitted
                        from now on runs.
 set_env_var(name, value): set an environment variable for every call submitted from now on.
@@ -241,7 +241,7 @@ These resolve ambiguities in the plan above, decided during implementation:
    checksum changes, that dataset's checkpoints are discarded and it restarts from scratch.
 
 2. **Distributor API gains a fifth method**, `retrieve(result_id, dest_path)`, beyond the
-   submit/wait/free_result/hungry described above:
+   submit/wait/release_result/capacity described above:
    ```python
    retrieve(result_id, dest_path): copy/materialize the file for a completed result_id to
                                     dest_path, a path local to the vine_reduce process.

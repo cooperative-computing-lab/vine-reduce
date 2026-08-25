@@ -95,18 +95,18 @@ def test_retrieve_copies_file(distributor, tmp_path):
     assert serialization.load(str(dest)) == 3
 
 
-def test_free_result_allows_reuse(distributor):
+def test_release_result_allows_reuse(distributor):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
     outcome = distributor.wait(timeout=WAIT_TIMEOUT)
 
-    distributor.free_result(outcome.result_id)
-    # free_result is fire-and-forget cleanup; the main guarantee is that it
-    # doesn't raise, and that the distributor's own bookkeeping is cleared.
+    distributor.release_result(outcome.result_id)
+    # release_result is fire-and-forget cleanup; the main guarantee is that
+    # it doesn't raise, and that the distributor's own bookkeeping is cleared.
     assert _result_token(outcome.result_id) not in distributor._files_by_token
 
 
-def test_hungry_reports_a_non_negative_capacity(distributor):
-    assert distributor.hungry() >= 0
+def test_capacity_reports_a_non_negative_capacity(distributor):
+    assert distributor.capacity() >= 0
 
 
 def test_constructor_reuses_a_pre_built_manager(monkeypatch):
