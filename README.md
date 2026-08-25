@@ -18,8 +18,8 @@ This project requires Python 3.13+ and is managed with
 
 ```bash
 # Clone the repository
-git clone https://github.com/cooperative-computing-lab/vine_reduce.git
-cd vine_reduce
+git clone https://github.com/cooperative-computing-lab/vine-reduce.git
+cd vine-reduce
 
 # Install the default environment (runtime dependencies only)
 pixi install
