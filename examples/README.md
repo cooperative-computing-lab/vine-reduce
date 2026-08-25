@@ -5,6 +5,34 @@ here — plain Python values chunked out of binary files, no Coffea/awkward
 machinery, the fastest way to see `chunk_to_args`, `processors`, and
 `reducer` wired together.
 
+## Running `quick_start`
+
+Set up the environment once from the repository root, then run the example
+from its own directory. Pick whichever of pixi or conda you already have
+installed.
+
+### pixi
+
+```bash
+pixi install            # or: pixi install -e dev
+cd examples/quick_start
+pixi run python quick_start.py
+```
+
+### conda
+
+`environment.yml` at the repository root pins the same dependencies as the
+`[tool.pixi.dependencies]` table in `pyproject.toml`, but doesn't install
+`vine_reduce` itself, so add an editable `pip install` after activating it:
+
+```bash
+conda env create -f environment.yml
+conda activate vine-cms-example-stack
+pip install -e .
+cd examples/quick_start
+python quick_start.py
+```
+
 The real physics examples live in
 [`vine-cms-analysis-stack`](https://github.com/cooperative-computing-lab/vine-cms-analysis-stack),
 not here, so there's one canonical copy that stays in sync with that
