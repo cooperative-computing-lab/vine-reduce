@@ -167,7 +167,7 @@ def main():
     workers.min_workers = 1
     workers.max_workers = 1
 
-    with workers:
+    with workers, distributor:
         # VineReduce ties everything together: which datasets to process
         # (input), what map function to run per processor (processors), how
         # to turn a chunk into that function's arguments (chunk_to_args), how
@@ -195,7 +195,6 @@ def main():
         # results together until every (processor, dataset) pair has a
         # final result on disk under results_dir.
         vr.compute()
-    distributor.shutdown()
 
     # Sanity-check the results: for each dataset, the file written by the
     # sum_odd and sum_even processors should add up to the one written by

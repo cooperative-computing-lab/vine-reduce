@@ -67,3 +67,15 @@ class Distributor(Protocol):
         """Set an environment variable for every processor/reducer call
         submitted after this point."""
         ...
+
+    def shutdown(self) -> None:
+        """Release whatever resources this distributor owns (worker pools,
+        temp directories, ...). Also reachable via `with distributor: ...`,
+        which calls this on exit."""
+        ...
+
+    def __enter__(self) -> "Distributor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.shutdown()
