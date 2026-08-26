@@ -18,9 +18,9 @@ dataset) pair, it:
      another of its own kind.
   3. Writes that final result to results_dir, one file per (dataset,
      processor) pair (see load_result below), and along the way
-     checkpoints intermediate reduce outputs to checkpoint_dir so a
-     crashed run can resume without recomputing chunks it already
-     finished.
+     checkpoints intermediate reduce outputs to the TaskVineDistributor's
+     own checkpoint_dir so a crashed run can resume without recomputing
+     chunks it already finished.
 
 None of this requires knowing TaskVine's own vocabulary (managers, workers,
 tasks) beyond what it takes to start one: main() below constructs a
@@ -154,7 +154,10 @@ def main():
     # category needs. This is TaskVine's own resource-provisioning model -
     # vine_reduce just wires it up here rather than replacing it.
     distributor = TaskVineDistributor(
-        port=0, resources_processor={"cores": 1}, resources_reducer={"cores": 1}
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=checkpoint_dir,
     )
     # A manager alone runs nothing - it needs workers to connect and execute
     # tasks. vine.Factory manages the lifecycle of local worker processes for
@@ -172,11 +175,12 @@ def main():
         # (input), what map function to run per processor (processors), how
         # to turn a chunk into that function's arguments (chunk_to_args), how
         # large a chunk should be in entries (chunksize), where to write
-        # final and intermediate results (results_dir, checkpoint_dir), and
-        # which executor backend runs the actual tasks (distributor).
-        # reducer and is_result are left at their defaults: plain `a += b`
-        # addition, and "a group is final once it covers every entry of the
-        # dataset" (see defaults.py for both).
+        # final results (results_dir - intermediate checkpoints are the
+        # distributor's own concern, see checkpoint_dir above), and which
+        # executor backend runs the actual tasks (distributor). reducer and
+        # is_result are left at their defaults: plain `a += b` addition, and
+        # "a group is final once it covers every entry of the dataset" (see
+        # defaults.py for both).
         vr = VineReduce(
             processors={
                 "sum_even": sum_even_processor,
@@ -187,7 +191,6 @@ def main():
             chunk_to_args=numbers_chunk_to_args,
             chunksize=CHUNKSIZE,
             results_dir=results_dir,
-            checkpoint_dir=checkpoint_dir,
             distributor=distributor,
         )
         # Runs the full map/reduce loop to completion: submits chunk and

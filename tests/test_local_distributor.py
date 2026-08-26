@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from vine_reduce import serialization
@@ -13,7 +15,11 @@ from helpers import count_events, read_env_var
 
 @pytest.fixture
 def distributor(tmp_path):
-    dist = LocalDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
+    dist = LocalDistributor(
+        max_workers=2,
+        work_dir=str(tmp_path / "cluster"),
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
     yield dist
     dist.shutdown()
 
@@ -64,8 +70,6 @@ def test_release_result_removes_file(distributor):
 
     distributor.release_result(outcome.result_id)
 
-    import os
-
     assert not os.path.exists(outcome.file)
 
 
@@ -82,6 +86,71 @@ def test_add_file_is_a_no_op_that_does_not_raise(distributor, tmp_path):
     shipped = tmp_path / "shipped.txt"
     shipped.write_text("hi")
     distributor.add_file(str(shipped))
+
+
+def test_checkpoint_result_is_written_to_checkpoint_dir_not_work_dir(distributor, tmp_path):
+    result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+    checkpoint_id = distributor.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        count_events,
+        Chunk("a.root", 0, 5),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+        is_checkpoint=True,
+    )
+
+    outcomes = {}
+    for _ in range(2):
+        outcome = distributor.wait(timeout=30)
+        outcomes[outcome.result_id] = outcome
+
+    assert outcomes[result_id].file.startswith(str(tmp_path / "cluster") + os.sep)
+    assert outcomes[checkpoint_id].file.startswith(str(tmp_path / "checkpoints") + os.sep)
+
+
+def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
+    """A checkpoint has to survive this process ending, so it can be read back
+    on restart - unlike an owned work_dir, which is disposable scratch space
+    shutdown() removes (see test_shutdown_removes_owned_work_dir)."""
+    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
+    checkpoint_id = dist.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        count_events,
+        Chunk("a.root", 0, 5),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+        is_checkpoint=True,
+    )
+    outcome = dist.wait(timeout=30)
+    checkpoint_path = dist.checkpoint_path(checkpoint_id)
+
+    dist.shutdown()
+
+    assert os.path.exists(checkpoint_path)
+    assert outcome.file == checkpoint_path
+
+
+def test_shutdown_removes_owned_work_dir(tmp_path):
+    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
+    work_dir = dist._work_dir
+    _submit_chunk(dist, 1, Chunk("a.root", 0, 5))
+    dist.wait(timeout=30)
+
+    dist.shutdown()
+
+    assert not os.path.exists(work_dir)
 
 
 def test_set_env_var_is_visible_to_submitted_calls(distributor):

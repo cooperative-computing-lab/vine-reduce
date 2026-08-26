@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_db import CheckpointDB
 from vine_reduce.executor import simple_executor
-from vine_reduce.pipeline import Pipeline
+from vine_reduce.pipeline import Pipeline, VineReduceError
 
 from helpers import count_events, sum_reducer
 
@@ -32,6 +34,7 @@ def make_pipeline(
     checkpoint_accumulations=False,
     db=None,
     dataset_name="ds",
+    is_result=None,
 ):
     db = db or CheckpointDB(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
@@ -49,17 +52,14 @@ def make_pipeline(
             executor_wrapper=defaults.executor_wrapper,
             reducer=reducer,
             reducer_wrapper=defaults.reducer_wrapper,
-            is_result=defaults.make_default_is_result(total_events),
+            is_result=is_result or defaults.make_default_is_result(total_events),
             result_postprocess=None,
             chunksize=chunksize,
             reduction_size=reduction_size,
             checkpoint_time=checkpoint_time,
             checkpoint_distance=checkpoint_distance,
             checkpoint_accumulations=checkpoint_accumulations,
-            checkpoint_dir=str(tmp_path / "checkpoints"),
-            checkpoint_retrieve=True,
             results_dir=str(tmp_path / "results"),
-            results_retrieve=True,
             process_priority=1,
             reduce_priority=2,
         ),
@@ -79,7 +79,7 @@ def run_to_completion(pipeline, distributor, max_cycles=1000):
         pipeline.feed(100)
         outcome = distributor.wait()
         if outcome is not None:
-            pipeline.handle_outcome(outcome.result_id, outcome)
+            pipeline.handle_outcome(outcome)
     raise AssertionError("pipeline did not finish within max_cycles")
 
 
@@ -136,9 +136,11 @@ def test_checkpoint_time_threshold_persists_and_supersedes_intermediates(
     # leaving only the final one.
     assert len(rows) == 1
     assert rows[0].is_final is True
-    # and its file, plus every superseded checkpoint file, should be cleaned
-    # off disk (final results live in results_dir, not checkpoint_dir).
-    assert os.listdir(str(tmp_path / "checkpoints")) == []
+    # every superseded checkpoint file, plus the final result's own
+    # originating cluster-side copy, should be cleaned off disk (the final
+    # result itself lives in results_dir, a separate copy - see
+    # final_value()).
+    assert os.listdir(str(tmp_path / "cluster")) == []
     db.close()
 
 
@@ -158,7 +160,7 @@ def test_checkpoint_distance_threshold_persists_and_supersedes_intermediates(
     # leaving only the final one.
     assert len(rows) == 1
     assert rows[0].is_final is True
-    assert os.listdir(str(tmp_path / "checkpoints")) == []
+    assert os.listdir(str(tmp_path / "cluster")) == []
     db.close()
 
 
@@ -209,27 +211,44 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
 
     fake_distributor.release_result = spy_release
 
+    retrieved: list[int] = []
+    original_retrieve = fake_distributor.retrieve
+
+    def spy_retrieve(result_id, dest_path):
+        retrieved.append(result_id)
+        original_retrieve(result_id, dest_path)
+
+    fake_distributor.retrieve = spy_retrieve
+
     intermediate_items = []
     original_checkpoint = pipeline._checkpoint
 
     def spy_checkpoint(new_item, inputs, is_final):
         before = len(released)
+        before_retrieved = len(retrieved)
         original_checkpoint(new_item, inputs, is_final)
         newly_released = released[before:]
         if is_final:
             # nothing reduces a final result further, so it's fully detached
-            # from the distributor once safely on disk.
+            # from the distributor once safely on disk. Its durable copy is
+            # vine_reduce's own (results_dir), fetched via retrieve() -
+            # unlike a non-final checkpoint, whose durable copy is entirely
+            # the distributor's own doing (see the else branch below).
             assert new_item.source_result_id is None
             assert new_item.file == new_item.checkpoint_path
+            assert len(retrieved) == before_retrieved + 1
         else:
             # checkpointing must not release the cluster-side copy, or a
             # later reduction folding this item in would need the manager
             # to re-send it - it must still be a live, distributor-native
-            # handle, distinct from the on-disk checkpoint file.
+            # handle. A non-final checkpoint is durable because the
+            # distributor made it so at submit time (is_checkpoint=True),
+            # not because vine_reduce copied it out via retrieve() - only a
+            # final result does that.
             assert new_item.source_result_id is not None
             assert new_item.source_result_id not in newly_released
+            assert len(retrieved) == before_retrieved  # no retrieve() copy for a non-final
             assert new_item.checkpoint_path is not None
-            assert new_item.file != new_item.checkpoint_path
             assert os.path.exists(new_item.checkpoint_path)
             intermediate_items.append(new_item)
 
@@ -318,10 +337,24 @@ def test_restart_skips_files_covered_by_a_non_final_checkpoint(fake_distributor,
     assert len(pipeline.pool) == 1
     assert pipeline.pool[0].file == str(seeded_file)
 
+    released_paths: list[str] = []
+    original_release_path = fake_distributor.release_path
+
+    def spy_release_path(path):
+        released_paths.append(path)
+        original_release_path(path)
+
+    fake_distributor.release_path = spy_release_path
+
     run_to_completion(pipeline, fake_distributor)
 
     # 100 (seeded, standing in for a.root) + 5 (b.root, actually processed)
     assert final_value(pipeline) == 105
+    # The seeded item has no source_result_id for release_result to release
+    # it by (see PoolItem docstring) - once the final reduction folds it in
+    # and supersedes it, release_path is how its distributor-side handle (if
+    # any) gets dropped instead.
+    assert str(seeded_file) in released_paths
     db.close()
 
 
@@ -338,6 +371,21 @@ def test_restart_with_final_checkpoint_for_all_files_skips_pipeline_entirely(
     assert pipeline.pool == []
     assert pipeline.in_flight_count() == 0
     assert len(pipeline.final_results) == 1
+    db.close()
+
+
+def test_unsatisfiable_is_result_raises_instead_of_looping_forever(fake_distributor, tmp_path):
+    """A custom is_result that the dataset's total can never reach must raise,
+    not silently keep re-submitting a no-op fold of the one remaining item
+    forever - see maybe_drain_final_group/_handle_reduce_outcome."""
+    dataset = {"files": {"a.root": 3, "b.root": 3}}
+    never_satisfied = lambda num_events, total_time, total_memory: False  # noqa: E731
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reduction_size=10, is_result=never_satisfied
+    )
+
+    with pytest.raises(VineReduceError, match="is_result"):
+        run_to_completion(pipeline, fake_distributor)
     db.close()
 
 

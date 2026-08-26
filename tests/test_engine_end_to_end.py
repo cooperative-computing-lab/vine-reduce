@@ -18,7 +18,11 @@ def double_count_events(chunk):
 
 @pytest.fixture
 def distributor(tmp_path):
-    dist = LocalDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
+    dist = LocalDistributor(
+        max_workers=2,
+        work_dir=str(tmp_path / "cluster"),
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
     yield dist
     dist.shutdown()
 
@@ -62,7 +66,6 @@ def test_end_to_end_two_processors_two_datasets(tmp_path, dataset_input, distrib
         processors={"count": count_events, "double_count": double_count_events},
         input=input_path,
         reducer=sum_reducer,
-        checkpoint_dir=str(tmp_path / "checkpoints"),
         results_dir=str(tmp_path / "results"),
         distributor=distributor,
     )
@@ -89,7 +92,6 @@ def test_per_dataset_reduction_size_config_is_respected(tmp_path, dataset_input,
         input=input_path,
         reducer=sum_reducer,
         reduction_size={"datasets": {"small_groups": 2}, "default": 10},
-        checkpoint_dir=str(tmp_path / "checkpoints"),
         results_dir=str(tmp_path / "results"),
         distributor=distributor,
     )
@@ -111,7 +113,6 @@ def test_end_to_end_two_datasets_two_files_each(tmp_path, dataset_input, distrib
         processors={"count": count_events},
         input=input_path,
         reducer=sum_reducer,
-        checkpoint_dir=str(tmp_path / "checkpoints"),
         results_dir=str(tmp_path / "results"),
         distributor=distributor,
     )
@@ -125,14 +126,13 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     datasets = {"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}}
     input_path = dataset_input(datasets)
 
-    checkpoint_dir = tmp_path / "checkpoints"
-    checkpoint_dir.mkdir()
+    db_path = tmp_path / "vine_reduce.db"
     results_dir = tmp_path / "results" / "numbers" / "count"
     results_dir.mkdir(parents=True)
     final_file = results_dir / "already_done.pkl.zst"
     serialization.dump(999, str(final_file))
 
-    db = CheckpointDB(str(checkpoint_dir / "vine_reduce.db"))
+    db = CheckpointDB(str(db_path))
     db.dataset_changed("numbers", checksum_dataset(datasets["numbers"]))
     db.add_checkpoint("count", "numbers", ["a.root", "b.root"], 10, 1.0, 1.0, True, str(final_file))
     db.close()
@@ -144,7 +144,7 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
         processors={"count": explode},
         input=input_path,
         reducer=sum_reducer,
-        checkpoint_dir=str(checkpoint_dir),
+        db_path=str(db_path),
         results_dir=str(tmp_path / "results"),
         distributor=distributor,
     )
@@ -160,7 +160,6 @@ def test_environment_variables_reach_the_processor(tmp_path, dataset_input, dist
     vr = VineReduce(
         processors={"env": read_env_var},
         input=input_path,
-        checkpoint_dir=str(tmp_path / "checkpoints"),
         results_dir=str(tmp_path / "results"),
         distributor=distributor,
         environment_variables={"VINE_REDUCE_TEST_VAR": "xyz"},
@@ -168,6 +167,45 @@ def test_environment_variables_reach_the_processor(tmp_path, dataset_input, dist
     vr.compute()
 
     assert _read_only_result(vr.results_dir, "numbers", "env") == "xyz"
+
+
+def test_zero_capacity_before_any_worker_is_available_does_not_hang(tmp_path, dataset_input):
+    """Before engine.py slept in this state, a distributor reporting zero
+    capacity with nothing in flight yet (e.g. TaskVine before a worker
+    connects) made the scheduling loop spin on distributor.capacity() with no
+    wait at all. This forces exactly that state a few times in a row and
+    checks compute() still reaches completion instead of hanging."""
+
+    class SlowToStartDistributor(LocalDistributor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._zero_capacity_calls_left = 3
+
+        def capacity(self):
+            if self._zero_capacity_calls_left > 0:
+                self._zero_capacity_calls_left -= 1
+                return 0
+            return super().capacity()
+
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 3}}})
+    dist = SlowToStartDistributor(
+        max_workers=1,
+        work_dir=str(tmp_path / "cluster"),
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
+    try:
+        vr = VineReduce(
+            processors={"count": count_events},
+            input=input_path,
+            reducer=sum_reducer,
+            results_dir=str(tmp_path / "results"),
+            distributor=dist,
+        )
+        vr.compute()
+    finally:
+        dist.shutdown()
+
+    assert _read_only_result(vr.results_dir, "numbers") == 3
 
 
 def test_extra_files_and_environment_variables_are_passed_to_the_distributor(
@@ -197,12 +235,15 @@ def test_extra_files_and_environment_variables_are_passed_to_the_distributor(
     shipped = tmp_path / "shipped.txt"
     shipped.write_text("hi")
 
-    dist = RecordingDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
+    dist = RecordingDistributor(
+        max_workers=2,
+        work_dir=str(tmp_path / "cluster"),
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
     try:
         vr = VineReduce(
             processors={"count": count_events},
             input=input_path,
-            checkpoint_dir=str(tmp_path / "checkpoints"),
             results_dir=str(tmp_path / "results"),
             distributor=dist,
             extra_files=[str(shipped)],

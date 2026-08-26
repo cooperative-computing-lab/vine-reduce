@@ -18,20 +18,17 @@ from vine_reduce.remote_environment import (
 
 
 def test_combined_commit_key_with_no_editable_packages_is_fixed():
-    assert _combined_commit_key({}, {}) == "fixed"
+    assert _combined_commit_key({}) == "fixed"
 
 
 def test_combined_commit_key_is_head_if_any_package_is_head():
-    paths = {"a": "/a", "b": "/b"}
-    commits = {"a": "abc123", "b": "HEAD"}
-    assert _combined_commit_key(paths, commits) == "HEAD"
+    assert _combined_commit_key({"a": "abc123", "b": "HEAD"}) == "HEAD"
 
 
 def test_combined_commit_key_is_deterministic_hash_of_clean_commits():
-    paths = {"a": "/a", "b": "/b"}
     commits = {"a": "abc123", "b": "def456"}
-    first = _combined_commit_key(paths, commits)
-    second = _combined_commit_key(paths, commits)
+    first = _combined_commit_key(commits)
+    second = _combined_commit_key(commits)
     assert first == second
     assert first != "HEAD" and first != "fixed"
 

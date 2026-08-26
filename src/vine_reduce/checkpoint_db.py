@@ -35,7 +35,8 @@ class CheckpointRow:
     num_events / wall_time_s / memory_mb: totals accumulated into this
         checkpoint's result.
     is_final: whether this is a final result (results_dir) or an
-        intermediate checkpoint (checkpoint_dir).
+        intermediate checkpoint (wherever the distributor durably stores
+        one - e.g. TaskVineDistributor's own checkpoint_dir).
     path: where the checkpoint's serialized result file lives on disk.
     """
 

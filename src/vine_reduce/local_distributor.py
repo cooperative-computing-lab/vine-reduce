@@ -11,6 +11,14 @@ do. It is intentionally simple, not production-grade:
   - func/args are cloudpickled before being handed to the pool (see
     _run_cloudpickled below), so processor/reducer/etc. may be closures
     or lambdas, not just module-level callables.
+  - a checkpoint (submit(..., is_checkpoint=True)) lands under
+    checkpoint_dir, a real directory that shutdown() never removes; an
+    ordinary result lands under work_dir instead, which is scratch space
+    - a fresh temp directory removed on shutdown() unless the caller
+    supplied its own. This split mirrors TaskVineDistributor's own
+    checkpoint_dir/declare_temp() split, and matters for restart: a
+    checkpoint has to still be there the next time this process starts,
+    which a result sitting in a wiped temp dir would not be.
 """
 
 from __future__ import annotations
@@ -48,11 +56,19 @@ class LocalDistributor:
     a `distributor=`. See the module docstring for what it is and isn't good
     for."""
 
-    def __init__(self, max_workers: int | None = None, work_dir: str | None = None):
+    def __init__(
+        self,
+        max_workers: int | None = None,
+        work_dir: str | None = None,
+        checkpoint_dir: str = "checkpoints",
+    ):
         """max_workers: size of the local process pool; defaults to the
-        machine's CPU count. work_dir: directory to write result files into;
-        defaults to a fresh temp directory that is removed on shutdown()
-        (a caller-supplied work_dir is left in place)."""
+        machine's CPU count. work_dir: directory to write ordinary
+        (non-checkpoint) result files into; defaults to a fresh temp
+        directory that is removed on shutdown() (a caller-supplied work_dir
+        is left in place). checkpoint_dir: directory to write checkpoint
+        (submit(..., is_checkpoint=True)) result files into; never removed
+        by shutdown() - see the module docstring."""
         self._max_workers = max_workers or os.process_cpu_count() or 1
         self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
 
@@ -60,29 +76,44 @@ class LocalDistributor:
         self._work_dir = work_dir or tempfile.mkdtemp(prefix="vine_reduce_local_")
         os.makedirs(self._work_dir, exist_ok=True)
 
+        self._checkpoint_dir = checkpoint_dir
+        os.makedirs(self._checkpoint_dir, exist_ok=True)
+
         self._next_id = itertools.count(1)
         self._seq = itertools.count()
-        # Heap of (-priority, seq, result_id, func, args): negated priority so
-        # the largest one pops first, seq to break ties in submission order.
-        self._pending: list[tuple[int, int, int, Callable, tuple]] = []
+        # Heap of (-priority, seq, result_id, func, args, is_checkpoint): negated
+        # priority so the largest one pops first, seq to break ties in
+        # submission order.
+        self._pending: list[tuple[int, int, int, Callable, tuple, bool]] = []
         self._running: dict[Future, int] = {}  # future -> result_id, while dispatched
         self._files: dict[int, str] = {}  # result_id -> file, for completed Successes
         self._env_vars: dict[str, str] = {}
 
     def submit(
-        self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
+        self,
+        priority: int,
+        category: str,
+        kind: str,
+        func: Callable[..., Any],
+        *args: Any,
+        is_checkpoint: bool = False,
     ) -> int:
         """Queue func(dest_file, *args) to run in the process pool, ordered
-        by priority (larger runs first). Returns a result_id."""
+        by priority (larger runs first). is_checkpoint picks which directory
+        the result lands under - checkpoint_dir or work_dir, see _dispatch
+        and the module docstring. Returns a result_id."""
         result_id = next(self._next_id)
-        heapq.heappush(self._pending, (-priority, next(self._seq), result_id, func, args))
+        heapq.heappush(
+            self._pending, (-priority, next(self._seq), result_id, func, args, is_checkpoint)
+        )
         self._dispatch()
         return result_id
 
     def _dispatch(self) -> None:
         while self._pending and len(self._running) < self._max_workers:
-            _, _, result_id, func, args = heapq.heappop(self._pending)
-            dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
+            _, _, result_id, func, args, is_checkpoint = heapq.heappop(self._pending)
+            base_dir = self._checkpoint_dir if is_checkpoint else self._work_dir
+            dest_file = os.path.join(base_dir, f"{result_id}.pkl.zst")
             payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
             self._running[self._pool.submit(_run_cloudpickled, payload)] = result_id
 
@@ -114,6 +145,11 @@ class LocalDistributor:
         if path is not None and os.path.exists(path):
             os.remove(path)
 
+    def release_path(self, path: str) -> None:
+        """No-op: worker subprocesses already share vine_reduce's filesystem
+        (see module docstring), so a restart-seeded checkpoint path is used
+        directly with nothing declared or cached on its behalf to release."""
+
     def capacity(self) -> int:
         """Room left before the pool + its pending queue reaches twice
         max_workers, this distributor's target queue depth."""
@@ -126,6 +162,11 @@ class LocalDistributor:
         dest_path - a plain file copy, since worker subprocesses already
         share vine_reduce's filesystem."""
         shutil.copy(self._files[result_id], dest_path)
+
+    def checkpoint_path(self, result_id: int) -> str:
+        """The real path a completed (Success) result_id already lives at -
+        see submit()."""
+        return self._files[result_id]
 
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """No-op: worker subprocesses already share vine_reduce's filesystem
@@ -140,7 +181,8 @@ class LocalDistributor:
 
     def shutdown(self) -> None:
         """Shut down the process pool and, if this distributor created its
-        own work_dir, remove it."""
+        own work_dir, remove it. checkpoint_dir is never removed here -
+        see the module docstring."""
         self._pool.shutdown(wait=True)
         if self._owns_work_dir:
             shutil.rmtree(self._work_dir, ignore_errors=True)

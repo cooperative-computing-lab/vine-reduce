@@ -38,12 +38,11 @@ class PoolItem:
         a fresh chunk result, max(group)+1 whenever a group is folded, reset
         to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
     checkpoint_row_id: id of the CheckpointDB row backing this item, if any.
-    checkpoint_path: local on-disk path of this item's checkpoint file, if
-        it has been checkpointed and retrieved - distinct from `file`, which
-        stays the distributor's own handle so the item can still be folded
-        into a later reduction without the manager re-sending it to the
-        cluster. None if never checkpointed, or checkpointed without
-        retrieval (checkpoint_retrieve=False).
+    checkpoint_path: local on-disk path of this item's checkpoint file, once
+        checkpointed - distinct from `file`, which stays the distributor's
+        own handle so the item can still be folded into a later reduction
+        without the manager re-sending it to the cluster. None if never
+        checkpointed.
     source_result_id: this item's own distributor result_id, kept alive
         (not released) until it is itself folded into a later reduction.
     inputs: the items folded together to produce this one (empty for a raw
@@ -118,10 +117,7 @@ class Pipeline:
         checkpoint_time: float | None,
         checkpoint_distance: int | None,
         checkpoint_accumulations: bool,
-        checkpoint_dir: str,
-        checkpoint_retrieve: bool,
         results_dir: str,
-        results_retrieve: bool,
         process_priority: int,
         reduce_priority: int,
     ):
@@ -145,10 +141,7 @@ class Pipeline:
         self._checkpoint_time = checkpoint_time
         self._checkpoint_distance = checkpoint_distance
         self._checkpoint_accumulations = checkpoint_accumulations
-        self._checkpoint_dir = checkpoint_dir
-        self._checkpoint_retrieve = checkpoint_retrieve
         self._results_dir = os.path.join(results_dir, dataset_name, processor_name)
-        self._results_retrieve = results_retrieve
         self._process_priority = process_priority
         self._reduce_priority = reduce_priority
         self._process_category = f"{processor_name}:{dataset_name}:process"
@@ -167,8 +160,6 @@ class Pipeline:
         self._seed_from_checkpoints()
         if not self.finished:
             os.makedirs(self._results_dir, exist_ok=True)
-            if self._checkpoint_retrieve:
-                os.makedirs(self._checkpoint_dir, exist_ok=True)
 
     # -- restart -----------------------------------------------------------
 
@@ -225,14 +216,13 @@ class Pipeline:
         return result_id in self._in_flight
 
     def refresh_finished(self) -> None:
-        """Catches pipelines that are done without ever producing an outcome
-        to react to, e.g. an empty dataset, or one fully covered by seeded
-        checkpoints for every file but not yet marked finished at construction."""
-        if not self.finished and self._is_done():
-            self.finished = True
-
-    def _is_done(self) -> bool:
-        return self.chunks_all_done and not self.pool and self.in_flight_count() == 0
+        """Set `finished` if there is nothing left to do. Called after every
+        outcome, and by the scheduling loop each cycle - the latter catches a
+        pipeline that is done without ever producing an outcome to react to,
+        e.g. an empty dataset, or one covered by seeded checkpoints for every
+        file but not yet marked finished at construction."""
+        if not self.finished:
+            self.finished = self.chunks_all_done and not self.pool and self.in_flight_count() == 0
 
     @property
     def chunks_all_done(self) -> bool:
@@ -339,6 +329,7 @@ class Pipeline:
             [item.file for item in group],
             is_final,
             self._result_postprocess,
+            is_checkpoint=is_checkpoint,
         )
         self._in_flight[result_id] = _ReduceTask(
             group=group,
@@ -351,18 +342,18 @@ class Pipeline:
 
     # -- outcome handling ------------------------------------------------------
 
-    def handle_outcome(self, result_id: int, outcome: Outcome) -> None:
+    def handle_outcome(self, outcome: Outcome) -> None:
         """React to the Outcome of one of this pipeline's own chunk/reduce
         tasks: pool a chunk's output, fold a reduction's output into
         final_results or back into the pool, retry on ResourceExhaustion (
         halving chunksize/reduction_size), or raise VineReduceError on
         RuntimeFailure. Updates `finished` once nothing is left to do."""
-        task = self._in_flight.pop(result_id)
+        task = self._in_flight.pop(outcome.result_id)
         if isinstance(task, _ChunkTask):
             self._handle_chunk_outcome(task, outcome)
         else:
             self._handle_reduce_outcome(task, outcome)
-        self.finished = self.finished or self._is_done()
+        self.refresh_finished()
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
@@ -399,7 +390,7 @@ class Pipeline:
             del self._files_in_progress[chunk.url]
 
     def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
-        group, is_final = task.group, task.is_final
+        group = task.group
         if isinstance(outcome, RuntimeFailure):
             raise VineReduceError(
                 f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed:\n"
@@ -432,10 +423,24 @@ class Pipeline:
         )
 
         if task.is_checkpoint:
-            self._checkpoint(new_item, group, is_final)
+            self._checkpoint(new_item, group, task.is_final)
 
-        if is_final:
+        if task.is_final:
             self.final_results.append(new_item)
+        elif len(group) == 1:
+            # Only maybe_drain_final_group ever reduces a group of size 1 -
+            # folding a single item with itself changes nothing, so if
+            # is_result still rejects the result, nothing else ever will
+            # either: chunk generation is exhausted and nothing else is in
+            # flight, so there is no future group is_result could see instead.
+            # Looping this back into the pool would just resubmit the same
+            # no-op reduction forever.
+            raise VineReduceError(
+                f"is_result never accepted a final result for "
+                f"{self.processor_name!r}/{self.dataset_name!r}: "
+                f"{new_item.num_events} events reduced, no chunks or reductions "
+                "left to add more. is_result is unsatisfiable for this run."
+            )
         else:
             self.pool.append(new_item)
 
@@ -464,26 +469,30 @@ class Pipeline:
         return False
 
     def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
-        dest_dir = self._results_dir if is_final else self._checkpoint_dir
-        should_retrieve = self._results_retrieve if is_final else self._checkpoint_retrieve
-
-        if should_retrieve:
-            dest_path = os.path.join(dest_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
+        if is_final:
+            # A final result is vine_reduce's own deliverable, so it gets
+            # vine_reduce's own naming/location (results_dir), independent of
+            # whatever durable storage the distributor itself used. Nothing
+            # will ever reduce it further, so once it is safely on disk here
+            # the cluster-side copy - and the distributor's own durable copy
+            # of it, if any - can go.
+            dest_path = os.path.join(
+                self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst"
+            )
             self._distributor.retrieve(new_item.source_result_id, dest_path)
+            self._distributor.release_result(new_item.source_result_id)
             new_item.checkpoint_path = dest_path
-            if is_final:
-                # Nothing will ever reduce a final result further, so once
-                # it is safely on disk the cluster-side copy can go. An
-                # intermediate checkpoint keeps its cluster-side copy (file/
-                # source_result_id untouched) live and reusable as input to
-                # a later reduction, so the manager never has to re-send a
-                # checkpoint it already sent once - it is released only once
-                # a further checkpoint covers it (below, via
-                # _release_uncheckpointed).
-                self._distributor.release_result(new_item.source_result_id)
-                new_item.file = dest_path
-                new_item.source_result_id = None
-        # else: the distributor keeps its own permanent copy; nothing to move.
+            new_item.file = dest_path
+            new_item.source_result_id = None
+        else:
+            # The distributor already made this durable at submit time
+            # (is_checkpoint=True - see _submit_reduction), so there is
+            # nothing to copy, just a path to learn. file/source_result_id
+            # stay live and reusable as input to a later reduction, so the
+            # manager never has to re-send a checkpoint it already generated;
+            # they are released only once a further checkpoint covers this
+            # item (via _release_uncheckpointed, below).
+            new_item.checkpoint_path = self._distributor.checkpoint_path(new_item.source_result_id)
 
         # Batch the new row and the superseded rows' deletes into one
         # transaction, so this checkpoint event either fully lands or, on a
@@ -497,21 +506,30 @@ class Pipeline:
             new_item.wall_time_s,
             new_item.memory_mb,
             is_final,
-            new_item.checkpoint_path or new_item.file,
+            new_item.checkpoint_path,
             commit=False,
         )
-
-        for item in inputs:
-            if item.checkpoint_row_id is not None:
-                self._db.delete_checkpoint(item.checkpoint_row_id, commit=False)
-                if item.checkpoint_path is not None and item.checkpoint_path.startswith(
-                    self._checkpoint_dir + os.sep
-                ):
-                    try:
-                        os.remove(item.checkpoint_path)
-                    except FileNotFoundError:
-                        pass
+        superseded = [item for item in inputs if item.checkpoint_row_id is not None]
+        for item in superseded:
+            self._db.delete_checkpoint(item.checkpoint_row_id, commit=False)
         self._db.commit()
+
+        # Only now that the db no longer points at them: delete the
+        # superseded checkpoints' own files. Pipeline removes them directly
+        # rather than leaving it to release_result, since a restart-seeded
+        # checkpoint has no source_result_id for release_result to be called
+        # with; release_path is its counterpart, keyed on the path itself,
+        # for whatever the distributor may have cached on this item's behalf
+        # (see TaskVineDistributor._remap_files) - a harmless no-op for an
+        # item that was never restart-seeded, since nothing is ever cached
+        # under a this-run item's checkpoint_path (its token is the key
+        # instead, already released via release_result elsewhere).
+        for item in superseded:
+            try:
+                os.remove(item.checkpoint_path)
+            except FileNotFoundError:
+                pass
+            self._distributor.release_path(item.checkpoint_path)
 
         # new_item is now durable (on disk, or the distributor's own
         # permanent copy), so its whole not-yet-checkpointed lineage is safe

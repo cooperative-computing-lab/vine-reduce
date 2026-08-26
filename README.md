@@ -61,10 +61,11 @@ vr = VineReduce(
     chunk_to_args=my_chunk_to_args,
     chunksize=10_000,
     results_dir="results",
-    checkpoint_dir="checkpoints",
     # distributor defaults to a local ProcessPoolExecutor-backed
     # LocalDistributor if omitted; pass a TaskVineDistributor to run on a
-    # real TaskVine cluster instead.
+    # real TaskVine cluster instead. Non-final checkpoints are the
+    # distributor's own concern (e.g. TaskVineDistributor(checkpoint_dir=...)),
+    # not VineReduce's.
 )
 vr.compute()
 ```

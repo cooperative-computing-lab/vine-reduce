@@ -10,6 +10,8 @@ this module is just the scheduling loop and priority/config wiring.
 from __future__ import annotations
 
 import os
+import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -20,6 +22,11 @@ from .executor import simple_executor
 from .pipeline import Pipeline, VineReduceError
 
 __all__ = ["VineReduce", "VineReduceError"]
+
+# How long to sleep before re-checking state when nothing is in flight and the
+# distributor has no capacity to accept more work right now (e.g. TaskVine
+# before any worker has connected) - keeps that wait from busy-spinning.
+_IDLE_POLL_INTERVAL_S = 0.5
 
 
 def _resolve_sized_config(
@@ -92,15 +99,8 @@ class VineReduce:
         distance-based checkpointing.
     checkpoint_accumulations: if True, checkpoint every non-final reduction
         result, regardless of checkpoint_time/checkpoint_distance.
-    checkpoint_dir: directory intermediate (non-final) checkpoints are
-        written under.
-    checkpoint_retrieve: if True, pull each checkpoint back to this process
-        via Distributor.retrieve(); if False, leave it wherever the
-        distributor produced it (only meaningful for a distributor that
-        keeps its own permanent copy).
     results_dir: directory final, per-(processor, dataset) results are
         written under, at results_dir/<dataset_name>/<processor_name>/.
-    results_retrieve: like checkpoint_retrieve, but for final results.
     distributor: where processor/reducer calls actually run - a Distributor
         implementation such as TaskVineDistributor. Defaults to a
         LocalDistributor (ProcessPoolExecutor-backed) that compute() creates
@@ -115,7 +115,11 @@ class VineReduce:
     max_chunks_cycle: cap on new chunks submitted per scheduling cycle,
         across all pipelines.
     db_path: path to the sqlite checkpoint database; defaults to
-        checkpoint_dir/vine_reduce.db.
+        results_dir/vine_reduce.db. Non-final checkpoints are the
+        responsibility of the distributor itself (e.g.
+        TaskVineDistributor's own checkpoint_dir constructor argument), not
+        VineReduce - see PLAN.md's "Temporary Results, Checkpoints, and
+        Restart".
     extra_files: local paths made available, under their basename, wherever
         every processor/reducer call runs - see Distributor.add_file().
     environment_variables: environment variables set for every
@@ -135,10 +139,7 @@ class VineReduce:
     checkpoint_time: float | None = None
     checkpoint_distance: int | None = None
     checkpoint_accumulations: bool = False
-    checkpoint_dir: str = "checkpoints"
-    checkpoint_retrieve: bool = True
     results_dir: str = "results"
-    results_retrieve: bool = True
     distributor: Distributor | None = None
     chunksize: int | dict | None = None
     max_chunks_active: int = 1000
@@ -153,40 +154,47 @@ class VineReduce:
         disk) and drive them until every pipeline has a final result. If
         `distributor` was not supplied, a LocalDistributor is created for
         this call and shut down again before returning."""
-        distributor = self.distributor
-        owns_distributor = distributor is None
-        if owns_distributor:
-            from .local_distributor import LocalDistributor
+        with ExitStack() as stack:
+            if self.distributor is not None:
+                distributor = self.distributor
+            else:
+                from .local_distributor import LocalDistributor
 
-            distributor = LocalDistributor()
+                # Entered into the stack (unlike a caller-supplied one) so it
+                # is shut down again on the way out, however this returns.
+                # checkpoint_dir defaults alongside db_path, under results_dir,
+                # rather than LocalDistributor's own bare "checkpoints" default
+                # - so a checkpoint written by this run is found again next to
+                # the checkpoint db that points at it, not wherever the
+                # process happened to be started from.
+                distributor = stack.enter_context(
+                    LocalDistributor(checkpoint_dir=os.path.join(self.results_dir, "checkpoints"))
+                )
 
-        # Communicated to the distributor once, up front, so every
-        # processor/reducer call it submits from here on has these files and
-        # environment variables available - see Distributor.add_file/
-        # set_env_var (distributor.py) for what each implementation does
-        # with them.
-        for path in self.extra_files:
-            distributor.add_file(path)
-        for name, value in self.environment_variables.items():
-            distributor.set_env_var(name, value)
+            # Communicated to the distributor once, up front, so every
+            # processor/reducer call it submits from here on has these files and
+            # environment variables available - see Distributor.add_file/
+            # set_env_var (distributor.py) for what each implementation does
+            # with them.
+            for path in self.extra_files:
+                distributor.add_file(path)
+            for name, value in self.environment_variables.items():
+                distributor.set_env_var(name, value)
 
-        input_to_datasets = self.input_to_datasets or defaults.default_input_to_datasets
-        datasets_to_chunks = self.datasets_to_chunks or defaults.default_datasets_to_chunks
+            input_to_datasets = self.input_to_datasets or defaults.default_input_to_datasets
+            datasets_to_chunks = self.datasets_to_chunks or defaults.default_datasets_to_chunks
 
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        db = CheckpointDB(self.db_path or os.path.join(self.checkpoint_dir, "vine_reduce.db"))
+            os.makedirs(self.results_dir, exist_ok=True)
+            db = stack.enter_context(
+                CheckpointDB(self.db_path or os.path.join(self.results_dir, "vine_reduce.db"))
+            )
 
-        try:
             datasets = input_to_datasets(self.input)
             for name, dataset in datasets.items():
                 db.dataset_changed(name, checksum_dataset(dataset))
 
             pipelines = self._build_pipelines(datasets, distributor, db, datasets_to_chunks)
             self._run(pipelines, distributor)
-        finally:
-            db.close()
-            if owns_distributor:
-                distributor.shutdown()
 
     def _build_pipelines(
         self,
@@ -229,10 +237,7 @@ class VineReduce:
                         checkpoint_time=self.checkpoint_time,
                         checkpoint_distance=self.checkpoint_distance,
                         checkpoint_accumulations=self.checkpoint_accumulations,
-                        checkpoint_dir=self.checkpoint_dir,
-                        checkpoint_retrieve=self.checkpoint_retrieve,
                         results_dir=self.results_dir,
-                        results_retrieve=self.results_retrieve,
                         process_priority=process_priority,
                         reduce_priority=reduce_priority,
                     )
@@ -253,7 +258,7 @@ class VineReduce:
                 break
 
             in_flight_total = sum(p.in_flight_count() for p in pipelines)
-            capacity = max(
+            budget = max(
                 0,
                 min(
                     distributor.capacity(),
@@ -266,17 +271,20 @@ class VineReduce:
             # `remaining` is a priority-order-preserving filter of that list,
             # so no re-sort is needed here.
             for pipeline in remaining:
-                if capacity <= 0:
+                if budget <= 0:
                     break
-                capacity -= pipeline.feed(capacity)
+                budget -= pipeline.feed(budget)
 
-            if sum(p.in_flight_count() for p in pipelines) == 0:
+            if not any(p.in_flight_count() for p in pipelines):
                 # Nothing submitted this cycle and nothing pending from before;
-                # waiting now would block forever. Loop back and re-check state.
+                # waiting now would block forever. Sleep briefly rather than
+                # busy-spinning re-checking distributor.capacity() (e.g. while
+                # waiting for a TaskVine worker to connect), then re-check state.
+                time.sleep(_IDLE_POLL_INTERVAL_S)
                 continue
 
             outcome = distributor.wait(timeout=None)
             if outcome is None:
                 continue
             pipeline = next(p for p in pipelines if p.owns(outcome.result_id))
-            pipeline.handle_outcome(outcome.result_id, outcome)
+            pipeline.handle_outcome(outcome)

@@ -222,10 +222,13 @@ def _local_pip_commits(
     return commits
 
 
-def _combined_commit_key(paths_by_package: dict[str, str], commits: dict[str, str]) -> str:
+def _combined_commit_key(commits: dict[str, str]) -> str:
+    """The editable-installs half of the cache key: one hash over every
+    editable package's commit, or the "HEAD" sentinel if any of them has
+    uncommitted changes (see _local_pip_commits)."""
     if not commits:
         return "fixed"
-    values = [commits[p] for p in paths_by_package]
+    values = list(commits.values())
     if "HEAD" in values:
         # always rebuild rather than trust a cache entry that might be stale
         return "HEAD"
@@ -274,6 +277,9 @@ def get_environment(
     uncommitted changes: "rebuild" (default) forces a fresh build, "fail"
     raises UnstagedChanges instead.
     """
+    if unstaged not in ("rebuild", "fail"):
+        raise ValueError(f"unstaged must be 'rebuild' or 'fail', not {unstaged!r}")
+
     conda_env_path = str(conda_env_path) if conda_env_path else os.environ.get("CONDA_PREFIX")
     if not conda_env_path:
         raise RuntimeError(
@@ -290,7 +296,7 @@ def get_environment(
 
     paths_by_package = _find_editable_pip_installs()
     commits = _local_pip_commits(paths_by_package, watch)
-    pip_check = _combined_commit_key(paths_by_package, commits)
+    pip_check = _combined_commit_key(commits)
 
     env_hash = _environment_state_hash(conda_env_path)
     env_path = str(cache_dir / f"env_{env_hash}_edit_{pip_check}.tar.gz")
@@ -300,11 +306,10 @@ def get_environment(
         changed = [p for p, c in commits.items() if c == "HEAD"]
         if unstaged == "fail":
             raise UnstagedChanges(changed)
-        if unstaged == "rebuild":
-            force = True
-            logger.warning(
-                "Rebuilding environment because of unstaged changes in: %s",
-                ", ".join(Path(paths_by_package[p]).name for p in changed),
-            )
+        force = True
+        logger.warning(
+            "Rebuilding environment because of unstaged changes in: %s",
+            ", ".join(Path(paths_by_package[p]).name for p in changed),
+        )
 
     return _create_env(env_path, conda_env_path, paths_by_package, force)

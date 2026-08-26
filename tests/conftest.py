@@ -28,7 +28,13 @@ class FakeDistributor:
         self._files: dict[int, str] = {}
 
     def submit(
-        self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
+        self,
+        priority: int,
+        category: str,
+        kind: str,
+        func: Callable[..., Any],
+        *args: Any,
+        is_checkpoint: bool = False,
     ) -> int:
         result_id = next(self._next_id)
         dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
@@ -45,13 +51,22 @@ class FakeDistributor:
         return raw.to_outcome(result_id)
 
     def release_result(self, result_id: int) -> None:
-        self._files.pop(result_id, None)
+        path = self._files.pop(result_id, None)
+        if path is not None and os.path.exists(path):
+            os.remove(path)
+
+    def release_path(self, path: str) -> None:
+        """No-op: FakeDistributor, like LocalDistributor, never declares or
+        caches anything keyed by a raw path."""
 
     def capacity(self) -> int:
         return self._capacity_amount
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
         shutil.copy(self._files[result_id], dest_path)
+
+    def checkpoint_path(self, result_id: int) -> str:
+        return self._files[result_id]
 
 
 @pytest.fixture
