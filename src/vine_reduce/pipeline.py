@@ -25,15 +25,32 @@ class PoolItem:
     """A not-yet-final result eligible for reduction: either a single chunk's
     output, or the output of a previous (non-final) reduction call.
 
-    file: the distributor's handle for this item's result file.
+    file: the distributor's handle for this item's result file - still a
+        live, distributor-native handle even once checkpointed, unless this
+        item is a final result (see Pipeline._checkpoint).
     num_events / wall_time_s / memory_mb: totals accumulated into this item.
     files: dataset file URLs whose data this item represents.
     since_checkpoint_time / since_checkpoint_memory: totals accumulated
         since this item (or one of its inputs) was last checkpointed - reset
         to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
     checkpoint_row_id: id of the CheckpointDB row backing this item, if any.
-    source_result_id: the distributor result_id to release once this item is
-        consumed by a later reduction.
+    checkpoint_path: local on-disk path of this item's checkpoint file, if
+        it has been checkpointed and retrieved - distinct from `file`, which
+        stays the distributor's own handle so the item can still be folded
+        into a later reduction without the manager re-sending it to the
+        cluster. None if never checkpointed, or checkpointed without
+        retrieval (checkpoint_retrieve=False).
+    source_result_id: this item's own distributor result_id, kept alive
+        (not released) until it is itself folded into a later reduction.
+    inputs: the items folded together to produce this one (empty for a raw
+        chunk's output). Kept around so that, if this item is lost before
+        anything checkpoints it, it can be recovered by re-folding its
+        inputs instead of recomputing everything from scratch - see
+        Pipeline._release_uncheckpointed, which walks this recursively to
+        release every not-yet-checkpointed ancestor once this item finally
+        is checkpointed. Cleared once that happens (see Pipeline._checkpoint)
+        - a checkpointed item's own durable copy is backup enough, so there
+        is nothing left in its lineage still worth holding onto.
     """
 
     file: str
@@ -44,7 +61,9 @@ class PoolItem:
     since_checkpoint_time: float
     since_checkpoint_memory: float
     checkpoint_row_id: int | None = None
+    checkpoint_path: str | None = None
     source_result_id: int | None = None
+    inputs: list[PoolItem] = field(default_factory=list)
 
 
 @dataclass
@@ -151,6 +170,9 @@ class Pipeline:
 
     @staticmethod
     def _pool_item_from_checkpoint(row: CheckpointRow) -> PoolItem:
+        # On restart there is no live distributor state to hand back, so the
+        # on-disk file doubles as both the distributor-facing handle (to be
+        # resubmitted) and the checkpoint's own on-disk record.
         return PoolItem(
             file=row.path,
             num_events=row.num_events,
@@ -160,6 +182,7 @@ class Pipeline:
             since_checkpoint_time=0,
             since_checkpoint_memory=0,
             checkpoint_row_id=row.id,
+            checkpoint_path=row.path,
         )
 
     def _seed_from_checkpoints(self) -> None:
@@ -384,10 +407,12 @@ class Pipeline:
             return
 
         assert isinstance(outcome, Success)
-        for item in group:
-            if item.source_result_id is not None:
-                self._distributor.release_result(item.source_result_id)
-
+        # group's own source_result_ids are deliberately not released here:
+        # new_item isn't durable yet, so if it's lost before something
+        # checkpoints it, group (kept below as new_item.inputs) is the only
+        # way to recover it without recomputing everything from scratch. See
+        # _release_uncheckpointed, invoked from _checkpoint once new_item
+        # eventually does become durable.
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
         new_item = PoolItem(
@@ -399,6 +424,7 @@ class Pipeline:
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
             since_checkpoint_memory=sum(item.since_checkpoint_memory for item in group) + memory_mb,
             source_result_id=outcome.result_id,
+            inputs=group,
         )
 
         if task.is_checkpoint:
@@ -434,9 +460,19 @@ class Pipeline:
         if should_retrieve:
             dest_path = os.path.join(dest_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
             self._distributor.retrieve(new_item.source_result_id, dest_path)
-            self._distributor.release_result(new_item.source_result_id)
-            new_item.file = dest_path
-            new_item.source_result_id = None
+            new_item.checkpoint_path = dest_path
+            if is_final:
+                # Nothing will ever reduce a final result further, so once
+                # it is safely on disk the cluster-side copy can go. An
+                # intermediate checkpoint keeps its cluster-side copy (file/
+                # source_result_id untouched) live and reusable as input to
+                # a later reduction, so the manager never has to re-send a
+                # checkpoint it already sent once - it is released only once
+                # a further checkpoint covers it (below, via
+                # _release_uncheckpointed).
+                self._distributor.release_result(new_item.source_result_id)
+                new_item.file = dest_path
+                new_item.source_result_id = None
         # else: the distributor keeps its own permanent copy; nothing to move.
 
         # Batch the new row and the superseded rows' deletes into one
@@ -451,20 +487,44 @@ class Pipeline:
             new_item.wall_time_s,
             new_item.memory_mb,
             is_final,
-            new_item.file,
+            new_item.checkpoint_path or new_item.file,
             commit=False,
         )
 
         for item in inputs:
             if item.checkpoint_row_id is not None:
                 self._db.delete_checkpoint(item.checkpoint_row_id, commit=False)
-                if item.file.startswith(self._checkpoint_dir + os.sep):
+                if item.checkpoint_path is not None and item.checkpoint_path.startswith(
+                    self._checkpoint_dir + os.sep
+                ):
                     try:
-                        os.remove(item.file)
+                        os.remove(item.checkpoint_path)
                     except FileNotFoundError:
                         pass
         self._db.commit()
 
+        # new_item is now durable (on disk, or the distributor's own
+        # permanent copy), so its whole not-yet-checkpointed lineage is safe
+        # to release - it was only ever kept alive as a fallback in case
+        # new_item itself got lost before being checkpointed.
+        for item in inputs:
+            self._release_uncheckpointed(item)
+        new_item.inputs = []
+
         new_item.checkpoint_row_id = row_id
         new_item.since_checkpoint_time = 0
         new_item.since_checkpoint_memory = 0
+
+    def _release_uncheckpointed(self, item: PoolItem) -> None:
+        """Release item's own cluster-side copy - safe now because the
+        caller's own item is durable and covers it, whether item was itself
+        a checkpoint being superseded or just an ordinary pooled result.
+        Recurses into item's inputs to release the rest of its not-yet-
+        checkpointed lineage too, unless item is itself a checkpoint - its
+        inputs were already released back when item itself was checkpointed,
+        so there is nothing left there to release."""
+        if item.source_result_id is not None:
+            self._distributor.release_result(item.source_result_id)
+        if item.checkpoint_row_id is None:
+            for child in item.inputs:
+                self._release_uncheckpointed(child)
