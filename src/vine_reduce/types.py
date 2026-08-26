@@ -15,7 +15,12 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Chunk:
-    """A contiguous range of events [start, stop) from a single file."""
+    """A contiguous range of events [start, stop) from a single file.
+
+    url: the dataset file this chunk belongs to.
+    start: index of the first event in the chunk.
+    stop: index one past the last event in the chunk.
+    """
 
     url: str
     start: int
@@ -23,12 +28,19 @@ class Chunk:
 
     @property
     def num_events(self) -> int:
+        """Number of events covered by this chunk (stop - start)."""
         return self.stop - self.start
 
 
 @dataclass(frozen=True)
 class Outcome:
-    """Base class for the result of a submitted call, as reported by a distributor."""
+    """Base class for the result of a submitted call, as reported by a distributor.
+
+    result_id: the id returned by Distributor.submit() for this call.
+    resources: usage reported for the call, e.g. {"cores", "memory_mb",
+        "wall_time_s"} - see each Distributor implementation for exactly
+        which keys it fills in.
+    """
 
     result_id: int
     resources: dict[str, Any]
@@ -36,17 +48,25 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Success(Outcome):
+    """The call finished normally. `file` is the distributor's own handle
+    for the result (a local path, or an opaque token - see distributor.py's
+    module docstring), to be passed to Distributor.retrieve()."""
+
     file: str
 
 
 @dataclass(frozen=True)
 class RuntimeFailure(Outcome):
+    """The call raised an exception. `traceback` is the remote traceback,
+    formatted as text, for surfacing in a local VineReduceError."""
+
     traceback: str
 
 
 @dataclass(frozen=True)
 class ResourceExhaustion(Outcome):
-    pass
+    """The call was killed for exceeding its resource allocation (memory,
+    wall time, disk). Carries no extra fields beyond result_id/resources."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +80,7 @@ class RawOutcome:
     traceback: str | None = None
 
     def to_outcome(self, result_id: int) -> Outcome:
+        """Attach result_id and convert to the matching Outcome subclass."""
         if self.status == "success":
             return Success(result_id=result_id, resources=self.resources, file=self.file)
         if self.status == "failure":

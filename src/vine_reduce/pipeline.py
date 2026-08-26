@@ -23,17 +23,28 @@ class VineReduceError(RuntimeError):
 @dataclass
 class PoolItem:
     """A not-yet-final result eligible for reduction: either a single chunk's
-    output, or the output of a previous (non-final) reduction call."""
+    output, or the output of a previous (non-final) reduction call.
+
+    file: the distributor's handle for this item's result file.
+    num_events / wall_time_s / memory_mb: totals accumulated into this item.
+    files: dataset file URLs whose data this item represents.
+    since_checkpoint_time / since_checkpoint_memory: totals accumulated
+        since this item (or one of its inputs) was last checkpointed - reset
+        to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
+    checkpoint_row_id: id of the CheckpointDB row backing this item, if any.
+    source_result_id: the distributor result_id to release once this item is
+        consumed by a later reduction.
+    """
 
     file: str
     num_events: int
     wall_time_s: float
     memory_mb: float
-    files: frozenset[str]  # dataset file URLs whose data this item represents
+    files: frozenset[str]
     since_checkpoint_time: float
     since_checkpoint_memory: float
     checkpoint_row_id: int | None = None
-    source_result_id: int | None = None  # distributor result_id to release once consumed
+    source_result_id: int | None = None
 
 
 @dataclass
@@ -176,9 +187,13 @@ class Pipeline:
     # -- chunk generation ----------------------------------------------------
 
     def in_flight_count(self) -> int:
+        """How many chunk/reduce tasks this pipeline currently has submitted
+        and not yet resolved."""
         return len(self._in_flight)
 
     def owns(self, result_id: int) -> bool:
+        """Whether result_id was submitted by this pipeline (as opposed to
+        another pipeline sharing the same distributor)."""
         return result_id in self._in_flight
 
     def refresh_finished(self) -> None:
@@ -193,6 +208,9 @@ class Pipeline:
 
     @property
     def chunks_all_done(self) -> bool:
+        """Whether chunk generation is exhausted and no chunk task (fresh or
+        retry) is pending or in flight - i.e. nothing more will ever be
+        added to the pool from chunk processing."""
         return (
             self._generator_exhausted
             and not self._retry_chunks
@@ -301,6 +319,11 @@ class Pipeline:
     # -- outcome handling ------------------------------------------------------
 
     def handle_outcome(self, result_id: int, outcome: Outcome) -> None:
+        """React to the Outcome of one of this pipeline's own chunk/reduce
+        tasks: pool a chunk's output, fold a reduction's output into
+        final_results or back into the pool, retry on ResourceExhaustion (
+        halving chunksize/reduction_size), or raise VineReduceError on
+        RuntimeFailure. Updates `finished` once nothing is left to do."""
         task = self._in_flight.pop(result_id)
         if isinstance(task, _ChunkTask):
             self._handle_chunk_outcome(task, outcome)

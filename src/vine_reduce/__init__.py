@@ -1,3 +1,13 @@
+"""VineReduce: a dynamic data reduction framework for data processing. See
+PLAN.md for the full design and the README for usage.
+
+Re-exports the package's public API: VineReduce/VineReduceError (engine.py),
+Distributor (the interface a distributor implements), LocalDistributor and
+TaskVineDistributor (the two Distributor implementations shipped here),
+get_environment/UnstagedChanges (remote_environment.py), and the Chunk/
+Outcome family of types shared between vine_reduce and a distributor.
+"""
+
 from typing import TYPE_CHECKING
 
 from .distributor import Distributor

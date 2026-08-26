@@ -23,6 +23,10 @@ TaskKind = Literal["processor", "reducer"]
 
 
 class Distributor(Protocol):
+    """The interface VineReduce needs from a distributor. Implement this
+    protocol (see LocalDistributor and TaskVineDistributor for two examples)
+    to run vine_reduce against a different backend."""
+
     def submit(
         self,
         priority: int,

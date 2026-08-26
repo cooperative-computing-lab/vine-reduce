@@ -125,6 +125,9 @@ def executor_wrapper(
 
 
 def default_reducer(a: Any, b: Any) -> Any:
+    """Folds b into a via `a += b`. Works for anything supporting in-place
+    addition (numbers, arrays, ...); does not know how to merge dicts or
+    sets - see coffea.py's default_reducer for that."""
     a += b
     return a
 

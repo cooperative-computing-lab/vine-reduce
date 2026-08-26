@@ -16,12 +16,29 @@ from typing import Any
 
 
 def checksum_dataset(dataset: dict[str, Any]) -> str:
+    """A stable hash of a dataset's contents, used to detect when a
+    dataset's definition has changed since the last run (see
+    CheckpointDB.dataset_changed)."""
     encoded = json.dumps(dataset, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
 class CheckpointRow:
+    """One row of the `checkpoints` table.
+
+    id: row id (sqlite AUTOINCREMENT primary key).
+    processor / dataset: the (processor, dataset) pair this checkpoint
+        belongs to.
+    covers_files: dataset file URLs whose data this checkpoint's result
+        represents.
+    num_events / wall_time_s / memory_mb: totals accumulated into this
+        checkpoint's result.
+    is_final: whether this is a final result (results_dir) or an
+        intermediate checkpoint (checkpoint_dir).
+    path: where the checkpoint's serialized result file lives on disk.
+    """
+
     id: int
     processor: str
     dataset: str
@@ -34,7 +51,12 @@ class CheckpointRow:
 
 
 class CheckpointDB:
+    """Sqlite-backed record of checkpoints and final results for every
+    (processor, dataset) pair, used to resume an interrupted run without
+    redoing finished work. See the module docstring."""
+
     def __init__(self, db_path: str):
+        """Opens (creating if needed) the sqlite database at db_path."""
         self._conn = sqlite3.connect(db_path)
         # This DB is a work-resumption aid, not a record that must survive a
         # power loss: on crash, a checkpoint just fails to record and the
@@ -96,9 +118,10 @@ class CheckpointDB:
         path: str,
         commit: bool = True,
     ) -> int:
-        """commit=False lets a caller that also has delete_checkpoint calls
-        for the same event (e.g. replacing checkpoints on a reduction) batch
-        them into one transaction via a single trailing self.commit()."""
+        """Insert a new checkpoint row and return its id. commit=False lets
+        a caller that also has delete_checkpoint calls for the same event
+        (e.g. replacing checkpoints on a reduction) batch them into one
+        transaction via a single trailing self.commit()."""
         cur = self._conn.execute(
             "INSERT INTO checkpoints"
             " (processor, dataset, covers_files, num_events, wall_time_s, memory_mb,"
@@ -120,14 +143,19 @@ class CheckpointDB:
         return cur.lastrowid
 
     def delete_checkpoint(self, row_id: int, commit: bool = True) -> None:
+        """Remove a checkpoint row by id. commit=False defers the write to a
+        later self.commit(), as with add_checkpoint."""
         self._conn.execute("DELETE FROM checkpoints WHERE id = ?", (row_id,))
         if commit:
             self._conn.commit()
 
     def commit(self) -> None:
+        """Commit any pending writes made with commit=False."""
         self._conn.commit()
 
     def checkpoints_for(self, processor: str, dataset: str) -> list[CheckpointRow]:
+        """All checkpoint rows (final and intermediate) on record for one
+        (processor, dataset) pair."""
         rows = self._conn.execute(
             "SELECT id, processor, dataset, covers_files, num_events, wall_time_s,"
             " memory_mb, is_final, path FROM checkpoints WHERE processor = ? AND dataset = ?",
@@ -149,6 +177,7 @@ class CheckpointDB:
         ]
 
     def close(self) -> None:
+        """Close the underlying sqlite connection."""
         self._conn.close()
 
     def __enter__(self) -> "CheckpointDB":

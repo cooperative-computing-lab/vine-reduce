@@ -38,6 +38,89 @@ def _resolve_sized_config(
 
 @dataclass
 class VineReduce:
+    """Drives a dynamic data reduction computation over one or more datasets: for
+    each (processor, dataset) pair, splits every dataset file into chunks,
+    runs `processor` over each chunk remotely (map), then repeatedly folds
+    pooled outputs together with `reducer` (reduce) until a final result
+    covers the whole dataset. Call compute() to run it. See the README's
+    Quick Start and PLAN.md for the full design.
+
+    processors: {name: processor_fn} - one Pipeline is built per
+        (processor, dataset) pair. processor_fn receives whatever
+        chunk_to_args returns for a chunk and runs remotely, at the
+        execution site chosen by `executor`.
+    input: the dataset description passed to input_to_datasets - by default
+        (see defaults.default_input_to_datasets) either an already-parsed
+        dict of shape {dataset_name: {"metadata": {...}, "files": {url:
+        num_entries}}}, or a path to a json file holding that dict.
+    input_to_datasets: parses `input` into that dataset dict shape; defaults
+        to defaults.default_input_to_datasets. Runs locally.
+    datasets_to_chunks: splits one dataset's files into Chunks; defaults to
+        defaults.default_datasets_to_chunks. Runs locally.
+    chunk_to_args: turns a Chunk into whatever argument `processor` expects
+        (e.g. opening the file and reading events); defaults to
+        defaults.default_chunk_to_args, which passes the Chunk through
+        unchanged. Runs remotely.
+    executor: runs `processor(args)` at the execution site - see
+        executor.py for simple_executor (default), cloudpickle_executor, and
+        dask_executor. Runs remotely.
+    reducer: folds two processor outputs (or two partial reductions)
+        together; must be commutative, associative, and distributive over a
+        dataset's chunks. Defaults to defaults.default_reducer (`a += b`).
+        Runs remotely.
+    reduction_size: how many pooled items a reduction call folds together at
+        once. Either a plain int, or a dict of shape
+        {"default": int, "processors": {name: int}, "datasets": {name: int}}
+        for per-processor/per-dataset overrides (most specific wins).
+        Halved automatically (down to a minimum of 2) on resource
+        exhaustion.
+    is_result: given (num_events, total_wall_time_s, total_memory_mb) for a
+        pooled group, returns whether it counts as a final result for that
+        (processor, dataset) pair. Defaults to a check that the group covers
+        every event in the dataset (see defaults.make_default_is_result).
+        Runs locally.
+    result_postprocess: applied to a final result just before it's written
+        out, e.g. to convert an accumulator into a plainer shape. Runs
+        remotely, as part of the reduction call that produces the final
+        result.
+    checkpoint_time: checkpoint a non-final reduction once at least this
+        many seconds of wall time have accumulated in it since its last
+        checkpoint. None disables time-based checkpointing.
+    checkpoint_size: checkpoint a non-final reduction once at least this
+        many MB of memory usage have accumulated in it since its last
+        checkpoint. None disables size-based checkpointing.
+    checkpoint_accumulations: if True, checkpoint every non-final reduction
+        result, regardless of checkpoint_time/checkpoint_size.
+    checkpoint_dir: directory intermediate (non-final) checkpoints are
+        written under.
+    checkpoint_retrieve: if True, pull each checkpoint back to this process
+        via Distributor.retrieve(); if False, leave it wherever the
+        distributor produced it (only meaningful for a distributor that
+        keeps its own permanent copy).
+    results_dir: directory final, per-(processor, dataset) results are
+        written under, at results_dir/<dataset_name>/<processor_name>/.
+    results_retrieve: like checkpoint_retrieve, but for final results.
+    distributor: where processor/reducer calls actually run - a Distributor
+        implementation such as TaskVineDistributor. Defaults to a
+        LocalDistributor (ProcessPoolExecutor-backed) that compute() creates
+        and tears down itself; a distributor passed in here is left running
+        for the caller to shut down.
+    chunksize: target number of events per chunk. Either a plain int, or a
+        dict of the same {"default"/"processors"/"datasets"} shape as
+        reduction_size. None means one chunk per file. Halved automatically
+        on resource exhaustion, taking effect for chunks not yet generated.
+    max_chunks_active: cap on chunks in flight (submitted but not yet
+        finished) across all pipelines at once.
+    max_chunks_cycle: cap on new chunks submitted per scheduling cycle,
+        across all pipelines.
+    db_path: path to the sqlite checkpoint database; defaults to
+        checkpoint_dir/vine_reduce.db.
+    extra_files: local paths made available, under their basename, wherever
+        every processor/reducer call runs - see Distributor.add_file().
+    environment_variables: environment variables set for every
+        processor/reducer call - see Distributor.set_env_var().
+    """
+
     processors: dict[str, Callable[[Any], Any]]
     input: str | dict[str, Any]
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] | None = None
@@ -64,6 +147,11 @@ class VineReduce:
     environment_variables: dict[str, str] = field(default_factory=dict)
 
     def compute(self) -> None:
+        """Run the computation to completion: build one Pipeline per
+        (processor, dataset) pair (resuming from any checkpoints already on
+        disk) and drive them until every pipeline has a final result. If
+        `distributor` was not supplied, a LocalDistributor is created for
+        this call and shut down again before returning."""
         distributor = self.distributor
         owns_distributor = distributor is None
         if owns_distributor:

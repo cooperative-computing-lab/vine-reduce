@@ -34,6 +34,8 @@ def simple_executor(
     distributor_metadata: dict[str, Any] | None = None,
     executor_metadata: dict[str, Any] | None = None,
 ) -> Any:
+    """Calls processor(args) directly, in the same process/task running
+    executor_wrapper. The default `executor` for VineReduce."""
     return processor(args)
 
 
@@ -54,6 +56,8 @@ class CloudpickleProcessPoolExecutor(ProcessPoolExecutor):
         super().__init__(*args, **kwargs, mp_context=mp.get_context("fork"))
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        """Like ProcessPoolExecutor.submit, but fn/args/kwargs may be
+        closures or lambdas."""
         payload = cloudpickle.dumps((fn, args, kwargs))
         return super().submit(_run_cloudpickled, payload)
 

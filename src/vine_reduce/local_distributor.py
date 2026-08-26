@@ -43,7 +43,16 @@ def _run_cloudpickled(payload: bytes) -> Any:
 
 
 class LocalDistributor:
+    """A Distributor that runs every processor/reducer call in a local
+    ProcessPoolExecutor - the default when VineReduce is constructed without
+    a `distributor=`. See the module docstring for what it is and isn't good
+    for."""
+
     def __init__(self, max_workers: int | None = None, work_dir: str | None = None):
+        """max_workers: size of the local process pool; defaults to the
+        machine's CPU count. work_dir: directory to write result files into;
+        defaults to a fresh temp directory that is removed on shutdown()
+        (a caller-supplied work_dir is left in place)."""
         self._max_workers = max_workers or os.process_cpu_count() or 1
         self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
 
@@ -63,6 +72,8 @@ class LocalDistributor:
     def submit(
         self, priority: int, category: str, kind: str, func: Callable[..., Any], *args: Any
     ) -> int:
+        """Queue func(dest_file, *args) to run in the process pool, ordered
+        by priority (larger runs first). Returns a result_id."""
         result_id = next(self._next_id)
         heapq.heappush(self._pending, (-priority, next(self._seq), result_id, func, args))
         self._dispatch()
@@ -76,6 +87,8 @@ class LocalDistributor:
             self._running[self._pool.submit(_run_cloudpickled, payload)] = result_id
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
+        """Block until a queued call finishes, returning its Outcome, or
+        None if timeout elapses (or nothing is running) first."""
         if not self._running:
             return None
         done, _ = concurrent.futures.wait(
@@ -96,16 +109,22 @@ class LocalDistributor:
         return outcome
 
     def release_result(self, result_id: int) -> None:
+        """Delete the result file for a completed (Success) result_id."""
         path = self._files.pop(result_id, None)
         if path is not None and os.path.exists(path):
             os.remove(path)
 
     def capacity(self) -> int:
+        """Room left before the pool + its pending queue reaches twice
+        max_workers, this distributor's target queue depth."""
         target_queue_depth = 2 * self._max_workers
         in_flight = len(self._running) + len(self._pending)
         return max(0, target_queue_depth - in_flight)
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
+        """Copy the result file for a completed (Success) result_id to
+        dest_path - a plain file copy, since worker subprocesses already
+        share vine_reduce's filesystem."""
         shutil.copy(self._files[result_id], dest_path)
 
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
@@ -115,9 +134,13 @@ class LocalDistributor:
         accepted for interface compatibility but unused."""
 
     def set_env_var(self, name: str, value: str) -> None:
+        """Set an environment variable for every call submitted from now on,
+        applied inside each worker subprocess (see _run_cloudpickled)."""
         self._env_vars[name] = value
 
     def shutdown(self) -> None:
+        """Shut down the process pool and, if this distributor created its
+        own work_dir, remove it."""
         self._pool.shutdown(wait=True)
         if self._owns_work_dir:
             shutil.rmtree(self._work_dir, ignore_errors=True)

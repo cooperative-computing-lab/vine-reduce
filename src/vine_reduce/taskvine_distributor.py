@@ -66,6 +66,12 @@ class _InFlight:
 
 
 class TaskVineDistributor:
+    """A Distributor backed by ndcctools.taskvine, running vine_reduce
+    across a cluster of TaskVine workers instead of local subprocesses. See
+    the module docstring for how it bridges the Distributor protocol onto
+    TaskVine's file/task model, and the README's "Packaging an environment
+    for remote workers" for `environment=`."""
+
     def __init__(
         self,
         port: int | tuple[int, int] = 9123,
@@ -75,6 +81,20 @@ class TaskVineDistributor:
         environment: str | None = None,
         manager: vine.Manager | None = None,
     ):
+        """port: port (or [min, max] range) the manager listens on, or 0 to
+        pick one automatically - see `port` below. name: the manager's
+        TaskVine project name, for workers to find it by name instead of
+        host:port. resources_processor/resources_reducer: per-category
+        resource caps (e.g. {"cores": 1, "memory_mb": 2000, "disk_mb": 4000})
+        applied to every processor/reducer call respectively, via
+        Manager.set_category_resources_max. environment: path to a packed
+        poncho package tarball (see get_environment() in
+        remote_environment.py) to ship and activate on every worker task;
+        None runs tasks in whatever Python environment the worker itself was
+        started with. manager: an already-constructed vine.Manager (or
+        subclass, e.g. vine.DaskVine) to use instead of building one from
+        port/name - lets vine_reduce's tasks and a caller's own tasks share
+        one manager/port and worker pool."""
         # manager lets a caller hand in an already-constructed vine.Manager
         # (or a subclass, e.g. vine.DaskVine) instead of having this class
         # build its own - the way to run coffea's own preprocess() and this
@@ -101,11 +121,19 @@ class TaskVineDistributor:
 
     @property
     def port(self) -> int:
+        """The manager's actual listening port - useful when `port=0` (or a
+        range) was passed to __init__ and the resolved port is needed to
+        point workers at this manager."""
         return self._manager.port
 
     def submit(
         self, priority: int, category: str, kind: TaskKind, func: Callable[..., Any], *args: Any
     ) -> int:
+        """Submit func(dest_token, *args) as a vine.PythonTask, ordered by
+        priority (larger runs first) and grouped under `category` for
+        resource-limit purposes. kind selects resources_processor vs.
+        resources_reducer the first time this category is seen. Returns a
+        result_id."""
         result_id = next(self._next_id)
         dest_token = _result_token(result_id)
 
@@ -176,6 +204,10 @@ class TaskVineDistributor:
         return remapped, extra_inputs
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
+        """Block until a submitted task finishes, returning its Outcome
+        (Success/RuntimeFailure/ResourceExhaustion, translated from
+        TaskVine's own result string when the task didn't run its Python
+        function to completion), or None if timeout elapses first."""
         # TaskVine's C API only accepts an integer number of seconds; round
         # up so a small positive float still waits at least that long
         # instead of truncating to 0 ("return immediately").
@@ -212,14 +244,20 @@ class TaskVineDistributor:
         }
 
     def release_result(self, result_id: int) -> None:
+        """Undeclare the vine.File backing a completed (Success) result_id,
+        letting TaskVine reclaim its storage on the worker(s) holding it."""
         file = self._files_by_token.pop(_result_token(result_id), None)
         if file is not None:
             self._manager.undeclare_file(file)
 
     def capacity(self) -> int:
+        """How many more tasks the manager's connected workers could
+        currently run, per TaskVine's own Manager.hungry()."""
         return self._manager.hungry()
 
     def retrieve(self, result_id: int, dest_path: str) -> None:
+        """Pull the result file for a completed (Success) result_id back to
+        the manager and write it to dest_path."""
         file = self._files_by_token[_result_token(result_id)]
         self._manager.fetch_file(file)
         with open(dest_path, "wb") as f:

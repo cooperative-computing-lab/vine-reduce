@@ -27,10 +27,14 @@ T = TypeVar("T")
 
 @runtime_checkable
 class Addable(Protocol):
+    """Anything supporting `a + b`, e.g. a histogram or a plain number."""
+
     def __add__(self: T, other: T) -> T: ...
 
 
 Accumulatable = Addable | MutableSet | MutableMapping
+"""A value default_reducer knows how to merge: an Addable, a mutable set
+(merged via union), or a mutable mapping (merged key-by-key, recursively)."""
 
 
 def default_reducer(a: Accumulatable, b: Accumulatable) -> Accumulatable:
@@ -139,6 +143,34 @@ def _make_executor(processor_args: Mapping[str, Any] | None) -> Callable[..., An
 
 @dataclass
 class VineReduceCoffea(VineReduce):
+    """A VineReduce specialization for coffea-based HEP analyses: supplies
+    NanoEvents-reading (chunk_to_args), awkward-array materialization
+    (executor), and coffea-style accumulator merging (reducer), while
+    chunking, checkpointing, and restart are inherited unchanged from
+    VineReduce. `processors` values here take one `events` NanoEvents array
+    and return any picklable, accumulatable result (see default_reducer).
+    See the README's "HEP / coffea workflows" section and PLAN.md.
+
+    schema: the coffea NanoEvents schema class used to interpret each ROOT
+        file, e.g. NanoAODSchema (default).
+    mode: NanoEventsFactory.from_root's `mode` - "virtual" (default) for
+        lazily-materialized awkward arrays, or "eager"/"dask" per coffea's
+        own NanoEventsFactory docs.
+    object_path: the ROOT TTree name to read events from, e.g. "Events"
+        (default).
+    uproot_options: extra keyword options forwarded to
+        NanoEventsFactory.from_root's `uproot_options`.
+    processor_args: extra keyword arguments passed to every processor call,
+        in addition to its `events` argument.
+    reducer: overrides VineReduce's default_reducer with this module's
+        coffea-aware default_reducer, which also merges sets and mappings
+        (dicts of histograms, as coffea processors commonly return).
+    input_to_datasets: overrides VineReduce's default with
+        coffea_input_to_datasets, which reads coffea's own preprocess()
+        output (a dict, or a path to the json file holding it) instead of
+        vine_reduce's plain dataset shape.
+    """
+
     schema: Any = NanoAODSchema
     mode: str = "virtual"
     object_path: str = "Events"
@@ -148,6 +180,8 @@ class VineReduceCoffea(VineReduce):
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] = coffea_input_to_datasets
 
     def __post_init__(self) -> None:
+        """Builds chunk_to_args/executor from the fields above, the way a
+        user of plain VineReduce would pass them in directly."""
         self.chunk_to_args = _make_chunk_to_args(
             self.schema, self.mode, self.uproot_options, self.object_path
         )
