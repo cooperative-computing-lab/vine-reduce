@@ -30,8 +30,12 @@ class PoolItem:
         item is a final result (see Pipeline._checkpoint).
     num_events / wall_time_s / memory_mb: totals accumulated into this item.
     files: dataset file URLs whose data this item represents.
-    since_checkpoint_time / since_checkpoint_memory: totals accumulated
-        since this item (or one of its inputs) was last checkpointed - reset
+    since_checkpoint_time: wall time accumulated since this item (or one of
+        its inputs) was last checkpointed - reset to 0 whenever a checkpoint
+        is written (see Pipeline._checkpoint).
+    since_checkpoint_distance: number of reductions folded into this item's
+        lineage since it (or one of its inputs) was last checkpointed - 0 for
+        a fresh chunk result, max(group)+1 whenever a group is folded, reset
         to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
     checkpoint_row_id: id of the CheckpointDB row backing this item, if any.
     checkpoint_path: local on-disk path of this item's checkpoint file, if
@@ -59,7 +63,7 @@ class PoolItem:
     memory_mb: float
     files: frozenset[str]
     since_checkpoint_time: float
-    since_checkpoint_memory: float
+    since_checkpoint_distance: int
     checkpoint_row_id: int | None = None
     checkpoint_path: str | None = None
     source_result_id: int | None = None
@@ -112,7 +116,7 @@ class Pipeline:
         chunksize: int | None,
         reduction_size: int,
         checkpoint_time: float | None,
-        checkpoint_size: float | None,
+        checkpoint_distance: int | None,
         checkpoint_accumulations: bool,
         checkpoint_dir: str,
         checkpoint_retrieve: bool,
@@ -139,7 +143,7 @@ class Pipeline:
         self.chunksize = chunksize
         self.reduction_size = reduction_size
         self._checkpoint_time = checkpoint_time
-        self._checkpoint_size = checkpoint_size
+        self._checkpoint_distance = checkpoint_distance
         self._checkpoint_accumulations = checkpoint_accumulations
         self._checkpoint_dir = checkpoint_dir
         self._checkpoint_retrieve = checkpoint_retrieve
@@ -180,7 +184,7 @@ class Pipeline:
             memory_mb=row.memory_mb,
             files=frozenset(row.covers_files),
             since_checkpoint_time=0,
-            since_checkpoint_memory=0,
+            since_checkpoint_distance=0,
             checkpoint_row_id=row.id,
             checkpoint_path=row.path,
         )
@@ -323,7 +327,7 @@ class Pipeline:
         is_final = self._is_result(num_events, total_time, total_memory)
         is_checkpoint = is_final or self._checkpoint_due(
             sum(item.since_checkpoint_time for item in group),
-            sum(item.since_checkpoint_memory for item in group),
+            max(item.since_checkpoint_distance for item in group),
         )
 
         result_id = self._distributor.submit(
@@ -386,7 +390,7 @@ class Pipeline:
                 memory_mb=memory_mb,
                 files=frozenset({chunk.url}),
                 since_checkpoint_time=wall_time_s,
-                since_checkpoint_memory=memory_mb,
+                since_checkpoint_distance=0,
                 source_result_id=outcome.result_id,
             )
         )
@@ -422,7 +426,7 @@ class Pipeline:
             memory_mb=task.total_memory + memory_mb,
             files=frozenset().union(*(item.files for item in group)),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
-            since_checkpoint_memory=sum(item.since_checkpoint_memory for item in group) + memory_mb,
+            since_checkpoint_distance=max(item.since_checkpoint_distance for item in group) + 1,
             source_result_id=outcome.result_id,
             inputs=group,
         )
@@ -435,21 +439,27 @@ class Pipeline:
         else:
             self.pool.append(new_item)
 
-    def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_memory: float) -> bool:
+    def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall
-        time or in memory - to be worth checkpointing the reduction about to
-        be submitted. Decided from the group's inputs alone (their summed
-        since_checkpoint_time/since_checkpoint_memory), before the reduction
-        itself has run, so this reduction's own cost is not part of the
-        decision - only what the reduction it is about to fold in already
-        carries. When checkpoint_accumulations is set, every accumulation
-        (non-final reduction) result is checkpointed regardless of the
-        thresholds."""
+        time or in un-checkpointed accumulations - to be worth checkpointing
+        the reduction about to be submitted. Decided from the group's inputs
+        alone, before the reduction itself has run, so this reduction's own
+        cost is not part of the decision - only what the reduction it is
+        about to fold in already carries. since_checkpoint_time is summed
+        across the group (total wall time at stake), while
+        since_checkpoint_distance is the max across the group (the worst-off
+        ancestor's accumulations-since-checkpoint - "has some ancestor gone
+        checkpoint_distance accumulations without being checkpointed").
+        When checkpoint_accumulations is set, every accumulation (non-final
+        reduction) result is checkpointed regardless of the thresholds."""
         if self._checkpoint_accumulations:
             return True
         if self._checkpoint_time is not None and since_checkpoint_time >= self._checkpoint_time:
             return True
-        if self._checkpoint_size is not None and since_checkpoint_memory >= self._checkpoint_size:
+        if (
+            self._checkpoint_distance is not None
+            and since_checkpoint_distance >= self._checkpoint_distance
+        ):
             return True
         return False
 
@@ -513,7 +523,7 @@ class Pipeline:
 
         new_item.checkpoint_row_id = row_id
         new_item.since_checkpoint_time = 0
-        new_item.since_checkpoint_memory = 0
+        new_item.since_checkpoint_distance = 0
 
     def _release_uncheckpointed(self, item: PoolItem) -> None:
         """Release item's own cluster-side copy - safe now because the

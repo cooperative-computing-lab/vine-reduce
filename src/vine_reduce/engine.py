@@ -86,11 +86,12 @@ class VineReduce:
     checkpoint_time: checkpoint a non-final reduction once at least this
         many seconds of wall time have accumulated in it since its last
         checkpoint. None disables time-based checkpointing.
-    checkpoint_size: checkpoint a non-final reduction once at least this
-        many MB of memory usage have accumulated in it since its last
-        checkpoint. None disables size-based checkpointing.
+    checkpoint_distance: checkpoint a non-final reduction once some ancestor
+        in the group being folded has gone at least this many accumulations
+        (reductions) without being checkpointed. None disables
+        distance-based checkpointing.
     checkpoint_accumulations: if True, checkpoint every non-final reduction
-        result, regardless of checkpoint_time/checkpoint_size.
+        result, regardless of checkpoint_time/checkpoint_distance.
     checkpoint_dir: directory intermediate (non-final) checkpoints are
         written under.
     checkpoint_retrieve: if True, pull each checkpoint back to this process
@@ -132,7 +133,7 @@ class VineReduce:
     is_result: Callable[[int, float, float], bool] | None = None
     result_postprocess: Callable[[Any], Any] | None = None
     checkpoint_time: float | None = None
-    checkpoint_size: float | None = None
+    checkpoint_distance: int | None = None
     checkpoint_accumulations: bool = False
     checkpoint_dir: str = "checkpoints"
     checkpoint_retrieve: bool = True
@@ -226,7 +227,7 @@ class VineReduce:
                             self.reduction_size, proc_name, dataset_name
                         ),
                         checkpoint_time=self.checkpoint_time,
-                        checkpoint_size=self.checkpoint_size,
+                        checkpoint_distance=self.checkpoint_distance,
                         checkpoint_accumulations=self.checkpoint_accumulations,
                         checkpoint_dir=self.checkpoint_dir,
                         checkpoint_retrieve=self.checkpoint_retrieve,

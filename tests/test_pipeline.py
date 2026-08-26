@@ -28,7 +28,7 @@ def make_pipeline(
     reduction_size=10,
     chunksize=None,
     checkpoint_time=None,
-    checkpoint_size=None,
+    checkpoint_distance=None,
     checkpoint_accumulations=False,
     db=None,
     dataset_name="ds",
@@ -54,7 +54,7 @@ def make_pipeline(
             chunksize=chunksize,
             reduction_size=reduction_size,
             checkpoint_time=checkpoint_time,
-            checkpoint_size=checkpoint_size,
+            checkpoint_distance=checkpoint_distance,
             checkpoint_accumulations=checkpoint_accumulations,
             checkpoint_dir=str(tmp_path / "checkpoints"),
             checkpoint_retrieve=True,
@@ -138,6 +138,26 @@ def test_checkpoint_time_threshold_persists_and_supersedes_intermediates(
     assert rows[0].is_final is True
     # and its file, plus every superseded checkpoint file, should be cleaned
     # off disk (final results live in results_dir, not checkpoint_dir).
+    assert os.listdir(str(tmp_path / "checkpoints")) == []
+    db.close()
+
+
+def test_checkpoint_distance_threshold_persists_and_supersedes_intermediates(
+    fake_distributor, tmp_path
+):
+    dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_distance=1
+    )
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 3
+    rows = db.checkpoints_for("proc", "ds")
+    # every intermediate checkpoint should have been superseded and deleted,
+    # leaving only the final one.
+    assert len(rows) == 1
+    assert rows[0].is_final is True
     assert os.listdir(str(tmp_path / "checkpoints")) == []
     db.close()
 
