@@ -63,6 +63,7 @@ class _ChunkTask:
 class _ReduceTask:
     group: list[PoolItem]
     is_final: bool
+    is_checkpoint: bool
     num_events: int
     total_time: float
     total_memory: float
@@ -297,6 +298,10 @@ class Pipeline:
         total_time = sum(item.wall_time_s for item in group)
         total_memory = sum(item.memory_mb for item in group)
         is_final = self._is_result(num_events, total_time, total_memory)
+        is_checkpoint = is_final or self._checkpoint_due(
+            sum(item.since_checkpoint_time for item in group),
+            sum(item.since_checkpoint_memory for item in group),
+        )
 
         result_id = self._distributor.submit(
             self._reduce_priority,
@@ -311,6 +316,7 @@ class Pipeline:
         self._in_flight[result_id] = _ReduceTask(
             group=group,
             is_final=is_final,
+            is_checkpoint=is_checkpoint,
             num_events=num_events,
             total_time=total_time,
             total_memory=total_memory,
@@ -395,7 +401,7 @@ class Pipeline:
             source_result_id=outcome.result_id,
         )
 
-        if is_final or self._checkpoint_due(new_item):
+        if task.is_checkpoint:
             self._checkpoint(new_item, group, is_final)
 
         if is_final:
@@ -403,22 +409,21 @@ class Pipeline:
         else:
             self.pool.append(new_item)
 
-    def _checkpoint_due(self, item: PoolItem) -> bool:
+    def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_memory: float) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall
-        time or in memory - to be worth writing this item out. When
-        checkpoint_accumulations is set, every accumulation (non-final
-        reduction) result is checkpointed regardless of the thresholds."""
+        time or in memory - to be worth checkpointing the reduction about to
+        be submitted. Decided from the group's inputs alone (their summed
+        since_checkpoint_time/since_checkpoint_memory), before the reduction
+        itself has run, so this reduction's own cost is not part of the
+        decision - only what the reduction it is about to fold in already
+        carries. When checkpoint_accumulations is set, every accumulation
+        (non-final reduction) result is checkpointed regardless of the
+        thresholds."""
         if self._checkpoint_accumulations:
             return True
-        if (
-            self._checkpoint_time is not None
-            and item.since_checkpoint_time >= self._checkpoint_time
-        ):
+        if self._checkpoint_time is not None and since_checkpoint_time >= self._checkpoint_time:
             return True
-        if (
-            self._checkpoint_size is not None
-            and item.since_checkpoint_memory >= self._checkpoint_size
-        ):
+        if self._checkpoint_size is not None and since_checkpoint_memory >= self._checkpoint_size:
             return True
         return False
 
