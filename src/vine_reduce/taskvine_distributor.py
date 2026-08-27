@@ -47,6 +47,14 @@ wait() checks task.successful() first and only trusts the RawOutcome
 returned by executor_wrapper/reducer_wrapper (a Python-level exception
 caught inside the wrapper) when that's True; otherwise it translates
 TaskVine's own result string into ResourceExhaustion or RuntimeFailure.
+task.successful() means "the wrapper ran to completion and returned a
+RawOutcome", not "that RawOutcome was a success" - a Python-level failure
+or caught MemoryError still returns normally, and dest_file is always
+written (see defaults.py's _run_and_wrap) precisely so TaskVine's own
+missing-output check can't itself mark such a task unsuccessful and
+discard the real RawOutcome. task.successful() is False only when the
+wrapper never returned at all: it crashed outright (unhandled exception,
+bug) or the worker process was killed by TaskVine's resource watchdog.
 """
 
 from __future__ import annotations
@@ -60,7 +68,7 @@ from typing import Any, Callable
 import ndcctools.taskvine as vine
 
 from .distributor import TaskKind
-from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure
+from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
@@ -282,12 +290,25 @@ class TaskVineDistributor:
 
         if task.successful():
             raw: RawOutcome = task.output
-            return raw.to_outcome(result_id)
+            outcome = raw.to_outcome(result_id)
+            if not isinstance(outcome, Success):
+                # The wrapper ran to completion but reported a Python-level
+                # failure/exhaustion (see defaults.py's _run_and_wrap) -
+                # dest_file exists (it's always written, even on failure, so
+                # TaskVine doesn't itself report "output missing" and
+                # discard this very outcome) but is just a placeholder,
+                # and vine_reduce only ever calls release_result() for a
+                # Success - so drop it here, or it would leak for the rest
+                # of the run.
+                self.release_result(result_id)
+            return outcome
 
-        # A task that didn't run to completion has no result to hand back, and
-        # vine_reduce only ever calls release_result() for a Success - so drop
-        # the file declared for it here, or it would leak for the rest of the
-        # run (a resource-exhausted chunk, say, is simply retried).
+        # A task that didn't run to completion at all (crashed before
+        # returning, or was killed by TaskVine's own resource watchdog) has
+        # no result to hand back, and vine_reduce only ever calls
+        # release_result() for a Success - so drop the file declared for it
+        # here, or it would leak for the rest of the run (a resource-
+        # exhausted chunk, say, is simply retried).
         self.release_result(result_id)
         resources = self._resources_from_task(task, kind)
         if task.result in _RESOURCE_EXHAUSTION_RESULTS:

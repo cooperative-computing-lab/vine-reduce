@@ -88,12 +88,20 @@ def _unmeasured_resources() -> dict[str, Any]:
 
 def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
     """Runs `run`, measuring resources, and serializes its result to dest_file
-    on success. Shared tail for executor_wrapper and reducer_wrapper."""
+    on success. Shared tail for executor_wrapper and reducer_wrapper.
+
+    dest_file is written unconditionally, even on failure/exhaustion: a
+    distributor may declare it as a required task output before this
+    function ever runs (see TaskVineDistributor.submit), so leaving it
+    missing would make the *transport* report the failure instead of this
+    function's own RawOutcome, discarding the real status and traceback."""
     try:
         result, resources = _measure(run)
     except MemoryError:
+        serialization.dump(None, dest_file)
         return RawOutcome(status="exhausted", resources=_unmeasured_resources())
     except Exception:
+        serialization.dump(None, dest_file)
         return RawOutcome(
             status="failure",
             resources=_unmeasured_resources(),

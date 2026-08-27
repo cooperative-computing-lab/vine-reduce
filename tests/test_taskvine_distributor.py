@@ -14,9 +14,9 @@ from vine_reduce.defaults import (
 )
 from vine_reduce.executor import simple_executor
 from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token
-from vine_reduce.types import Chunk, Success
+from vine_reduce.types import Chunk, RuntimeFailure, Success
 
-from helpers import count_events, read_env_var, read_shipped_file, sum_reducer
+from helpers import count_events, failing_processor, read_env_var, read_shipped_file, sum_reducer
 
 pytestmark = pytest.mark.skipif(
     shutil.which("vine_factory") is None, reason="vine_factory not on PATH"
@@ -145,6 +145,35 @@ def test_release_result_removes_checkpoint_file_from_disk(distributor):
 
     assert not os.path.exists(path)
     assert _result_token(outcome.result_id) not in distributor._checkpoint_paths_by_token
+
+
+def test_failed_task_reports_real_traceback_not_output_missing(distributor):
+    """A processor that raises must come back as the wrapper's own
+    RuntimeFailure, with the real traceback - not as a generic "output
+    missing" RuntimeFailure with no traceback, which is what happens if the
+    declared dest_file output isn't produced on failure (see defaults.py's
+    _run_and_wrap)."""
+    result_id = distributor.submit(
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        failing_processor,
+        Chunk("a.root", 0, 5),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        simple_executor,
+    )
+
+    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+
+    assert isinstance(outcome, RuntimeFailure)
+    assert outcome.result_id == result_id
+    assert "ValueError: boom" in outcome.traceback
+    # The placeholder dest_file must not leak once its outcome is consumed.
+    assert _result_token(result_id) not in distributor._files_by_key
 
 
 def test_capacity_reports_a_non_negative_capacity(distributor):

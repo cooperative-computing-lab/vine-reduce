@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from vine_reduce import serialization
 from vine_reduce.defaults import (
     default_datasets_to_chunks,
@@ -94,6 +96,11 @@ def test_executor_wrapper_failure_captures_traceback(tmp_path):
     )
     assert outcome.status == "failure"
     assert "ValueError: boom" in outcome.traceback
+    # dest_file must still be written on failure: a distributor (e.g.
+    # TaskVineDistributor) may have already declared it as a required task
+    # output, so leaving it missing would make the transport itself report
+    # the failure and discard this RawOutcome (see taskvine_distributor.py).
+    assert os.path.exists(dest)
 
 
 def test_executor_wrapper_resource_exhaustion(tmp_path):
@@ -110,6 +117,7 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
         lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
     )
     assert outcome.status == "exhausted"
+    assert os.path.exists(dest)
 
 
 def test_reducer_wrapper_folds_inputs(tmp_path):
