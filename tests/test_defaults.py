@@ -17,6 +17,7 @@ from helpers import (
     exhausting_processor,
     failing_processor,
     sum_reducer,
+    unpicklable_processor,
 )
 
 
@@ -117,6 +118,27 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
         lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
     )
     assert outcome.status == "exhausted"
+    assert os.path.exists(dest)
+
+
+def test_executor_wrapper_unpicklable_result_becomes_failure(tmp_path):
+    """A result that cloudpickle can't serialize (e.g. contains a lock) must
+    become a failure Outcome, not raise out of the wrapper - dump() failures
+    are as much a run failure as an exception from the processor itself."""
+    dest = str(tmp_path / "out.pkl.zst")
+    chunk = Chunk("a.root", 0, 5)
+    outcome = executor_wrapper(
+        dest,
+        unpicklable_processor,
+        chunk,
+        {},
+        None,
+        None,
+        lambda c, dm, dmeta=None: c,
+        lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
+    )
+    assert outcome.status == "failure"
+    assert outcome.traceback is not None
     assert os.path.exists(dest)
 
 

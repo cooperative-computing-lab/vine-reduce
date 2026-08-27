@@ -97,6 +97,7 @@ def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
     function's own RawOutcome, discarding the real status and traceback."""
     try:
         result, resources = _measure(run)
+        serialization.dump(result, dest_file)
     except MemoryError:
         serialization.dump(None, dest_file)
         return RawOutcome(status="exhausted", resources=_unmeasured_resources())
@@ -108,7 +109,6 @@ def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
             traceback=traceback_module.format_exc(),
         )
 
-    serialization.dump(result, dest_file)
     return RawOutcome(status="success", resources=resources, file=dest_file)
 
 

@@ -5,6 +5,7 @@ reused across several test modules, so a shared name is simpler)."""
 from __future__ import annotations
 
 import os
+import threading
 
 
 def read_env_var(chunk):
@@ -34,3 +35,7 @@ def failing_processor(chunk):
 
 def exhausting_processor(chunk):
     raise MemoryError("simulated resource exhaustion")
+
+
+def unpicklable_processor(chunk):
+    return threading.Lock()  # cloudpickle cannot serialize a lock
