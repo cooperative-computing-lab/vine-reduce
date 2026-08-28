@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vine-reduce"
-version = "2026.8.1"
+version = "2026.8.2"
 description = "Dynamic MapReduce framework for data processing"
 readme = "README.md"
 license = "Apache-2.0"
