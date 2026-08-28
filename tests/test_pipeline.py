@@ -5,9 +5,10 @@ import os
 import pytest
 
 from vine_reduce import defaults, serialization
-from vine_reduce.checkpoint_db import CheckpointDB
+from vine_reduce.checkpoint_store import CheckpointRecord, CheckpointStore
 from vine_reduce.executor import simple_executor
-from vine_reduce.pipeline import Pipeline, VineReduceError
+from vine_reduce.pipeline import Pipeline, PoolItem, VineReduceError, plan_restart
+from vine_reduce.types import Chunk, ResultHandle
 
 from helpers import count_events, sum_reducer
 
@@ -36,7 +37,7 @@ def make_pipeline(
     dataset_name="ds",
     is_result=None,
 ):
-    db = db or CheckpointDB(str(tmp_path / "db.sqlite"))
+    db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
     return (
         Pipeline(
@@ -84,8 +85,10 @@ def run_to_completion(pipeline, distributor, max_cycles=1000):
 
 
 def final_value(pipeline):
+    # A final result's durable copy is its checkpoint's path (in results_dir);
+    # its distributor handle is gone by then (see Pipeline._checkpoint).
     assert len(pipeline.final_results) == 1
-    return serialization.load(pipeline.final_results[0].file)
+    return serialization.load(pipeline.final_results[0].checkpoint.path)
 
 
 def test_pools_across_files_and_produces_one_final_result(fake_distributor, tmp_path):
@@ -193,10 +196,10 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
     fake_distributor, tmp_path
 ):
     """A non-final checkpoint must stay usable as a reduction input without the
-    manager re-sending it: its distributor handle/source_result_id must not be
-    released at checkpoint time, only later once a further reduction actually
-    folds it in and supersedes it - the same point any other pooled item's
-    source_result_id is released."""
+    manager re-sending it: its distributor handle must not be released at
+    checkpoint time, only later once a further reduction actually folds it in
+    and supersedes it - the same point any other pooled item's handle is
+    released (invariant #2)."""
     dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
     pipeline, db = make_pipeline(
         fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_accumulations=True
@@ -234,8 +237,9 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
             # vine_reduce's own (results_dir), fetched via retrieve() -
             # unlike a non-final checkpoint, whose durable copy is entirely
             # the distributor's own doing (see the else branch below).
-            assert new_item.source_result_id is None
-            assert new_item.file == new_item.checkpoint_path
+            assert new_item.handle is None
+            assert new_item.checkpoint is not None
+            assert os.path.exists(new_item.checkpoint.path)
             assert len(retrieved) == before_retrieved + 1
         else:
             # checkpointing must not release the cluster-side copy, or a
@@ -245,12 +249,14 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
             # distributor made it so at submit time (is_checkpoint=True),
             # not because vine_reduce copied it out via retrieve() - only a
             # final result does that.
-            assert new_item.source_result_id is not None
-            assert new_item.source_result_id not in newly_released
+            assert new_item.handle is not None
+            assert new_item.handle.result_id not in newly_released
             assert len(retrieved) == before_retrieved  # no retrieve() copy for a non-final
-            assert new_item.checkpoint_path is not None
-            assert os.path.exists(new_item.checkpoint_path)
-            intermediate_items.append(new_item)
+            assert new_item.checkpoint is not None
+            assert os.path.exists(new_item.checkpoint.path)
+            # the handle is cleared when this item is later released, so
+            # remember its result_id now.
+            intermediate_items.append((new_item, new_item.handle.result_id))
 
     pipeline._checkpoint = spy_checkpoint
 
@@ -260,8 +266,9 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
     assert len(intermediate_items) == 2  # a+b, c+d
     # each intermediate checkpoint's cluster copy is only released once a
     # later reduction (here, the final one) actually folds it in.
-    for item in intermediate_items:
-        assert item.source_result_id in released
+    for item, result_id in intermediate_items:
+        assert result_id in released
+        assert item.handle is None
     db.close()
 
 
@@ -321,40 +328,71 @@ def test_uncheckpointed_fold_keeps_every_ancestor_until_a_later_checkpoint_cover
     db.close()
 
 
-def test_restart_skips_files_covered_by_a_non_final_checkpoint(fake_distributor, tmp_path):
+def test_restart_seeded_checkpoint_is_adopted_used_and_released_when_superseded(
+    fake_distributor, tmp_path
+):
+    """Seeded-checkpoint lifecycle: a partial checkpoint row from a previous
+    run is adopted (adopt_checkpoint) at Pipeline construction, giving it a
+    real distributor handle indistinguishable from a this-run result's; once
+    a superseding checkpoint lands, that handle is released via
+    release_result - which, per its contract, also removes the seeded file
+    from disk (the distributor is the single owner of non-final checkpoint
+    files)."""
     dataset = {"files": {"a.root": 5, "b.root": 5}}
-    db = CheckpointDB(str(tmp_path / "db.sqlite"))
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
 
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     seeded_file = checkpoint_dir / "seeded.pkl.zst"
     serialization.dump(100, str(seeded_file))  # stands in for a's "already processed" result
-    db.add_checkpoint("proc", "ds", ["a.root"], 5, 1.0, 1.0, False, str(seeded_file))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers_files=["a.root"],
+        num_events=5,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=False,
+        path=str(seeded_file),
+    )
+
+    adopted_paths: list[str] = []
+    original_adopt = fake_distributor.adopt_checkpoint
+
+    def spy_adopt(path):
+        adopted_paths.append(path)
+        return original_adopt(path)
+
+    fake_distributor.adopt_checkpoint = spy_adopt
 
     pipeline, _ = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=10, db=db)
 
+    assert adopted_paths == [str(seeded_file)]
     assert pipeline._skip_files == {"a.root"}
     assert len(pipeline.pool) == 1
-    assert pipeline.pool[0].file == str(seeded_file)
+    seeded_item = pipeline.pool[0]
+    assert seeded_item.handle is not None
+    assert seeded_item.checkpoint.path == str(seeded_file)
+    adopted_result_id = seeded_item.handle.result_id
 
-    released_paths: list[str] = []
-    original_release_path = fake_distributor.release_path
+    released: list[int] = []
+    original_release = fake_distributor.release_result
 
-    def spy_release_path(path):
-        released_paths.append(path)
-        original_release_path(path)
+    def spy_release(result_id):
+        released.append(result_id)
+        original_release(result_id)
 
-    fake_distributor.release_path = spy_release_path
+    fake_distributor.release_result = spy_release
 
     run_to_completion(pipeline, fake_distributor)
 
     # 100 (seeded, standing in for a.root) + 5 (b.root, actually processed)
     assert final_value(pipeline) == 105
-    # The seeded item has no source_result_id for release_result to release
-    # it by (see PoolItem docstring) - once the final reduction folds it in
-    # and supersedes it, release_path is how its distributor-side handle (if
-    # any) gets dropped instead.
-    assert str(seeded_file) in released_paths
+    # the final reduction folded the seeded item in and superseded its row,
+    # so its adopted handle was released - exactly once - and release_result
+    # removed the seeded file from disk.
+    assert released.count(adopted_result_id) == 1
+    assert not os.path.exists(str(seeded_file))
     db.close()
 
 
@@ -362,8 +400,17 @@ def test_restart_with_final_checkpoint_for_all_files_skips_pipeline_entirely(
     fake_distributor, tmp_path
 ):
     dataset = {"files": {"a.root": 5, "b.root": 5}}
-    db = CheckpointDB(str(tmp_path / "db.sqlite"))
-    db.add_checkpoint("proc", "ds", ["a.root", "b.root"], 10, 1.0, 1.0, True, "/tmp/final.pkl")
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers_files=["a.root", "b.root"],
+        num_events=10,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=True,
+        path="/tmp/final.pkl",
+    )
 
     pipeline, _ = make_pipeline(fake_distributor, tmp_path, dataset, db=db)
 
@@ -371,6 +418,163 @@ def test_restart_with_final_checkpoint_for_all_files_skips_pipeline_entirely(
     assert pipeline.pool == []
     assert pipeline.in_flight_count() == 0
     assert len(pipeline.final_results) == 1
+    db.close()
+
+
+def test_pool_admits_a_file_only_once_every_chunk_of_it_succeeded(fake_distributor, tmp_path):
+    """Invariant #1: only completely processed files are accumulated into the
+    pool. With chunksize=2, a 4-event file processes as two chunks; the first
+    Success alone must stage its result, not pool it - both chunk results
+    enter the pool together only once the whole file is covered."""
+    dataset = {"files": {"a.root": 4}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, chunksize=2, reduction_size=10
+    )
+
+    assert pipeline.feed(100) == 2  # both chunks of a.root
+
+    pipeline.handle_outcome(fake_distributor.wait())
+    assert pipeline.pool == []  # a.root only half processed - nothing pooled
+
+    pipeline.handle_outcome(fake_distributor.wait())
+    assert len(pipeline.pool) == 2  # fully processed - both results, together
+    assert all(item.files == frozenset({"a.root"}) for item in pipeline.pool)
+    db.close()
+
+
+def test_release_covered_frees_deep_lineage_without_recursion(fake_distributor, tmp_path):
+    """Invariant #3's walk must survive an arbitrarily long uncheckpointed
+    chain: a lineage thousands of levels deep is released exactly once per
+    item, with no RecursionError (pins the iterative, explicit-stack walk)."""
+    dataset = {"files": {"a.root": 1}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset)
+
+    released: list[int] = []
+    fake_distributor.release_result = released.append
+
+    depth = 5000  # far beyond Python's default recursion limit
+    item = None
+    for result_id in range(1, depth + 1):
+        item = PoolItem(
+            handle=ResultHandle(result_id, f"file_{result_id}"),
+            num_events=1,
+            wall_time_s=0.0,
+            memory_mb=0.0,
+            files=frozenset({"a.root"}),
+            since_checkpoint_time=0.0,
+            since_checkpoint_distance=0,
+            inputs=[item] if item is not None else [],
+        )
+
+    pipeline._release_covered(item)
+
+    assert sorted(released) == list(range(1, depth + 1))  # each exactly once
+    assert item.handle is None
+    assert item.inputs == []
+    db.close()
+
+
+def _restart_row(row_id, covers, *, is_final, path="/tmp/x.pkl"):
+    return CheckpointRecord(
+        id=row_id,
+        processor="proc",
+        dataset="ds",
+        covers_files=frozenset(covers),
+        num_events=len(covers),
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=is_final,
+        path=path,
+    )
+
+
+def test_plan_restart_all_final_rows_means_finished_with_no_pool():
+    rows = [
+        _restart_row(1, ["a.root"], is_final=True),
+        _restart_row(2, ["b.root"], is_final=True),
+    ]
+    plan = plan_restart(rows, {"a.root", "b.root"})
+    assert plan.finished is True
+    assert plan.final_rows == rows
+    assert plan.pool_rows == []
+    assert plan.skip_files == {"a.root", "b.root"}
+
+
+def test_plan_restart_mixed_rows_skip_the_union_of_what_they_cover():
+    final = _restart_row(1, ["a.root"], is_final=True)
+    partial = _restart_row(2, ["b.root", "c.root"], is_final=False)
+    plan = plan_restart([final, partial], {"a.root", "b.root", "c.root", "d.root"})
+    assert plan.finished is False
+    assert plan.final_rows == [final]
+    assert plan.pool_rows == [partial]
+    assert plan.skip_files == {"a.root", "b.root", "c.root"}  # d.root still to do
+
+
+def test_plan_restart_partials_are_moot_when_finals_cover_everything():
+    final = _restart_row(1, ["a.root", "b.root"], is_final=True)
+    partial = _restart_row(2, ["a.root"], is_final=False)
+    plan = plan_restart([final, partial], {"a.root", "b.root"})
+    assert plan.finished is True
+    assert plan.final_rows == [final]
+    assert plan.pool_rows == []
+    assert plan.skip_files == {"a.root", "b.root"}
+
+
+def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distributor, tmp_path):
+    dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+
+    # Run 1: checkpoint every accumulation, and "crash" (stop driving) right
+    # after the first non-final checkpoint lands.
+    pipeline, _ = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reduction_size=2,
+        checkpoint_accumulations=True,
+        db=db,
+    )
+    for _ in range(1000):
+        if any(not row.is_final for row in db.checkpoints_for("proc", "ds")):
+            break
+        pipeline.submit_ready_reductions()
+        pipeline.maybe_drain_final_group()
+        pipeline.feed(100)
+        outcome = fake_distributor.wait()
+        if outcome is not None:
+            pipeline.handle_outcome(outcome)
+    else:
+        raise AssertionError("no non-final checkpoint ever landed")
+    covered = {url for row in db.checkpoints_for("proc", "ds") for url in row.covers_files}
+    assert covered
+    assert not pipeline.finished
+
+    # Run 2: fresh Pipeline + fresh distributor, same store and cluster dir.
+    distributor2 = type(fake_distributor)(str(tmp_path / "cluster"))
+    submitted_chunk_urls: set[str] = set()
+    original_submit = distributor2.submit
+
+    def spy_submit(priority, category, kind, func, *args, **kwargs):
+        if kind == "processor":
+            submitted_chunk_urls.update(a.url for a in args if isinstance(a, Chunk))
+        return original_submit(priority, category, kind, func, *args, **kwargs)
+
+    distributor2.submit = spy_submit
+
+    pipeline2, _ = make_pipeline(
+        distributor2,
+        tmp_path,
+        dataset,
+        reduction_size=2,
+        checkpoint_accumulations=True,
+        db=db,
+    )
+    run_to_completion(pipeline2, distributor2)
+
+    # checkpoint-covered files were never re-submitted as chunks, and the
+    # final value still accounts for every file exactly once.
+    assert submitted_chunk_urls == set(dataset["files"]) - covered
+    assert final_value(pipeline2) == 4
     db.close()
 
 

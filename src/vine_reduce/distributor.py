@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Literal, Protocol
 
-from .types import Outcome
+from .types import Outcome, ResultHandle
 
 TaskKind = Literal["processor", "reducer"]
 
@@ -56,18 +56,24 @@ class Distributor(Protocol):
         ...
 
     def release_result(self, result_id: int) -> None:
-        """Release any resources (e.g. worker-local files) held for result_id."""
+        """Release any resources (e.g. worker-local files) held for
+        result_id. This is a hard requirement, not just cleanup: for a
+        result submitted with is_checkpoint=True (or adopted via
+        adopt_checkpoint), release_result must also remove the checkpoint's
+        durable on-disk copy - the distributor is the single owner of that
+        file. Both shipped distributors (LocalDistributor,
+        TaskVineDistributor) already behave this way; Pipeline relies on it
+        rather than deleting checkpoint files itself."""
         ...
 
-    def release_path(self, path: str) -> None:
-        """Release any distributor-side resources cached for `path`, a
-        restart-seeded checkpoint file used directly as a PoolItem.file
-        (Pipeline._pool_item_from_checkpoint), once Pipeline has removed
-        that file from disk because a later checkpoint superseded it - the
-        release_result() counterpart for an item with no result_id of its
-        own. A distributor that never caches anything keyed by a raw path
-        (e.g. LocalDistributor, whose workers already share vine_reduce's
-        filesystem) can make this a no-op."""
+    def adopt_checkpoint(self, path: str) -> ResultHandle:
+        """Register `path` - an existing durable checkpoint file written by
+        a previous run and recorded in the checkpoint store - as if it were
+        a completed Success result of this run submitted with
+        is_checkpoint=True. The returned handle's result_id is valid for
+        release_result/retrieve/checkpoint_path (checkpoint_path returns
+        `path`), and its file may appear in later submit() args exactly like
+        an Outcome.file."""
         ...
 
     def capacity(self) -> int:

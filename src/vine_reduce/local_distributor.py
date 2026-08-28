@@ -31,10 +31,11 @@ import shutil
 import tempfile
 from concurrent.futures import Future, ProcessPoolExecutor
 from typing import Any, Callable
+from uuid import uuid4
 
 import cloudpickle
 
-from .types import Outcome, RawOutcome
+from .types import Outcome, RawOutcome, ResultHandle
 
 
 def _run_cloudpickled(payload: bytes) -> Any:
@@ -113,7 +114,7 @@ class LocalDistributor:
         while self._pending and len(self._running) < self._max_workers:
             _, _, result_id, func, args, is_checkpoint = heapq.heappop(self._pending)
             base_dir = self._checkpoint_dir if is_checkpoint else self._work_dir
-            dest_file = os.path.join(base_dir, f"{result_id}.pkl.zst")
+            dest_file = os.path.join(base_dir, f"{uuid4().hex}.pkl.zst")
             payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
             self._running[self._pool.submit(_run_cloudpickled, payload)] = result_id
 
@@ -145,10 +146,15 @@ class LocalDistributor:
         if path is not None and os.path.exists(path):
             os.remove(path)
 
-    def release_path(self, path: str) -> None:
-        """No-op: worker subprocesses already share vine_reduce's filesystem
-        (see module docstring), so a restart-seeded checkpoint path is used
-        directly with nothing declared or cached on its behalf to release."""
+    def adopt_checkpoint(self, path: str) -> ResultHandle:
+        """Register an existing durable checkpoint file at `path` as if it
+        were a completed Success result submitted with is_checkpoint=True -
+        see the Distributor protocol docstring. Worker subprocesses already
+        share vine_reduce's filesystem, so `path` itself is usable as-is;
+        this just mints a result_id for it."""
+        result_id = next(self._next_id)
+        self._files[result_id] = path
+        return ResultHandle(result_id, path)
 
     def capacity(self) -> int:
         """Room left before the pool + its pending queue reaches twice

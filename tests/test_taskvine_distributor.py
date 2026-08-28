@@ -298,14 +298,17 @@ def test_reduction_chains_across_two_tasks(distributor, tmp_path):
     assert serialization.load(str(dest)) == 3 + 5
 
 
-def test_restart_seeded_checkpoint_path_is_declared_as_task_input(distributor, tmp_path):
-    """On restart, Pipeline._pool_item_from_checkpoint seeds a pooled item's
-    `file` with the checkpoint's real on-disk path, not a token this class
-    ever minted (there was no live run to mint one in) - _remap_files must
-    recognize that case too, not just a known token."""
+def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, tmp_path):
+    """A seeded checkpoint adopted via adopt_checkpoint must behave exactly
+    like a this-run checkpoint from then on: its handle.file remaps/declares
+    as a task input, the reduction using it succeeds, and release_result
+    undeclares it and removes it from disk - no special-casing needed."""
     seeded_path = str(tmp_path / "checkpoints" / "seeded.p")
     os.makedirs(os.path.dirname(seeded_path), exist_ok=True)
     serialization.dump(100, seeded_path)  # stands in for a prior run's checkpoint
+
+    handle = distributor.adopt_checkpoint(seeded_path)
+    assert handle.file in distributor._files_by_key
 
     _submit_chunk(distributor, 1, Chunk("b.root", 0, 3))
     outcome_b = distributor.wait(timeout=WAIT_TIMEOUT)
@@ -316,7 +319,7 @@ def test_restart_seeded_checkpoint_path_is_declared_as_task_input(distributor, t
         "reducer",
         reducer_wrapper,
         sum_reducer,
-        [seeded_path, outcome_b.file],
+        [handle.file, outcome_b.file],
         True,
         None,
     )
@@ -328,42 +331,43 @@ def test_restart_seeded_checkpoint_path_is_declared_as_task_input(distributor, t
     distributor.retrieve(reduce_outcome.result_id, str(dest))
     assert serialization.load(str(dest)) == 100 + 3
 
+    distributor.release_result(handle.result_id)
+    assert handle.file not in distributor._files_by_key
+    assert not os.path.exists(seeded_path)
 
-def test_restart_seeded_checkpoint_path_is_cached_and_released(distributor, tmp_path):
-    """A restart-seeded path is declared once and cached under its own path
-    in _files_by_key - the same dict dest_tokens live in - rather than
-    re-declared every time it's used, so a retried resubmission of the same
-    group (e.g. after a ResourceExhaustion retry) doesn't leak a fresh
-    vine.File each time. release_path() drops the cache entry once Pipeline
-    has removed the checkpoint from disk (see pipeline.py's _checkpoint)."""
-    seeded_path = str(tmp_path / "checkpoints" / "seeded.p")
-    os.makedirs(os.path.dirname(seeded_path), exist_ok=True)
-    serialization.dump(100, seeded_path)  # stands in for a prior run's checkpoint
 
-    def _reduce_with_seeded_path():
-        _submit_chunk(distributor, 1, Chunk("b.root", 0, 3))
-        outcome_b = distributor.wait(timeout=WAIT_TIMEOUT)
-        distributor.submit(
-            10,
-            "test:reduce",
-            "reducer",
-            reducer_wrapper,
-            sum_reducer,
-            [seeded_path, outcome_b.file],
-            True,
-            None,
+def test_checkpoint_filenames_never_collide_across_restarts(monkeypatch, tmp_path):
+    """§2.7: both distributor instances' result_id/token counters start at
+    1, but a fresh instance's counter must not be able to mint an on-disk
+    checkpoint filename that collides with one still-live from an earlier
+    instance/run against the same checkpoint_dir."""
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    checkpoint_dir = str(tmp_path / "checkpoints")
+
+    def _write_one_checkpoint():
+        dist = TaskVineDistributor(
+            port=0,
+            resources_processor={"cores": 1},
+            checkpoint_dir=checkpoint_dir,
         )
-        distributor.wait(timeout=WAIT_TIMEOUT)
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
+            outcome = dist.wait(timeout=WAIT_TIMEOUT)
+            path = dist.checkpoint_path(outcome.result_id)
+        dist.shutdown()
+        return path
 
-    _reduce_with_seeded_path()
-    assert seeded_path in distributor._files_by_key
-    cached_file = distributor._files_by_key[seeded_path]
+    path_1 = _write_one_checkpoint()
+    path_2 = _write_one_checkpoint()
 
-    _reduce_with_seeded_path()
-    assert distributor._files_by_key[seeded_path] is cached_file
-
-    distributor.release_path(seeded_path)
-    assert seeded_path not in distributor._files_by_key
+    assert path_1 != path_2
+    assert os.path.exists(path_1)
+    assert os.path.exists(path_2)
 
 
 def test_shutdown_frees_a_self_built_manager(monkeypatch, tmp_path):

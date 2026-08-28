@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pytest
 
-from vine_reduce.types import RawOutcome
+from vine_reduce.types import RawOutcome, ResultHandle
 
 
 class FakeDistributor:
@@ -55,9 +55,13 @@ class FakeDistributor:
         if path is not None and os.path.exists(path):
             os.remove(path)
 
-    def release_path(self, path: str) -> None:
-        """No-op: FakeDistributor, like LocalDistributor, never declares or
-        caches anything keyed by a raw path."""
+    def adopt_checkpoint(self, path: str) -> ResultHandle:
+        """Mirror LocalDistributor.adopt_checkpoint: mint a result_id for an
+        existing on-disk checkpoint file, so it can be released/retrieved/
+        checkpointed exactly like a this-run result."""
+        result_id = next(self._next_id)
+        self._files[result_id] = path
+        return ResultHandle(result_id, path)
 
     def capacity(self) -> int:
         return self._capacity_amount

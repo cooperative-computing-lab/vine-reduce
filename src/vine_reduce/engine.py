@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import defaults
-from .checkpoint_db import CheckpointDB, checksum_dataset
+from .checkpoint_store import CheckpointStore, checksum_dataset
 from .distributor import Distributor
 from .executor import simple_executor
 from .pipeline import Pipeline, VineReduceError
@@ -202,7 +202,7 @@ class VineReduce:
 
             os.makedirs(self.results_dir, exist_ok=True)
             db = stack.enter_context(
-                CheckpointDB(self.db_path or os.path.join(self.results_dir, "vine_reduce.db"))
+                CheckpointStore(self.db_path or os.path.join(self.results_dir, "vine_reduce.db"))
             )
 
             datasets = input_to_datasets(self.input)
@@ -216,7 +216,7 @@ class VineReduce:
         self,
         datasets: dict[str, Any],
         distributor: Distributor,
-        db: CheckpointDB,
+        db: CheckpointStore,
         datasets_to_chunks: Callable,
     ) -> list[Pipeline]:
         num_processors = len(self.processors)

@@ -5,7 +5,7 @@ import os
 import pytest
 
 from vine_reduce import VineReduce, VineReduceError, serialization
-from vine_reduce.checkpoint_db import CheckpointDB, checksum_dataset
+from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
 from vine_reduce.engine import _resolve_reduction_size, _resolve_sized_config
 from vine_reduce.local_distributor import LocalDistributor
 
@@ -164,9 +164,18 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     final_file = results_dir / "already_done.pkl.zst"
     serialization.dump(999, str(final_file))
 
-    db = CheckpointDB(str(db_path))
+    db = CheckpointStore(str(db_path))
     db.dataset_changed("numbers", checksum_dataset(datasets["numbers"]))
-    db.add_checkpoint("count", "numbers", ["a.root", "b.root"], 10, 1.0, 1.0, True, str(final_file))
+    db.record(
+        processor="count",
+        dataset="numbers",
+        covers_files=["a.root", "b.root"],
+        num_events=10,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=True,
+        path=str(final_file),
+    )
     db.close()
 
     def explode(chunk):

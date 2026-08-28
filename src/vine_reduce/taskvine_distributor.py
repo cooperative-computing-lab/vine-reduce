@@ -30,15 +30,11 @@ retrieve() is the only place its bytes are ever pulled to the manager, via
 manager.fetch_file() + File.contents(); for a checkpoint, retrieve() still
 works the same way but the bytes are already local by then.
 
-A restart-seeded checkpoint (Pipeline._pool_item_from_checkpoint) has no
-token - there was no live run to mint one in - so it shows up in submit()
-args as its own real on-disk path instead. _remap_files declares that path
-on demand and caches the vine.File under the path itself in _files_by_key,
-the same dict dest_tokens live in, so a later submit() reusing the same path
-(e.g. a ResourceExhaustion retry resubmitting the same group) reuses the
-declaration rather than leaking a fresh one. release_path() is the
-counterpart to release_result() for these path-keyed entries, since they
-have no result_id for release_result() to be called with.
+A restart-seeded checkpoint is adopted via adopt_checkpoint() before it ever
+appears in a submit() call: adoption mints a token and declares the file
+under it exactly like a this-run checkpoint (see adopt_checkpoint below), so
+from then on it flows through the normal token path in _remap_files -
+remapping, release, retrieve - with no special-casing.
 
 Resource exhaustion: monitoring is enabled with watchdog=True, so TaskVine
 itself can kill and report a task that overruns its resource allocation -
@@ -64,11 +60,12 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Any, Callable
+from uuid import uuid4
 
 import ndcctools.taskvine as vine
 
 from .distributor import TaskKind
-from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Outcome, RawOutcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
@@ -145,12 +142,9 @@ class TaskVineDistributor:
         os.makedirs(self._checkpoint_dir, exist_ok=True)
 
         self._next_id = itertools.count(1)
-        # Keyed on whatever string _remap_files sees in task args: either a
-        # dest_token this run minted (see submit(), below) or a restart-
-        # seeded checkpoint path declared on demand (see _remap_files) - one
-        # dict either way, since the two key spaces never collide (a token
-        # is never an absolute, existing path) and both need the same
-        # lookup-or-declare-once / undeclare-on-release treatment.
+        # Keyed on the dest_token minted for every result - by submit() for
+        # a this-run result, or by adopt_checkpoint() for a restart-seeded
+        # one - so _remap_files always finds it by simple lookup.
         self._files_by_key: dict[str, vine.File] = {}
         self._checkpoint_paths_by_token: dict[str, str] = {}
         self._in_flight_by_taskvine_id: dict[int, _InFlight] = {}
@@ -209,7 +203,7 @@ class TaskVineDistributor:
             task.set_env_var(name, value)
 
         if is_checkpoint:
-            checkpoint_path = os.path.join(self._checkpoint_dir, dest_token)
+            checkpoint_path = os.path.join(self._checkpoint_dir, f"{uuid4().hex}.p")
             result_file = self._manager.declare_file(checkpoint_path, cache=True)
             self._checkpoint_paths_by_token[dest_token] = checkpoint_path
         else:
@@ -237,9 +231,9 @@ class TaskVineDistributor:
         self._categories_configured.add(category)
 
     def _remap_files(self, args: tuple[Any, ...]) -> tuple[list[Any], list[tuple[str, vine.File]]]:
-        """Replace tokens from earlier Success outcomes - and restart-seeded
-        checkpoint paths - with fresh sandbox names. Tokens/paths only ever
-        appear as bare strings or inside a flat list of strings
+        """Replace tokens from earlier Success outcomes (this-run or
+        adopted, see adopt_checkpoint) with fresh sandbox names. Tokens only
+        ever appear as bare strings or inside a flat list of strings
         (reducer_wrapper's input_files), so this only looks one level deep
         rather than walking arbitrary nested structures."""
         extra_inputs: list[tuple[str, vine.File]] = []
@@ -247,19 +241,6 @@ class TaskVineDistributor:
         def remap_one(value: Any) -> Any:
             if isinstance(value, str) and value in self._files_by_key:
                 sandbox_name = f"input_{len(extra_inputs)}"
-                extra_inputs.append((sandbox_name, self._files_by_key[value]))
-                return sandbox_name
-            if isinstance(value, str) and os.path.isabs(value) and os.path.exists(value):
-                # A restart-seeded checkpoint path (Pipeline._pool_item_from_
-                # checkpoint): not a token this run ever minted, but a real
-                # file already durable on this manager's disk - declare it on
-                # demand, under its own path as the key, so a later reduction
-                # that resubmits the same group (e.g. after a
-                # ResourceExhaustion retry) hits the branch above instead of
-                # declaring it again. release_path() undoes this once
-                # Pipeline supersedes the checkpoint.
-                sandbox_name = f"input_{len(extra_inputs)}"
-                self._files_by_key[value] = self._manager.declare_file(value, cache=True)
                 extra_inputs.append((sandbox_name, self._files_by_key[value]))
                 return sandbox_name
             return value
@@ -330,14 +311,6 @@ class TaskVineDistributor:
             "wall_time_s": (measured.wall_time or 0) / 1e6,
         }
 
-    def _undeclare(self, key: str) -> None:
-        """Drop and undeclare the vine.File cached under `key` in
-        _files_by_key, if any - shared by release_result (key: a result
-        token) and release_path (key: a restart-seeded checkpoint path)."""
-        file = self._files_by_key.pop(key, None)
-        if file is not None:
-            self._manager.undeclare_file(file)
-
     def release_result(self, result_id: int) -> None:
         """Undeclare the vine.File backing a completed (Success) result_id,
         letting TaskVine reclaim its storage on the worker(s) holding it,
@@ -346,7 +319,9 @@ class TaskVineDistributor:
         has superseded it, or because a final result was safely retrieved
         elsewhere and no longer needs this durable copy."""
         token = _result_token(result_id)
-        self._undeclare(token)
+        file = self._files_by_key.pop(token, None)
+        if file is not None:
+            self._manager.undeclare_file(file)
         checkpoint_path = self._checkpoint_paths_by_token.pop(token, None)
         if checkpoint_path is not None:
             try:
@@ -354,15 +329,20 @@ class TaskVineDistributor:
             except FileNotFoundError:
                 pass
 
-    def release_path(self, path: str) -> None:
-        """Undeclare the vine.File cached (see _remap_files) for a restart-
-        seeded checkpoint path, once Pipeline has removed the file itself
-        from disk because a later checkpoint superseded it - the on-demand
-        counterpart to release_result, for items with no result_id of their
-        own. A no-op if `path` was never declared on demand (e.g. it's a
-        this-run checkpoint's path, whose declaration lives under its token
-        instead and is already released via release_result)."""
-        self._undeclare(path)
+    def adopt_checkpoint(self, path: str) -> ResultHandle:
+        """Register an existing durable checkpoint file at `path` as if it
+        were a completed Success result submitted with is_checkpoint=True -
+        see the Distributor protocol docstring. Mints a result_id/token the
+        same way submit() does, declares `path` under that token (cache=True,
+        same as a this-run checkpoint), and records it in
+        _checkpoint_paths_by_token - from then on the adopted item flows
+        through every existing code path (remapping, release, retrieve) with
+        no special cases."""
+        result_id = next(self._next_id)
+        token = _result_token(result_id)
+        self._files_by_key[token] = self._manager.declare_file(path, cache=True)
+        self._checkpoint_paths_by_token[token] = path
+        return ResultHandle(result_id, token)
 
     def checkpoint_path(self, result_id: int) -> str:
         """Local, durable on-disk path for a completed (Success) result_id

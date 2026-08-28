@@ -1,6 +1,6 @@
 """Per-(processor, dataset) state: chunk generation, the reduction pool, and
-checkpoint bookkeeping. See "Implementation Clarifications" in PLAN.md for
-the pooling and checkpointing rules this implements.
+checkpoint bookkeeping. See "Temporary Results, Checkpoints, and Restart" in
+PLAN.md for the pooling and checkpointing rules this implements.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 from uuid import uuid4
 
-from .checkpoint_db import CheckpointDB, CheckpointRow
+from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor
-from .types import Chunk, Outcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
 
 
 class VineReduceError(RuntimeError):
@@ -20,14 +20,28 @@ class VineReduceError(RuntimeError):
     the remote traceback so the failure can be debugged from the local side."""
 
 
+@dataclass(frozen=True)
+class CheckpointRef:
+    """The durable identity of a checkpointed item: its store row and the
+    on-disk path recorded there. Present iff the item is durable."""
+
+    row_id: int
+    path: str
+
+
 @dataclass
 class PoolItem:
-    """A not-yet-final result eligible for reduction: either a single chunk's
-    output, or the output of a previous (non-final) reduction call.
+    """A result this pipeline is holding: a chunk's output, a reduction's
+    output, a restart-seeded checkpoint, or a final result.
 
-    file: the distributor's handle for this item's result file - still a
-        live, distributor-native handle even once checkpointed, unless this
-        item is a final result (see Pipeline._checkpoint).
+    handle: the item's live distributor identity - handle.file is what goes
+        into a later submit()'s args, handle.result_id is what
+        release_result/retrieve/checkpoint_path take. None only once nothing
+        will ever need the distributor's copy again: a final result safely
+        copied into results_dir, a released item, or a restart-seeded final
+        row (a final result is never resubmitted, so it never gets a handle).
+        A non-final checkpoint keeps its handle live so it can still be
+        folded into a later reduction without the manager re-sending it.
     num_events / wall_time_s / memory_mb: totals accumulated into this item.
     files: dataset file URLs whose data this item represents.
     since_checkpoint_time: wall time accumulated since this item (or one of
@@ -37,36 +51,70 @@ class PoolItem:
         lineage since it (or one of its inputs) was last checkpointed - 0 for
         a fresh chunk result, max(group)+1 whenever a group is folded, reset
         to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
-    checkpoint_row_id: id of the CheckpointDB row backing this item, if any.
-    checkpoint_path: local on-disk path of this item's checkpoint file, once
-        checkpointed - distinct from `file`, which stays the distributor's
-        own handle so the item can still be folded into a later reduction
-        without the manager re-sending it to the cluster. None if never
-        checkpointed.
-    source_result_id: this item's own distributor result_id, kept alive
-        (not released) until it is itself folded into a later reduction.
+    checkpoint: the item's durable identity (store row id + on-disk path),
+        once checkpointed. None while the item is not durable.
     inputs: the items folded together to produce this one (empty for a raw
         chunk's output). Kept around so that, if this item is lost before
         anything checkpoints it, it can be recovered by re-folding its
         inputs instead of recomputing everything from scratch - see
-        Pipeline._release_uncheckpointed, which walks this recursively to
-        release every not-yet-checkpointed ancestor once this item finally
-        is checkpointed. Cleared once that happens (see Pipeline._checkpoint)
-        - a checkpointed item's own durable copy is backup enough, so there
-        is nothing left in its lineage still worth holding onto.
+        Pipeline._release_covered, which frees this whole lineage once a
+        durable checkpoint finally covers it, clearing `inputs` as it goes
+        (a checkpointed item's own durable copy is backup enough, so there
+        is nothing left in its lineage still worth holding onto).
     """
 
-    file: str
+    handle: ResultHandle | None
     num_events: int
     wall_time_s: float
     memory_mb: float
     files: frozenset[str]
     since_checkpoint_time: float
     since_checkpoint_distance: int
-    checkpoint_row_id: int | None = None
-    checkpoint_path: str | None = None
-    source_result_id: int | None = None
+    checkpoint: CheckpointRef | None = None
     inputs: list[PoolItem] = field(default_factory=list)
+
+    @property
+    def is_checkpointed(self) -> bool:
+        return self.checkpoint is not None
+
+
+@dataclass(frozen=True)
+class RestartPlan:
+    """What plan_restart decided a restart should do with the checkpoint
+    rows on file - see plan_restart for the rules."""
+
+    finished: bool
+    final_rows: list[CheckpointRecord]
+    pool_rows: list[CheckpointRecord]  # empty when finished (partials are moot)
+    skip_files: set[str]
+
+
+def plan_restart(rows: list[CheckpointRecord], dataset_files: set[str]) -> RestartPlan:
+    """The restart rules, stated once:
+    1. Every final row is replayed as a final result.
+    2. The run is finished iff the final rows cover every dataset file;
+       partial rows are then moot and ignored.
+    3. Otherwise every partial row is replayed as a pool item.
+    4. A file is skipped iff a replayed row covers it."""
+    final_rows = [row for row in rows if row.is_final]
+    partial_rows = [row for row in rows if not row.is_final]
+
+    finalized_files = {url for row in final_rows for url in row.covers_files}
+    if dataset_files <= finalized_files:
+        return RestartPlan(
+            finished=True,
+            final_rows=final_rows,
+            pool_rows=[],
+            skip_files=set(dataset_files),
+        )
+
+    covered_by_partial = {url for row in partial_rows for url in row.covers_files}
+    return RestartPlan(
+        finished=False,
+        final_rows=final_rows,
+        pool_rows=partial_rows,
+        skip_files=finalized_files | covered_by_partial,
+    )
 
 
 @dataclass
@@ -103,7 +151,7 @@ class Pipeline:
         dataset_name: str,
         dataset: dict[str, Any],
         distributor: Distributor,
-        db: CheckpointDB,
+        db: CheckpointStore,
         datasets_to_chunks: Callable[[dict, Callable[[], int | None], set[str]], Iterator[Chunk]],
         chunk_to_args: Callable,
         executor: Callable,
@@ -164,44 +212,38 @@ class Pipeline:
     # -- restart -----------------------------------------------------------
 
     @staticmethod
-    def _pool_item_from_checkpoint(row: CheckpointRow) -> PoolItem:
-        # On restart there is no live distributor state to hand back, so the
-        # on-disk file doubles as both the distributor-facing handle (to be
-        # resubmitted) and the checkpoint's own on-disk record.
+    def _seeded_item(row: CheckpointRecord, handle: ResultHandle | None) -> PoolItem:
+        """A PoolItem replaying one checkpoint row from a previous run. The
+        since-checkpoint counters start at zero: the row IS a checkpoint, so
+        nothing has accumulated on top of it yet."""
         return PoolItem(
-            file=row.path,
+            handle=handle,
             num_events=row.num_events,
             wall_time_s=row.wall_time_s,
             memory_mb=row.memory_mb,
-            files=frozenset(row.covers_files),
+            files=row.covers_files,
             since_checkpoint_time=0,
             since_checkpoint_distance=0,
-            checkpoint_row_id=row.id,
-            checkpoint_path=row.path,
+            checkpoint=CheckpointRef(row.id, row.path),
         )
 
     def _seed_from_checkpoints(self) -> None:
-        """Restart support: replay the checkpoint rows on file as final results
-        and pool items, and record which dataset files they already cover so
-        chunk generation can skip them."""
+        """Restart support: replay the checkpoint rows on file (per
+        plan_restart's rules) as final results and pool items, and record
+        which dataset files they already cover so chunk generation can skip
+        them. A replayed pool item is adopted by the distributor
+        (adopt_checkpoint), so from here on it is indistinguishable from a
+        result this run produced itself: same handle for resubmission, same
+        release_result for cleanup. A replayed final row gets no handle -
+        a final result is never resubmitted."""
         rows = self._db.checkpoints_for(self.processor_name, self.dataset_name)
-        final_rows = [row for row in rows if row.is_final]
-        partial_rows = [row for row in rows if not row.is_final]
-
-        all_files = set(self._dataset["files"])
-        finalized_files = {url for row in final_rows for url in row.covers_files}
-        self.final_results = [self._pool_item_from_checkpoint(row) for row in final_rows]
-
-        if all_files <= finalized_files:
-            # Every file already has a final result, so there is nothing left
-            # to run and any partial checkpoints are moot.
-            self.finished = True
-            self._skip_files = all_files
-            return
-
-        self.pool = [self._pool_item_from_checkpoint(row) for row in partial_rows]
-        covered_by_partial = {url for row in partial_rows for url in row.covers_files}
-        self._skip_files = finalized_files | covered_by_partial
+        plan = plan_restart(rows, set(self._dataset["files"]))
+        self.final_results = [self._seeded_item(row, handle=None) for row in plan.final_rows]
+        self._skip_files = plan.skip_files
+        self.finished = plan.finished
+        for row in plan.pool_rows:
+            handle = self._distributor.adopt_checkpoint(row.path)
+            self.pool.append(self._seeded_item(row, handle=handle))
 
     # -- chunk generation ----------------------------------------------------
 
@@ -326,7 +368,7 @@ class Pipeline:
             "reducer",
             self._reducer_wrapper,
             self._reducer,
-            [item.file for item in group],
+            [item.handle.file for item in group],
             is_final,
             self._result_postprocess,
             is_checkpoint=is_checkpoint,
@@ -375,14 +417,13 @@ class Pipeline:
         progress.covered_events += chunk.num_events
         progress.staged_items.append(
             PoolItem(
-                file=outcome.file,
+                handle=ResultHandle(outcome.result_id, outcome.file),
                 num_events=chunk.num_events,
                 wall_time_s=wall_time_s,
                 memory_mb=memory_mb,
                 files=frozenset({chunk.url}),
                 since_checkpoint_time=wall_time_s,
                 since_checkpoint_distance=0,
-                source_result_id=outcome.result_id,
             )
         )
         if progress.covered_events >= progress.num_entries:
@@ -402,23 +443,22 @@ class Pipeline:
             return
 
         assert isinstance(outcome, Success)
-        # group's own source_result_ids are deliberately not released here:
-        # new_item isn't durable yet, so if it's lost before something
-        # checkpoints it, group (kept below as new_item.inputs) is the only
-        # way to recover it without recomputing everything from scratch. See
-        # _release_uncheckpointed, invoked from _checkpoint once new_item
+        # group's own handles are deliberately not released here: new_item
+        # isn't durable yet, so if it's lost before something checkpoints
+        # it, group (kept below as new_item.inputs) is the only way to
+        # recover it without recomputing everything from scratch. See
+        # _release_covered, invoked from _checkpoint once new_item
         # eventually does become durable.
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
         new_item = PoolItem(
-            file=outcome.file,
+            handle=ResultHandle(outcome.result_id, outcome.file),
             num_events=task.num_events,
             wall_time_s=task.total_time + wall_time_s,
             memory_mb=task.total_memory + memory_mb,
             files=frozenset().union(*(item.files for item in group)),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
             since_checkpoint_distance=max(item.since_checkpoint_distance for item in group) + 1,
-            source_result_id=outcome.result_id,
             inputs=group,
         )
 
@@ -469,90 +509,75 @@ class Pipeline:
         return False
 
     def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
+        # Phase 1 - locate/create the durable copy.
         if is_final:
             # A final result is vine_reduce's own deliverable, so it gets
             # vine_reduce's own naming/location (results_dir), independent of
             # whatever durable storage the distributor itself used. Nothing
             # will ever reduce it further, so once it is safely on disk here
-            # the cluster-side copy - and the distributor's own durable copy
-            # of it, if any - can go.
-            dest_path = os.path.join(
-                self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst"
-            )
-            self._distributor.retrieve(new_item.source_result_id, dest_path)
-            self._distributor.release_result(new_item.source_result_id)
-            new_item.checkpoint_path = dest_path
-            new_item.file = dest_path
-            new_item.source_result_id = None
+            # the distributor's every copy of it can go, handle included.
+            path = os.path.join(self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
+            self._distributor.retrieve(new_item.handle.result_id, path)
+            self._distributor.release_result(new_item.handle.result_id)
+            new_item.handle = None
         else:
             # The distributor already made this durable at submit time
             # (is_checkpoint=True - see _submit_reduction), so there is
-            # nothing to copy, just a path to learn. file/source_result_id
-            # stay live and reusable as input to a later reduction, so the
-            # manager never has to re-send a checkpoint it already generated;
-            # they are released only once a further checkpoint covers this
-            # item (via _release_uncheckpointed, below).
-            new_item.checkpoint_path = self._distributor.checkpoint_path(new_item.source_result_id)
+            # nothing to copy, just a path to learn. The handle stays live
+            # and reusable as input to a later reduction, so the manager
+            # never has to re-send a checkpoint it already generated; it is
+            # released only once a FURTHER checkpoint covers this item (via
+            # _release_covered) - the other half of invariant #2.
+            path = self._distributor.checkpoint_path(new_item.handle.result_id)
 
-        # Batch the new row and the superseded rows' deletes into one
+        # Phase 2 - record durably, atomically superseding the rows this
+        # replaces: the new row and the superseded rows' deletes are one
         # transaction, so this checkpoint event either fully lands or, on a
         # crash mid-way, fully doesn't (never leaves both old and new rows
         # covering the same files on disk).
-        row_id = self._db.add_checkpoint(
-            self.processor_name,
-            self.dataset_name,
-            sorted(new_item.files),
-            new_item.num_events,
-            new_item.wall_time_s,
-            new_item.memory_mb,
-            is_final,
-            new_item.checkpoint_path,
-            commit=False,
+        superseded = [item.checkpoint.row_id for item in inputs if item.is_checkpointed]
+        row_id = self._db.record(
+            processor=self.processor_name,
+            dataset=self.dataset_name,
+            covers_files=new_item.files,
+            num_events=new_item.num_events,
+            wall_time_s=new_item.wall_time_s,
+            memory_mb=new_item.memory_mb,
+            is_final=is_final,
+            path=path,
+            supersedes=superseded,
         )
-        superseded = [item for item in inputs if item.checkpoint_row_id is not None]
-        for item in superseded:
-            self._db.delete_checkpoint(item.checkpoint_row_id, commit=False)
-        self._db.commit()
 
-        # Only now that the db no longer points at them: delete the
-        # superseded checkpoints' own files. Pipeline removes them directly
-        # rather than leaving it to release_result, since a restart-seeded
-        # checkpoint has no source_result_id for release_result to be called
-        # with; release_path is its counterpart, keyed on the path itself,
-        # for whatever the distributor may have cached on this item's behalf
-        # (see TaskVineDistributor._remap_files) - a harmless no-op for an
-        # item that was never restart-seeded, since nothing is ever cached
-        # under a this-run item's checkpoint_path (its token is the key
-        # instead, already released via release_result elsewhere).
-        for item in superseded:
-            try:
-                os.remove(item.checkpoint_path)
-            except FileNotFoundError:
-                pass
-            self._distributor.release_path(item.checkpoint_path)
-
-        # new_item is now durable (on disk, or the distributor's own
-        # permanent copy), so its whole not-yet-checkpointed lineage is safe
-        # to release - it was only ever kept alive as a fallback in case
-        # new_item itself got lost before being checkpointed.
+        # Phase 3 - new_item is durable, so everything it covers can be
+        # freed: its inputs' whole not-yet-checkpointed lineage (only ever
+        # kept alive as a fallback in case new_item was lost before being
+        # checkpointed), and any superseded checkpoint's durable file too -
+        # release_result removes that file as part of its contract (the
+        # distributor is the single owner of non-final checkpoint files),
+        # and the store stopped pointing at it when phase 2 committed.
         for item in inputs:
-            self._release_uncheckpointed(item)
+            self._release_covered(item)
         new_item.inputs = []
-
-        new_item.checkpoint_row_id = row_id
+        new_item.checkpoint = CheckpointRef(row_id, path)
         new_item.since_checkpoint_time = 0
         new_item.since_checkpoint_distance = 0
 
-    def _release_uncheckpointed(self, item: PoolItem) -> None:
-        """Release item's own cluster-side copy - safe now because the
-        caller's own item is durable and covers it, whether item was itself
-        a checkpoint being superseded or just an ordinary pooled result.
-        Recurses into item's inputs to release the rest of its not-yet-
-        checkpointed lineage too, unless item is itself a checkpoint - its
-        inputs were already released back when item itself was checkpointed,
-        so there is nothing left there to release."""
-        if item.source_result_id is not None:
-            self._distributor.release_result(item.source_result_id)
-        if item.checkpoint_row_id is None:
-            for child in item.inputs:
-                self._release_uncheckpointed(child)
+    def _release_covered(self, root: PoolItem) -> None:
+        """Retention rule (invariant #3): a result may be freed only once a
+        durable checkpoint covers it downstream; this is called exactly when
+        such a checkpoint lands, once per item folded into it. Frees root
+        and its whole not-yet-checkpointed lineage, stopping its descent at
+        any item that is itself a checkpoint - that item's own lineage was
+        already freed when IT was checkpointed (invariant #2). An explicit
+        stack, not recursion, so an arbitrarily long uncheckpointed chain
+        cannot hit Python's recursion limit; clearing handle/inputs as it
+        goes makes double-release structurally impossible."""
+        stack = [root]
+        while stack:
+            item = stack.pop()
+            if item.handle is not None:
+                self._distributor.release_result(item.handle.result_id)
+                item.handle = None
+            if not item.is_checkpointed:
+                stack.extend(item.inputs)
+            item.inputs = []

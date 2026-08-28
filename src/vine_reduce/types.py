@@ -70,6 +70,16 @@ class ResourceExhaustion(Outcome):
 
 
 @dataclass(frozen=True)
+class ResultHandle:
+    """A completed result as the distributor knows it: result_id for
+    release_result/retrieve/checkpoint_path, and file - the distributor's own
+    opaque handle (Outcome.file) - for use inside a later submit()'s args."""
+
+    result_id: int
+    file: str
+
+
+@dataclass(frozen=True)
 class RawOutcome:
     """What executor_wrapper/reducer_wrapper return on the worker side, before a
     distributor attaches the result_id and turns it into a proper Outcome."""

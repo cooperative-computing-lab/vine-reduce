@@ -8,7 +8,7 @@ from vine_reduce import serialization
 from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
 from vine_reduce.executor import simple_executor
 from vine_reduce.local_distributor import LocalDistributor
-from vine_reduce.types import Chunk, Success
+from vine_reduce.types import Chunk, ResultHandle, Success
 
 from helpers import count_events, read_env_var
 
@@ -151,6 +151,77 @@ def test_shutdown_removes_owned_work_dir(tmp_path):
     dist.shutdown()
 
     assert not os.path.exists(work_dir)
+
+
+def test_adopt_checkpoint_returns_a_usable_handle(distributor, tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+    seeded_path = str(checkpoint_dir / "seeded.pkl.zst")
+    serialization.dump(42, seeded_path)  # stands in for a prior run's checkpoint
+
+    handle = distributor.adopt_checkpoint(seeded_path)
+
+    assert isinstance(handle, ResultHandle)
+    assert handle.file == seeded_path
+    assert distributor.checkpoint_path(handle.result_id) == seeded_path
+
+    dest = tmp_path / "copy.pkl.zst"
+    distributor.retrieve(handle.result_id, str(dest))
+    assert serialization.load(str(dest)) == 42
+
+
+def test_adopt_checkpoint_release_result_removes_the_adopted_file(distributor, tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+    seeded_path = str(checkpoint_dir / "seeded.pkl.zst")
+    serialization.dump(42, seeded_path)
+
+    handle = distributor.adopt_checkpoint(seeded_path)
+    distributor.release_result(handle.result_id)
+
+    assert not os.path.exists(seeded_path)
+
+
+def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp_path):
+    """§2.7: the on-disk filename for a non-final checkpoint must be unique
+    for the lifetime of checkpoint_dir, not just for this process's
+    result_id counter - otherwise a fresh distributor's counter restarting
+    at 1 could mint a filename that collides with (and silently overwrites)
+    a still-live checkpoint from an earlier run at that same path."""
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    # A pre-fix, result_id-based naming scheme would have named the first
+    # checkpoint of a fresh process "1.pkl.zst" - plant exactly that,
+    # holding content distinguishable from anything this test submits.
+    leftover_path = checkpoint_dir / "1.pkl.zst"
+    serialization.dump("leftover-from-a-prior-run", str(leftover_path))
+
+    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(checkpoint_dir))
+    try:
+        checkpoint_paths = []
+        for _ in range(2):
+            dist.submit(
+                1,
+                "test:process",
+                "processor",
+                executor_wrapper,
+                count_events,
+                Chunk("a.root", 0, 5),
+                {},
+                None,
+                None,
+                default_chunk_to_args,
+                simple_executor,
+                is_checkpoint=True,
+            )
+            outcome = dist.wait(timeout=30)
+            checkpoint_paths.append(outcome.file)
+    finally:
+        dist.shutdown()
+
+    assert str(leftover_path) not in checkpoint_paths
+    assert len(set(checkpoint_paths)) == 2
+    assert serialization.load(str(leftover_path)) == "leftover-from-a-prior-run"
 
 
 def test_set_env_var_is_visible_to_submitted_calls(distributor):
