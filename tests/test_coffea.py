@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from vine_reduce.coffea import VineReduceCoffea, coffea_input_to_datasets, default_reducer
+from vine_reduce.coffea import (
+    VineReduceCoffea,
+    _checksum_fileset,
+    coffea_input_to_datasets,
+    default_reducer,
+)
 
 
 def test_default_reducer_adds_plain_addables():
@@ -83,3 +90,106 @@ def test_vine_reduce_coffea_executor_materializes_result():
 
     result = vr.executor(processor, [1, 2, 3], {})
     assert result == {"count": 3}
+
+
+def test_coffea_input_to_datasets_raises_on_missing_num_entries():
+    preprocessed = {"ds": {"files": {"a.root": {"object_path": "Events", "num_entries": None}}}}
+    with pytest.raises(ValueError, match="preprocess_cache"):
+        coffea_input_to_datasets(preprocessed)
+
+
+def test_coffea_input_to_datasets_raises_on_absent_num_entries_key():
+    preprocessed = {"ds": {"files": {"a.root": {"object_path": "Events"}}}}
+    with pytest.raises(ValueError, match="preprocess_cache"):
+        coffea_input_to_datasets(preprocessed)
+
+
+def test_coffea_input_to_datasets_raises_on_bare_file_spec():
+    preprocessed = {"ds": {"files": {"a.root": "Events"}}}
+    with pytest.raises(ValueError, match="preprocess_cache"):
+        coffea_input_to_datasets(preprocessed)
+
+
+def test_preprocess_cache_hit_skips_preprocess(tmp_path, monkeypatch):
+    fileset = {"ds": {"files": {"a.root": "Events"}}}
+    cache_file = tmp_path / "cache.jsonl"
+    cached_result = {"ds": {"files": {"a.root": {"num_entries": 100}}}}
+    checksum = _checksum_fileset(fileset)
+    with open(cache_file, "w") as f:
+        f.write(json.dumps({"checksum": checksum}) + "\n")
+        f.write(json.dumps(cached_result) + "\n")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("preprocess should not be called on a cache hit")
+
+    monkeypatch.setattr("coffea.dataset_tools.preprocess", _boom)
+
+    result = VineReduceCoffea.preprocess_cache(fileset, cache_file=cache_file)
+    assert result == cached_result
+
+
+def test_preprocess_cache_miss_on_checksum_change(tmp_path, monkeypatch):
+    fileset = {"ds": {"files": {"a.root": "Events"}}}
+    cache_file = tmp_path / "cache.jsonl"
+    with open(cache_file, "w") as f:
+        f.write(json.dumps({"checksum": "stale"}) + "\n")
+        f.write(json.dumps({"ds": {"files": {"a.root": {"num_entries": 1}}}}) + "\n")
+
+    fresh_available = {"ds": {"files": {"a.root": {"num_entries": 100}}}}
+    calls = []
+
+    def fake_preprocess(passed_fileset, **kwargs):
+        calls.append((passed_fileset, kwargs))
+        return fresh_available, {"ds": {"files": {}}}
+
+    monkeypatch.setattr("coffea.dataset_tools.preprocess", fake_preprocess)
+
+    result = VineReduceCoffea.preprocess_cache(fileset, cache_file=cache_file, step_size=1000)
+    assert result == fresh_available
+    assert len(calls) == 1
+    assert calls[0][0] == fileset
+    assert calls[0][1]["step_size"] == 1000
+
+    with open(cache_file) as f:
+        header = json.loads(f.readline())
+        cached = json.loads(f.readline())
+    assert cached == fresh_available
+    assert header["checksum"] != "stale"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "",
+        '{"checksum": "abc"}\n',
+        "not json\n",
+        '{"checksum": "abc"}\nnot json either\n',
+    ],
+)
+def test_preprocess_cache_recomputes_on_corrupt_cache(tmp_path, monkeypatch, contents):
+    fileset = {"ds": {"files": {"a.root": "Events"}}}
+    cache_file = tmp_path / "cache.jsonl"
+    cache_file.write_text(contents)
+
+    fresh_available = {"ds": {"files": {"a.root": {"num_entries": 42}}}}
+    monkeypatch.setattr("coffea.dataset_tools.preprocess", lambda *a, **k: (fresh_available, {}))
+
+    result = VineReduceCoffea.preprocess_cache(fileset, cache_file=cache_file)
+    assert result == fresh_available
+
+    with open(cache_file) as f:
+        header = json.loads(f.readline())
+        cached = json.loads(f.readline())
+    assert cached == fresh_available
+    assert "checksum" in header
+
+
+def test_preprocess_cache_computes_on_missing_file(tmp_path, monkeypatch):
+    fileset = {"ds": {"files": {"a.root": "Events"}}}
+    cache_file = tmp_path / "does_not_exist.jsonl"
+    fresh_available = {"ds": {"files": {"a.root": {"num_entries": 7}}}}
+    monkeypatch.setattr("coffea.dataset_tools.preprocess", lambda *a, **k: (fresh_available, {}))
+
+    result = VineReduceCoffea.preprocess_cache(fileset, cache_file=cache_file)
+    assert result == fresh_available
+    assert cache_file.exists()

@@ -11,10 +11,13 @@ overall design.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import operator
+import os
 from collections.abc import Mapping, MutableMapping, MutableSet
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 
 from coffea.nanoevents import NanoAODSchema
@@ -66,7 +69,12 @@ def coffea_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]
     """Converts coffea's own preprocess() output into vine_reduce's dataset
     shape. coffea describes each file with a dict carrying num_entries (plus
     steps/uuid/object_path); vine_reduce only needs the event count per file.
-    input_data may be that dict directly, or a path to a json file holding it."""
+    input_data may be that dict directly, or a path to a json file holding it.
+
+    Raises ValueError if any file is missing a concrete num_entries - this
+    means the fileset hasn't been preprocessed yet. Run
+    VineReduceCoffea.preprocess_cache(fileset, cache_file=...) first and pass
+    its result (or the cache_file path) in as input_data."""
     if isinstance(input_data, dict):
         raw = input_data
     else:
@@ -75,7 +83,17 @@ def coffea_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]
 
     datasets = {}
     for name, spec in raw.items():
-        files = {url: file_info["num_entries"] for url, file_info in spec["files"].items()}
+        files = {}
+        for url, file_info in spec["files"].items():
+            num_entries = file_info.get("num_entries") if isinstance(file_info, Mapping) else None
+            if num_entries is None:
+                raise ValueError(
+                    f"File {url!r} in dataset {name!r} has no num_entries; the fileset "
+                    "has not been preprocessed. Run "
+                    "VineReduceCoffea.preprocess_cache(fileset, cache_file=...) first "
+                    "and pass its result as input."
+                )
+            files[url] = num_entries
         datasets[name] = {"metadata": spec.get("metadata", {}), "files": files}
     return datasets
 
@@ -141,6 +159,45 @@ def _make_executor(processor_args: Mapping[str, Any] | None) -> Callable[..., An
     return executor
 
 
+def _checksum_fileset(fileset: dict[str, Any]) -> str:
+    """A stable hash of a fileset's contents, used to detect whether a
+    preprocess_cache entry is still valid for the given input fileset."""
+    encoded = json.dumps(fileset, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_preprocess_cache(cache_file: str | Path, checksum: str) -> dict[str, Any] | None:
+    """Reads a preprocess_cache jsonl file and returns its cached
+    preprocessed fileset if its stored checksum matches, else None (a cache
+    miss - including on a missing, truncated, or otherwise corrupt file)."""
+    try:
+        with open(cache_file) as f:
+            header = json.loads(f.readline())
+            if header.get("checksum") != checksum:
+                return None
+            cached = json.loads(f.readline())
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    return cached
+
+
+def _write_preprocess_cache(
+    cache_file: str | Path, checksum: str, preprocessed: dict[str, Any]
+) -> None:
+    """Writes a preprocess_cache jsonl file: a header line with the fileset's
+    checksum, followed by the preprocessed fileset. Writes to a temp file and
+    renames into place so a crash mid-write can't leave a corrupt cache_file
+    (a reader would just treat that as a cache miss anyway, but this avoids
+    it in the common case)."""
+    tmp_path = f"{cache_file}.tmp"
+    with open(tmp_path, "w") as f:
+        f.write(json.dumps({"checksum": checksum}) + "\n")
+        f.write(json.dumps(preprocessed) + "\n")
+    os.replace(tmp_path, cache_file)
+
+
 @dataclass
 class VineReduceCoffea(VineReduce):
     """A VineReduce specialization for coffea-based HEP analyses: supplies
@@ -186,3 +243,60 @@ class VineReduceCoffea(VineReduce):
             self.schema, self.mode, self.uproot_options, self.object_path
         )
         self.executor = _make_executor(self.processor_args)
+
+    @staticmethod
+    def preprocess_cache(
+        fileset: dict[str, Any],
+        cache_file: str | Path,
+        step_size: None | int = None,
+        align_clusters: bool = False,
+        recalculate_steps: bool = False,
+        files_per_batch: int = 1,
+        skip_bad_files: bool = False,
+        file_exceptions: Any = (OSError,),
+        save_form: bool = False,
+        scheduler: None | Callable | str = None,
+        uproot_options: dict[str, Any] | None = None,
+        step_size_safety_factor: float = 0.5,
+        allow_empty_datasets: bool = False,
+    ) -> dict[str, Any]:
+        """Runs coffea's own dataset_tools.preprocess() on fileset, caching
+        the result at cache_file so unchanged filesets don't get
+        re-preprocessed on every run.
+
+        cache_file is a jsonl file: its first line is a header dict holding
+        a checksum of fileset, and its second line is the preprocessed
+        fileset (coffea's "available" return value - the files it was able
+        to fully probe). If cache_file exists and its checksum matches
+        fileset's, preprocess() is skipped and the cached result is
+        returned as-is. Otherwise (no cache, stale checksum, or a corrupt
+        cache file) preprocess() is run and cache_file is (re)written.
+
+        All other arguments are forwarded to coffea.dataset_tools.preprocess
+        unchanged - see its docs. Returns coffea's rich per-file dict shape
+        (not vine_reduce's flat shape); pass the result as input to
+        coffea_input_to_datasets (e.g. via VineReduceCoffea's default
+        input_to_datasets)."""
+        checksum = _checksum_fileset(fileset)
+        cached = _read_preprocess_cache(cache_file, checksum)
+        if cached is not None:
+            return cached
+
+        from coffea.dataset_tools import preprocess
+
+        available, _updated = preprocess(
+            fileset,
+            step_size=step_size,
+            align_clusters=align_clusters,
+            recalculate_steps=recalculate_steps,
+            files_per_batch=files_per_batch,
+            skip_bad_files=skip_bad_files,
+            file_exceptions=file_exceptions,
+            save_form=save_form,
+            scheduler=scheduler,
+            uproot_options=uproot_options or {},
+            step_size_safety_factor=step_size_safety_factor,
+            allow_empty_datasets=allow_empty_datasets,
+        )
+        _write_preprocess_cache(cache_file, checksum, available)
+        return available
