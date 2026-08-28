@@ -4,9 +4,9 @@ import os
 
 import pytest
 
-from vine_reduce import VineReduce, serialization
+from vine_reduce import VineReduce, VineReduceError, serialization
 from vine_reduce.checkpoint_db import CheckpointDB, checksum_dataset
-from vine_reduce.engine import _resolve_sized_config
+from vine_reduce.engine import _resolve_reduction_size, _resolve_sized_config
 from vine_reduce.local_distributor import LocalDistributor
 
 from helpers import count_events, read_env_var, sum_reducer
@@ -52,6 +52,38 @@ def test_resolve_sized_config_dataset_beats_processor_beats_default():
 def test_resolve_sized_config_missing_keys_fall_back_to_default():
     assert _resolve_sized_config({"default": 7}, "proc", "ds") == 7
     assert _resolve_sized_config({}, "proc", "ds") is None
+
+
+def test_resolve_reduction_size_passes_through_valid_int():
+    assert _resolve_reduction_size(5, "proc", "ds") == 5
+    assert _resolve_reduction_size({"default": 5}, "proc", "ds") == 5
+
+
+def test_resolve_reduction_size_raises_on_missing_default():
+    with pytest.raises(VineReduceError):
+        _resolve_reduction_size({}, "proc", "ds")
+
+
+def test_resolve_reduction_size_raises_on_too_small_value():
+    with pytest.raises(VineReduceError):
+        _resolve_reduction_size(1, "proc", "ds")
+    with pytest.raises(VineReduceError):
+        _resolve_reduction_size({"default": 1}, "proc", "ds")
+
+
+def test_reduction_size_dict_missing_default_raises_clearly(tmp_path, dataset_input, distributor):
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 7}}})
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        reduction_size={"processors": {"other_proc": 2}},
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+    with pytest.raises(VineReduceError):
+        vr.compute()
 
 
 def test_end_to_end_two_processors_two_datasets(tmp_path, dataset_input, distributor):

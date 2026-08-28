@@ -43,6 +43,22 @@ def _resolve_sized_config(
     return config.get("default")
 
 
+def _resolve_reduction_size(config: int | dict, processor_name: str, dataset_name: str) -> int:
+    """Like _resolve_sized_config, but for reduction_size specifically: unlike
+    chunksize, reduction_size has no meaningful "unset" value, so a dict config
+    missing a "default" (and no matching per-processor/per-dataset entry) is a
+    configuration error, not a silent None - and the resolved size must be
+    usable as a fold width (>= 2)."""
+    resolved = _resolve_sized_config(config, processor_name, dataset_name)
+    if resolved is None or resolved < 2:
+        raise VineReduceError(
+            f"reduction_size for processor {processor_name!r}, dataset {dataset_name!r} "
+            f"resolved to {resolved!r}; it must be an int >= 2. Check the reduction_size "
+            f'dict has a "default" entry or a matching "processors"/"datasets" override.'
+        )
+    return resolved
+
+
 @dataclass
 class VineReduce:
     """Drives a dynamic data reduction computation over one or more datasets: for
@@ -231,7 +247,7 @@ class VineReduce:
                         is_result=is_result,
                         result_postprocess=self.result_postprocess,
                         chunksize=_resolve_sized_config(self.chunksize, proc_name, dataset_name),
-                        reduction_size=_resolve_sized_config(
+                        reduction_size=_resolve_reduction_size(
                             self.reduction_size, proc_name, dataset_name
                         ),
                         checkpoint_time=self.checkpoint_time,
