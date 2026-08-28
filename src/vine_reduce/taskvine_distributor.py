@@ -19,7 +19,7 @@ task completes (unlike a temp file, which stays remote until explicitly
 fetched), so by the time wait() reports success the checkpoint already sits
 durably on local disk at `path` - see checkpoint_path(). Either way,
 Outcome.file is not that file's real location but an opaque token this class
-mints, e.g. "result_7.p". When that token later shows up inside another
+mints from result_id, e.g. "result_3f9a1c...p". When that token later shows up inside another
 submit() call's args (as one of reducer_wrapper's input_files),
 _remap_files recognizes it, attaches the underlying vine.File as a task
 input under a fresh sandbox name, and substitutes that sandbox name into the
@@ -55,7 +55,6 @@ bug) or the worker process was killed by TaskVine's resource watchdog.
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
 from dataclasses import dataclass
@@ -65,7 +64,7 @@ from uuid import uuid4
 import ndcctools.taskvine as vine
 
 from .distributor import TaskKind
-from .types import Outcome, RawOutcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
+from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
@@ -77,7 +76,7 @@ _RESOURCE_EXHAUSTION_RESULTS = {"resource exhaustion", "max wall time", "disk al
 _RESOURCE_KEY_TO_RMSUMMARY = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
 
 
-def _result_token(result_id: int) -> str:
+def _result_token(result_id: str) -> str:
     """The opaque manager-side name for a result (see module docstring). Derived
     from result_id rather than stored, so the two can never drift apart."""
     return f"result_{result_id}.p"
@@ -85,7 +84,7 @@ def _result_token(result_id: int) -> str:
 
 @dataclass
 class _InFlight:
-    result_id: int
+    result_id: str
     kind: TaskKind
 
 
@@ -141,7 +140,6 @@ class TaskVineDistributor:
         self._checkpoint_dir = checkpoint_dir
         os.makedirs(self._checkpoint_dir, exist_ok=True)
 
-        self._next_id = itertools.count(1)
         # Keyed on the dest_token minted for every result - by submit() for
         # a this-run result, or by adopt_checkpoint() for a restart-seeded
         # one - so _remap_files always finds it by simple lookup.
@@ -164,14 +162,16 @@ class TaskVineDistributor:
 
     def submit(
         self,
+        result_id: str,
         priority: int,
         category: str,
         kind: TaskKind,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
-    ) -> int:
-        """Submit func(dest_token, *args) as a vine.PythonTask, ordered by
+    ) -> None:
+        """Submit func(dest_token, *args) as a vine.PythonTask, identified by
+        result_id (see the Distributor protocol docstring), ordered by
         priority (larger runs first) and grouped under `category` for
         resource-limit purposes. kind selects resources_processor vs.
         resources_reducer the first time this category is seen.
@@ -179,8 +179,7 @@ class TaskVineDistributor:
         its file becomes a manager.declare_file(cache=True) under
         checkpoint_dir instead of an ordinary manager.declare_temp(), and
         its path becomes available via checkpoint_path() once the task
-        succeeds. Returns a result_id."""
-        result_id = next(self._next_id)
+        succeeds."""
         dest_token = _result_token(result_id)
 
         remapped_args, extra_inputs = self._remap_files(args)
@@ -213,7 +212,6 @@ class TaskVineDistributor:
         taskvine_id = self._manager.submit(task)
         self._files_by_key[dest_token] = result_file
         self._in_flight_by_taskvine_id[taskvine_id] = _InFlight(result_id=result_id, kind=kind)
-        return result_id
 
     def _configure_category(self, category: str, kind: TaskKind) -> None:
         """Apply resources_processor/resources_reducer to `category` in
@@ -311,7 +309,7 @@ class TaskVineDistributor:
             "wall_time_s": (measured.wall_time or 0) / 1e6,
         }
 
-    def release_result(self, result_id: int) -> None:
+    def release_result(self, result_id: str) -> None:
         """Undeclare the vine.File backing a completed (Success) result_id,
         letting TaskVine reclaim its storage on the worker(s) holding it,
         and remove its checkpoint_dir mirror from local disk, if it has one
@@ -329,22 +327,21 @@ class TaskVineDistributor:
             except FileNotFoundError:
                 pass
 
-    def adopt_checkpoint(self, path: str) -> ResultHandle:
-        """Register an existing durable checkpoint file at `path` as if it
-        were a completed Success result submitted with is_checkpoint=True -
-        see the Distributor protocol docstring. Mints a result_id/token the
-        same way submit() does, declares `path` under that token (cache=True,
-        same as a this-run checkpoint), and records it in
-        _checkpoint_paths_by_token - from then on the adopted item flows
-        through every existing code path (remapping, release, retrieve) with
-        no special cases."""
-        result_id = next(self._next_id)
+    def adopt_checkpoint(self, result_id: str, path: str) -> str:
+        """Register an existing durable checkpoint file at `path` under
+        result_id, as if it were a completed Success result submitted with
+        is_checkpoint=True - see the Distributor protocol docstring. Mints a
+        token from result_id the same way submit() does, declares `path`
+        under that token (cache=True, same as a this-run checkpoint), and
+        records it in _checkpoint_paths_by_token - from then on the adopted
+        item flows through every existing code path (remapping, release,
+        retrieve) with no special cases. Returns the token."""
         token = _result_token(result_id)
         self._files_by_key[token] = self._manager.declare_file(path, cache=True)
         self._checkpoint_paths_by_token[token] = path
-        return ResultHandle(result_id, token)
+        return token
 
-    def checkpoint_path(self, result_id: int) -> str:
+    def checkpoint_path(self, result_id: str) -> str:
         """Local, durable on-disk path for a completed (Success) result_id
         that was submitted with is_checkpoint=True - see submit(). TaskVine
         already wrote the file there as part of retrieving the task's
@@ -356,7 +353,7 @@ class TaskVineDistributor:
         currently run, per TaskVine's own Manager.hungry()."""
         return self._manager.hungry()
 
-    def retrieve(self, result_id: int, dest_path: str) -> None:
+    def retrieve(self, result_id: str, dest_path: str) -> None:
         """Pull the result file for a completed (Success) result_id back to
         the manager and write it to dest_path."""
         file = self._files_by_key[_result_token(result_id)]

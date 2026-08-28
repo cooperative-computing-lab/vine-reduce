@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 
 import pytest
 
@@ -8,7 +9,7 @@ from vine_reduce import serialization
 from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
 from vine_reduce.executor import simple_executor
 from vine_reduce.local_distributor import LocalDistributor
-from vine_reduce.types import Chunk, ResultHandle, Success
+from vine_reduce.types import Chunk, Success
 
 from helpers import count_events, read_env_var
 
@@ -25,7 +26,9 @@ def distributor(tmp_path):
 
 
 def _submit_chunk(distributor, priority, chunk):
-    return distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         priority,
         "test:process",
         "processor",
@@ -38,6 +41,7 @@ def _submit_chunk(distributor, priority, chunk):
         default_chunk_to_args,
         simple_executor,
     )
+    return result_id
 
 
 def test_submit_and_wait_round_trip(distributor):
@@ -90,7 +94,9 @@ def test_add_file_is_a_no_op_that_does_not_raise(distributor, tmp_path):
 
 def test_checkpoint_result_is_written_to_checkpoint_dir_not_work_dir(distributor, tmp_path):
     result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
-    checkpoint_id = distributor.submit(
+    checkpoint_id = uuid4().hex
+    distributor.submit(
+        checkpoint_id,
         1,
         "test:process",
         "processor",
@@ -119,7 +125,9 @@ def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
     on restart - unlike an owned work_dir, which is disposable scratch space
     shutdown() removes (see test_shutdown_removes_owned_work_dir)."""
     dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
-    checkpoint_id = dist.submit(
+    checkpoint_id = uuid4().hex
+    dist.submit(
+        checkpoint_id,
         1,
         "test:process",
         "processor",
@@ -153,20 +161,20 @@ def test_shutdown_removes_owned_work_dir(tmp_path):
     assert not os.path.exists(work_dir)
 
 
-def test_adopt_checkpoint_returns_a_usable_handle(distributor, tmp_path):
+def test_adopt_checkpoint_returns_a_usable_file_handle(distributor, tmp_path):
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     seeded_path = str(checkpoint_dir / "seeded.pkl.zst")
     serialization.dump(42, seeded_path)  # stands in for a prior run's checkpoint
 
-    handle = distributor.adopt_checkpoint(seeded_path)
+    result_id = uuid4().hex
+    file = distributor.adopt_checkpoint(result_id, seeded_path)
 
-    assert isinstance(handle, ResultHandle)
-    assert handle.file == seeded_path
-    assert distributor.checkpoint_path(handle.result_id) == seeded_path
+    assert file == seeded_path
+    assert distributor.checkpoint_path(result_id) == seeded_path
 
     dest = tmp_path / "copy.pkl.zst"
-    distributor.retrieve(handle.result_id, str(dest))
+    distributor.retrieve(result_id, str(dest))
     assert serialization.load(str(dest)) == 42
 
 
@@ -176,8 +184,9 @@ def test_adopt_checkpoint_release_result_removes_the_adopted_file(distributor, t
     seeded_path = str(checkpoint_dir / "seeded.pkl.zst")
     serialization.dump(42, seeded_path)
 
-    handle = distributor.adopt_checkpoint(seeded_path)
-    distributor.release_result(handle.result_id)
+    result_id = uuid4().hex
+    distributor.adopt_checkpoint(result_id, seeded_path)
+    distributor.release_result(result_id)
 
     assert not os.path.exists(seeded_path)
 
@@ -201,6 +210,7 @@ def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp
         checkpoint_paths = []
         for _ in range(2):
             dist.submit(
+                uuid4().hex,
                 1,
                 "test:process",
                 "processor",
@@ -227,7 +237,9 @@ def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp
 def test_set_env_var_is_visible_to_submitted_calls(distributor):
     distributor.set_env_var("VINE_REDUCE_TEST_VAR", "xyz")
 
-    result_id = distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         1,
         "test:process",
         "processor",

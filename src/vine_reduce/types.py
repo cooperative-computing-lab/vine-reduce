@@ -3,8 +3,9 @@
 See PLAN.md for the full design. `Outcome` and its variants are the public,
 distributor-facing result of a submitted call. `RawOutcome` is the internal,
 distributor-agnostic value returned by executor_wrapper/reducer_wrapper on
-the worker side; a distributor is responsible for attaching the result_id it
-assigned at submit() time to produce a proper Outcome (see distributor.py).
+the worker side; a distributor is responsible for attaching the result_id the
+caller gave it at submit() time to produce a proper Outcome (see
+distributor.py).
 """
 
 from __future__ import annotations
@@ -36,13 +37,13 @@ class Chunk:
 class Outcome:
     """Base class for the result of a submitted call, as reported by a distributor.
 
-    result_id: the id returned by Distributor.submit() for this call.
+    result_id: the id passed to Distributor.submit() for this call.
     resources: usage reported for the call, e.g. {"cores", "memory_mb",
         "wall_time_s"} - see each Distributor implementation for exactly
         which keys it fills in.
     """
 
-    result_id: int
+    result_id: str
     resources: dict[str, Any]
 
 
@@ -75,7 +76,7 @@ class ResultHandle:
     release_result/retrieve/checkpoint_path, and file - the distributor's own
     opaque handle (Outcome.file) - for use inside a later submit()'s args."""
 
-    result_id: int
+    result_id: str
     file: str
 
 
@@ -89,7 +90,7 @@ class RawOutcome:
     file: str | None = None
     traceback: str | None = None
 
-    def to_outcome(self, result_id: int) -> Outcome:
+    def to_outcome(self, result_id: str) -> Outcome:
         """Attach result_id and convert to the matching Outcome subclass."""
         if self.status == "success":
             return Success(result_id=result_id, resources=self.resources, file=self.file)

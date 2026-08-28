@@ -89,6 +89,12 @@ class RestartPlan:
     skip_files: set[str]
 
 
+def next_result_id() -> str:
+    """A fresh result_id for submit()/adopt_checkpoint() - unique for the
+    lifetime of the distributor (see Distributor.submit)."""
+    return uuid4().hex
+
+
 def plan_restart(rows: list[CheckpointRecord], dataset_files: set[str]) -> RestartPlan:
     """The restart rules, stated once:
     1. Every final row is replayed as a final result.
@@ -199,7 +205,7 @@ class Pipeline:
         self.final_results: list[PoolItem] = []
         self._files_in_progress: dict[str, _FileProgress] = {}
         self._retry_chunks: list[Chunk] = []
-        self._in_flight: dict[int, _ChunkTask | _ReduceTask] = {}
+        self._in_flight: dict[str, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
         self._skip_files: set[str] = set()
@@ -242,7 +248,9 @@ class Pipeline:
         self._skip_files = plan.skip_files
         self.finished = plan.finished
         for row in plan.pool_rows:
-            handle = self._distributor.adopt_checkpoint(row.path)
+            result_id = next_result_id()
+            file = self._distributor.adopt_checkpoint(result_id, row.path)
+            handle = ResultHandle(result_id, file)
             self.pool.append(self._seeded_item(row, handle=handle))
 
     # -- chunk generation ----------------------------------------------------
@@ -252,7 +260,7 @@ class Pipeline:
         and not yet resolved."""
         return len(self._in_flight)
 
-    def owns(self, result_id: int) -> bool:
+    def owns(self, result_id: str) -> bool:
         """Whether result_id was submitted by this pipeline (as opposed to
         another pipeline sharing the same distributor)."""
         return result_id in self._in_flight
@@ -322,7 +330,9 @@ class Pipeline:
         self._files_in_progress.setdefault(
             chunk.url, _FileProgress(num_entries=self._dataset["files"][chunk.url])
         )
-        result_id = self._distributor.submit(
+        result_id = next_result_id()
+        self._distributor.submit(
+            result_id,
             self._process_priority,
             self._process_category,
             "processor",
@@ -362,7 +372,9 @@ class Pipeline:
             max(item.since_checkpoint_distance for item in group),
         )
 
-        result_id = self._distributor.submit(
+        result_id = next_result_id()
+        self._distributor.submit(
+            result_id,
             self._reduce_priority,
             self._reduce_category,
             "reducer",

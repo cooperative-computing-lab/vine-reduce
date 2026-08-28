@@ -35,7 +35,7 @@ from uuid import uuid4
 
 import cloudpickle
 
-from .types import Outcome, RawOutcome, ResultHandle
+from .types import Outcome, RawOutcome
 
 
 def _run_cloudpickled(payload: bytes) -> Any:
@@ -80,35 +80,33 @@ class LocalDistributor:
         self._checkpoint_dir = checkpoint_dir
         os.makedirs(self._checkpoint_dir, exist_ok=True)
 
-        self._next_id = itertools.count(1)
         self._seq = itertools.count()
         # Heap of (-priority, seq, result_id, func, args, is_checkpoint): negated
         # priority so the largest one pops first, seq to break ties in
         # submission order.
-        self._pending: list[tuple[int, int, int, Callable, tuple, bool]] = []
-        self._running: dict[Future, int] = {}  # future -> result_id, while dispatched
-        self._files: dict[int, str] = {}  # result_id -> file, for completed Successes
+        self._pending: list[tuple[int, int, str, Callable, tuple, bool]] = []
+        self._running: dict[Future, str] = {}  # future -> result_id, while dispatched
+        self._files: dict[str, str] = {}  # result_id -> file, for completed Successes
         self._env_vars: dict[str, str] = {}
 
     def submit(
         self,
+        result_id: str,
         priority: int,
         category: str,
         kind: str,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
-    ) -> int:
+    ) -> None:
         """Queue func(dest_file, *args) to run in the process pool, ordered
         by priority (larger runs first). is_checkpoint picks which directory
         the result lands under - checkpoint_dir or work_dir, see _dispatch
-        and the module docstring. Returns a result_id."""
-        result_id = next(self._next_id)
+        and the module docstring."""
         heapq.heappush(
             self._pending, (-priority, next(self._seq), result_id, func, args, is_checkpoint)
         )
         self._dispatch()
-        return result_id
 
     def _dispatch(self) -> None:
         while self._pending and len(self._running) < self._max_workers:
@@ -140,21 +138,20 @@ class LocalDistributor:
         self._dispatch()
         return outcome
 
-    def release_result(self, result_id: int) -> None:
+    def release_result(self, result_id: str) -> None:
         """Delete the result file for a completed (Success) result_id."""
         path = self._files.pop(result_id, None)
         if path is not None and os.path.exists(path):
             os.remove(path)
 
-    def adopt_checkpoint(self, path: str) -> ResultHandle:
-        """Register an existing durable checkpoint file at `path` as if it
-        were a completed Success result submitted with is_checkpoint=True -
-        see the Distributor protocol docstring. Worker subprocesses already
-        share vine_reduce's filesystem, so `path` itself is usable as-is;
-        this just mints a result_id for it."""
-        result_id = next(self._next_id)
+    def adopt_checkpoint(self, result_id: str, path: str) -> str:
+        """Register an existing durable checkpoint file at `path` under
+        result_id, as if it were a completed Success result submitted with
+        is_checkpoint=True - see the Distributor protocol docstring. Worker
+        subprocesses already share vine_reduce's filesystem, so `path` itself
+        is usable as-is and is also this distributor's handle for it."""
         self._files[result_id] = path
-        return ResultHandle(result_id, path)
+        return path
 
     def capacity(self) -> int:
         """Room left before the pool + its pending queue reaches twice
@@ -163,13 +160,13 @@ class LocalDistributor:
         in_flight = len(self._running) + len(self._pending)
         return max(0, target_queue_depth - in_flight)
 
-    def retrieve(self, result_id: int, dest_path: str) -> None:
+    def retrieve(self, result_id: str, dest_path: str) -> None:
         """Copy the result file for a completed (Success) result_id to
         dest_path - a plain file copy, since worker subprocesses already
         share vine_reduce's filesystem."""
         shutil.copy(self._files[result_id], dest_path)
 
-    def checkpoint_path(self, result_id: int) -> str:
+    def checkpoint_path(self, result_id: str) -> str:
         """The real path a completed (Success) result_id already lives at -
         see submit()."""
         return self._files[result_id]

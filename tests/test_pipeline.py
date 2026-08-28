@@ -359,9 +359,9 @@ def test_restart_seeded_checkpoint_is_adopted_used_and_released_when_superseded(
     adopted_paths: list[str] = []
     original_adopt = fake_distributor.adopt_checkpoint
 
-    def spy_adopt(path):
+    def spy_adopt(result_id, path):
         adopted_paths.append(path)
-        return original_adopt(path)
+        return original_adopt(result_id, path)
 
     fake_distributor.adopt_checkpoint = spy_adopt
 
@@ -554,10 +554,10 @@ def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distribut
     submitted_chunk_urls: set[str] = set()
     original_submit = distributor2.submit
 
-    def spy_submit(priority, category, kind, func, *args, **kwargs):
+    def spy_submit(result_id, priority, category, kind, func, *args, **kwargs):
         if kind == "processor":
             submitted_chunk_urls.update(a.url for a in args if isinstance(a, Chunk))
-        return original_submit(priority, category, kind, func, *args, **kwargs)
+        return original_submit(result_id, priority, category, kind, func, *args, **kwargs)
 
     distributor2.submit = spy_submit
 

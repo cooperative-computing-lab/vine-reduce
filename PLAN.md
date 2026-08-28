@@ -218,10 +218,12 @@ restart with `plan_restart(rows, dataset_files)` - a pure function stating the r
 4. A file is skipped by chunk generation iff a replayed row covers it.
 
 `_seed_from_checkpoints` then executes the plan. Every replayed **partial** row is handed to the
-distributor via `adopt_checkpoint(row.path)`, which registers the on-disk file as if it were a
-completed Success result of this run submitted with `is_checkpoint=True` and returns a
-`ResultHandle`. From then on a restart-seeded pool item is indistinguishable from one this run
-produced itself: the same handle flows into later `submit()` args, and the same
+distributor via `adopt_checkpoint(result_id, row.path)` - `result_id` freshly minted by
+vine_reduce itself, same as for `submit()` - which registers the on-disk file as if it were a
+completed Success result of this run submitted with `is_checkpoint=True` and returns its file
+handle, which vine_reduce wraps into a `ResultHandle`. From then on a restart-seeded pool item is
+indistinguishable from one this run produced itself: the same handle flows into later `submit()`
+args, and the same
 `release_result` releases it - one release channel and one file-cleanup owner (the distributor)
 cover both cases. A replayed **final** row gets no handle: a final result is never resubmitted,
 so it needs no distributor identity. Seeded items start with zeroed since-checkpoint counters -
@@ -321,7 +323,7 @@ re-split first if it predates the halving, so the retry actually runs at the sma
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
                              │
-                             │  submit(priority, category, kind,
+                             │  submit(result_id, priority, category, kind,
                              │         executor_wrapper | reducer_wrapper, ...)
                              ▼
         distributor dispatches the call to a worker node
@@ -404,16 +406,19 @@ The pieces, in flow order (each is user-overridable unless noted):
 A distributor implements the `Distributor` protocol (`src/vine_reduce/distributor.py`):
 
 ```python
-result_id = submit(priority, category, kind, executor_wrapper | reducer_wrapper, *args,
-    is_checkpoint=False): submit a processor or reduction call. category is a string grouping
-    calls of the same processing/reduction set (e.g. for logging or scheduling heuristics). kind
-    is "processor" or "reducer", letting a distributor apply different resource requests to each.
+submit(result_id, priority, category, kind, executor_wrapper | reducer_wrapper, *args,
+    is_checkpoint=False): submit a processor or reduction call, identified by result_id - a
+    caller-minted id (vine_reduce mints uuid4().hex per call; see "Pipeline state"), unique for
+    the lifetime of this distributor. The distributor itself never computes or hands back an id -
+    it just remembers result_id for release_result/retrieve/checkpoint_path, and echoes it back
+    on the matching Outcome.result_id from wait(). category is a string grouping calls of the
+    same processing/reduction set (e.g. for logging or scheduling heuristics). kind is
+    "processor" or "reducer", letting a distributor apply different resource requests to each.
     is_checkpoint marks a call whose result must be durable - decided at submit time because that
     is when a distributor declares the result's file (see "When a checkpoint is taken"). func is
     always called as func(dest_file, *args): the distributor picks dest_file (or an opaque token
     standing in for it) and prepends it itself - vine_reduce never picks the path, it only sees
-    it echoed back on Outcome.file. Returns a result_id, used later by
-    release_result/retrieve/checkpoint_path.
+    it echoed back on Outcome.file.
 outcome = wait(timeout): block until a submitted call finishes and return its Outcome
     (Success | RuntimeFailure | ResourceExhaustion); None on timeout. outcome.result_id
     identifies which submit() call it corresponds to.
@@ -422,15 +427,15 @@ release_result(result_id): release any resources held for result_id. A hard requ
     adopt_checkpoint, release_result must also remove the checkpoint's durable on-disk copy -
     the distributor is the single owner of that file. Both shipped distributors behave this way;
     vine_reduce relies on it rather than ever deleting a checkpoint file itself.
-handle = adopt_checkpoint(path): register path - an existing durable checkpoint file written by
-    a previous run and recorded in the checkpoint store - as if it were a completed Success
-    result of this run submitted with is_checkpoint=True. Returns a ResultHandle whose result_id
-    works with release_result/retrieve/checkpoint_path exactly like one from submit()
-    (checkpoint_path returns path), and whose file may appear in later submit() args exactly
-    like an Outcome.file. This makes a restart-seeded pool item indistinguishable from one this
-    run produced: one release channel and one file-cleanup owner cover both cases, with no
-    "free a result with no live result_id" side path and no distributor-side guessing about
-    which task arguments are restart-seeded on-disk paths.
+file = adopt_checkpoint(result_id, path): register path - an existing durable checkpoint file
+    written by a previous run and recorded in the checkpoint store - under result_id, as if it
+    were a completed Success result of this run submitted with is_checkpoint=True. result_id
+    becomes valid for release_result/retrieve/checkpoint_path exactly like one from submit()
+    (checkpoint_path returns path). Returns the distributor's own file handle - the same kind of
+    value as Outcome.file - which vine_reduce wraps into a ResultHandle(result_id, file) for use
+    inside a later submit()'s args. This makes a restart-seeded pool item indistinguishable from
+    one this run produced: one release channel and one file-cleanup owner cover both cases, with
+    no distributor-side guessing about which task arguments are restart-seeded on-disk paths.
 chunks_wanted = capacity(): number of additional chunks the distributor could usefully accept
     right now.
 retrieve(result_id, dest_path): copy/materialize the file for a completed (Success) result_id to
@@ -518,7 +523,7 @@ num_events int: property, stop - start.
 
 ```python
 Outcome: Union of RuntimeFailure, ResourceExhaustion, Success. All variants carry:
-  result_id: id returned by the submit() call this outcome corresponds to.
+  result_id: the id vine_reduce passed to the submit() call this outcome corresponds to.
   resources Dict[str, Any]: resources used by the task, e.g.
                             {"cores": ..., "memory_mb": ..., "wall_time_s": ...}.
                             Measured by executor_wrapper/reducer_wrapper using core python
@@ -536,14 +541,15 @@ Success additionally carries:
 
 ```python
 ResultHandle (frozen):
-result_id int: for release_result/retrieve/checkpoint_path.
+result_id str: for release_result/retrieve/checkpoint_path. Minted by vine_reduce itself
+               (uuid4().hex), never by the distributor - see "API vine_reduce <-> distributor".
 file str: the distributor's opaque handle (an Outcome.file), for use inside a later submit()'s
           args.
 ```
 
 Worker-side, `executor_wrapper`/`reducer_wrapper` actually return a `RawOutcome` (`status`,
 `resources`, `file | traceback`) - the distributor-agnostic value produced before a `result_id`
-exists. A distributor attaches the `result_id` it assigned at `submit()` time via
+is attached. A distributor attaches the `result_id` it was given at `submit()` time via
 `RawOutcome.to_outcome(result_id)` to produce the `Outcome` it hands back from `wait()`.
 
 ## Distributors
@@ -560,20 +566,20 @@ the protocol.
   plain file copy and `add_file()` is a no-op. Env vars from `set_env_var` are applied inside
   each worker call, so they take effect regardless of when the pool forked its workers.
 - Every result lands at a real path the moment it's produced, so `checkpoint_path()` is a
-  lookup, no copy. *Which* directory depends on `is_checkpoint`: an ordinary result lands under
-  `work_dir` (scratch - a fresh temp directory removed on `shutdown()` unless the caller
-  supplied its own), named after its `result_id`; a checkpoint lands under the constructor's
-  `checkpoint_dir` (default `"checkpoints"`, matching TaskVineDistributor), which `shutdown()`
-  never removes, named from `uuid4().hex`. The uuid naming matters because `result_id` restarts
-  at 1 with every new distributor instance while `checkpoint_dir` persists across runs - a
-  `result_id`-derived name could collide with (and overwrite) a still-live checkpoint from an
-  earlier run. `work_dir` has no such risk, since it is wiped every run. The directory split is
-  what makes restart possible: a checkpoint must still exist, at the path recorded in the
-  checkpoint store, the next time the same `results_dir`/`db_path` is used.
-- `adopt_checkpoint(path)` - the reference implementation of the protocol method - just mints a
-  fresh `result_id` and records `path` under it (workers share the filesystem, so `path` is
-  usable as-is); the seeded item is then released/retrieved/resubmitted through exactly the same
-  code paths as a this-run result.
+  lookup, no copy. Every result's on-disk filename is its own fresh `uuid4().hex`, independent of
+  `result_id` - *which directory* it lands in is what depends on `is_checkpoint`: an ordinary
+  result lands under `work_dir` (scratch - a fresh temp directory removed on `shutdown()` unless
+  the caller supplied its own), a checkpoint under the constructor's `checkpoint_dir` (default
+  `"checkpoints"`, matching TaskVineDistributor), which `shutdown()` never removes. Minting the
+  filename itself, rather than deriving it from `result_id`, keeps a checkpoint's name safe from
+  collision with a still-live checkpoint from an earlier run regardless of what the caller's
+  `result_id`s look like. The directory split is what makes restart possible: a checkpoint must
+  still exist, at the path recorded in the checkpoint store, the next time the same
+  `results_dir`/`db_path` is used.
+- `adopt_checkpoint(result_id, path)` - the reference implementation of the protocol method -
+  just records `path` under `result_id` (workers share the filesystem, so `path` is usable
+  as-is); the seeded item is then released/retrieved/resubmitted through exactly the same code
+  paths as a this-run result.
 - `func`/`args` are cloudpickled before crossing into the subprocess, so
   `processor`/`reducer`/etc. may be closures or lambdas, not just module-level callables.
 - Priority is best-effort only: a pending call waits in a priority queue until a worker slot is
@@ -595,13 +601,14 @@ Runs vine_reduce across a real cluster of machines via
   the manager or each other, so a real path can't stand in for `Outcome.file`. Every result
   becomes either a `manager.declare_temp()` file, kept at/near the worker that produced it, or -
   when `submit(..., is_checkpoint=True)` - a `manager.declare_file(path, cache=True)` file with
-  `path` a fresh `uuid4().hex` name under the constructor's `checkpoint_dir` (uuid-based for the
-  same cross-run collision reason as LocalDistributor). TaskVine transfers a `declare_file()`
-  output back to the manager unconditionally as soon as the task completes (unlike a temp file,
-  which stays remote until fetched), so a checkpoint is already durably on local disk by the
-  time `wait()` reports success - `checkpoint_path(result_id)` is a lookup, no copy. Either way,
-  `Outcome.file` is an opaque token this class mints (e.g. `"result_7.p"`), never the real
-  location. When that token later appears in a `submit()` call's args (a `reducer_wrapper`
+  `path` a fresh `uuid4().hex` name under the constructor's `checkpoint_dir` (minted independently
+  of `result_id`, for the same cross-run collision reason as LocalDistributor). TaskVine transfers
+  a `declare_file()` output back to the manager unconditionally as soon as the task completes
+  (unlike a temp file, which stays remote until fetched), so a checkpoint is already durably on
+  local disk by the time `wait()` reports success - `checkpoint_path(result_id)` is a lookup, no
+  copy. Either way, `Outcome.file` is an opaque token this class derives from `result_id` (e.g.
+  `"result_<uuid>.p"`), never the real location. When that token later appears in a `submit()`
+  call's args (a `reducer_wrapper`
   `input_files` entry), it is recognized by lookup, the underlying `vine.File` is attached as a
   task input under a fresh sandbox name, and that name is substituted into the args actually
   sent - the remote wrapper opens a name that exists in its own sandbox, never the manager-side
@@ -613,8 +620,9 @@ Runs vine_reduce across a real cluster of machines via
   disk. It is also called internally for a task that fails or is resource-exhausted (not just a
   `Success`), since that task's declared file/checkpoint bookkeeping would otherwise leak for
   the rest of the run.
-- **Adoption, not sniffing.** `adopt_checkpoint(path)` mints a token/`result_id` exactly like
-  `submit()` would, declares `path` under it (`cache=True`), and records its checkpoint path -
+- **Adoption, not sniffing.** `adopt_checkpoint(result_id, path)` derives a token from
+  `result_id` exactly like `submit()` would, declares `path` under it (`cache=True`), and records
+  its checkpoint path -
   so a restart-seeded item flows through remapping/release/retrieve with zero special cases, and
   `_remap_files` only ever matches known tokens, never guesses from path-shaped strings.
 - **Infra-level resource exhaustion is mapped, not just Python-level.** TaskVine's resource

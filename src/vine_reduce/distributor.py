@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Literal, Protocol
 
-from .types import Outcome, ResultHandle
+from .types import Outcome
 
 TaskKind = Literal["processor", "reducer"]
 
@@ -29,25 +29,29 @@ class Distributor(Protocol):
 
     def submit(
         self,
+        result_id: str,
         priority: int,
         category: str,
         kind: TaskKind,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
-    ) -> int:
-        """Submit a call for remote execution. Larger priority runs first.
-        category groups calls belonging to the same processing/reduction set
-        (e.g. for logging or scheduling heuristics). kind says whether this is
-        a processor or reducer call, so a distributor can apply different
-        resource requests to each. is_checkpoint marks a call whose result
-        vine_reduce needs to survive independently of whatever produced it -
-        a non-final checkpoint or a final result (see PLAN.md's "Temporary
-        Results, Checkpoints, and Restart") - so a distributor that
-        distinguishes durable from disposable storage (e.g.
-        TaskVineDistributor's vine_file(cache=True) vs vine_temp()) knows
-        which to use; a distributor with only one kind of storage can ignore
-        it. Returns a result_id."""
+    ) -> None:
+        """Submit a call for remote execution, identified by result_id - a
+        caller-minted id (see PLAN.md), unique for the lifetime of this
+        distributor, that release_result/retrieve/checkpoint_path and the
+        matching Outcome.result_id will use to refer back to this call.
+        Larger priority runs first. category groups calls belonging to the
+        same processing/reduction set (e.g. for logging or scheduling
+        heuristics). kind says whether this is a processor or reducer call,
+        so a distributor can apply different resource requests to each.
+        is_checkpoint marks a call whose result vine_reduce needs to survive
+        independently of whatever produced it - a non-final checkpoint or a
+        final result (see PLAN.md's "Temporary Results, Checkpoints, and
+        Restart") - so a distributor that distinguishes durable from
+        disposable storage (e.g. TaskVineDistributor's vine_file(cache=True)
+        vs vine_temp()) knows which to use; a distributor with only one kind
+        of storage can ignore it."""
         ...
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
@@ -55,7 +59,7 @@ class Distributor(Protocol):
         return None if timeout elapses first."""
         ...
 
-    def release_result(self, result_id: int) -> None:
+    def release_result(self, result_id: str) -> None:
         """Release any resources (e.g. worker-local files) held for
         result_id. This is a hard requirement, not just cleanup: for a
         result submitted with is_checkpoint=True (or adopted via
@@ -66,28 +70,29 @@ class Distributor(Protocol):
         rather than deleting checkpoint files itself."""
         ...
 
-    def adopt_checkpoint(self, path: str) -> ResultHandle:
+    def adopt_checkpoint(self, result_id: str, path: str) -> str:
         """Register `path` - an existing durable checkpoint file written by
-        a previous run and recorded in the checkpoint store - as if it were
-        a completed Success result of this run submitted with
-        is_checkpoint=True. The returned handle's result_id is valid for
+        a previous run and recorded in the checkpoint store - under
+        result_id, as if it were a completed Success result of this run
+        submitted with is_checkpoint=True. result_id becomes valid for
         release_result/retrieve/checkpoint_path (checkpoint_path returns
-        `path`), and its file may appear in later submit() args exactly like
-        an Outcome.file."""
+        `path`). Returns the distributor's own handle for the file - the
+        same kind of value as Outcome.file - which the caller wraps into a
+        ResultHandle for use inside a later submit()'s args."""
         ...
 
     def capacity(self) -> int:
         """How many more chunks the distributor could usefully accept right now."""
         ...
 
-    def retrieve(self, result_id: int, dest_path: str) -> None:
+    def retrieve(self, result_id: str, dest_path: str) -> None:
         """Copy the file for a completed (Success) result_id to dest_path, a
         path local to the vine_reduce process. Used for final results, whose
         location (results_dir) and naming are vine_reduce's own convention,
         independent of the distributor."""
         ...
 
-    def checkpoint_path(self, result_id: int) -> str:
+    def checkpoint_path(self, result_id: str) -> str:
         """Local, durable on-disk path for a completed (Success) result_id
         that was submitted with is_checkpoint=True. Unlike retrieve(), the
         distributor chooses this path itself (e.g. TaskVineDistributor's own

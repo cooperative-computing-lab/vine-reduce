@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from uuid import uuid4
 
 import ndcctools.taskvine as vine
 import pytest
@@ -55,7 +56,9 @@ def distributor(monkeypatch, tmp_path):
 
 
 def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
-    return distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         priority,
         "test:process",
         "processor",
@@ -69,6 +72,7 @@ def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
         simple_executor,
         is_checkpoint=is_checkpoint,
     )
+    return result_id
 
 
 def test_submit_and_wait_round_trip(distributor, tmp_path):
@@ -153,7 +157,9 @@ def test_failed_task_reports_real_traceback_not_output_missing(distributor):
     missing" RuntimeFailure with no traceback, which is what happens if the
     declared dest_file output isn't produced on failure (see defaults.py's
     _run_and_wrap)."""
-    result_id = distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         1,
         "test:process",
         "processor",
@@ -218,7 +224,9 @@ def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
     shipped.write_text("hello from add_file")
     distributor.add_file(str(shipped))
 
-    result_id = distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         1,
         "test:process",
         "processor",
@@ -243,7 +251,9 @@ def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
 def test_set_env_var_is_visible_to_every_task(distributor, tmp_path):
     distributor.set_env_var("VINE_REDUCE_TEST_VAR", "abc123")
 
-    result_id = distributor.submit(
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
         1,
         "test:process",
         "processor",
@@ -279,7 +289,9 @@ def test_reduction_chains_across_two_tasks(distributor, tmp_path):
 
     file_a, file_b = outcomes[id_a].file, outcomes[id_b].file
 
-    reduce_id = distributor.submit(
+    reduce_id = uuid4().hex
+    distributor.submit(
+        reduce_id,
         10,
         "test:reduce",
         "reducer",
@@ -300,26 +312,29 @@ def test_reduction_chains_across_two_tasks(distributor, tmp_path):
 
 def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, tmp_path):
     """A seeded checkpoint adopted via adopt_checkpoint must behave exactly
-    like a this-run checkpoint from then on: its handle.file remaps/declares
+    like a this-run checkpoint from then on: its file token remaps/declares
     as a task input, the reduction using it succeeds, and release_result
     undeclares it and removes it from disk - no special-casing needed."""
     seeded_path = str(tmp_path / "checkpoints" / "seeded.p")
     os.makedirs(os.path.dirname(seeded_path), exist_ok=True)
     serialization.dump(100, seeded_path)  # stands in for a prior run's checkpoint
 
-    handle = distributor.adopt_checkpoint(seeded_path)
-    assert handle.file in distributor._files_by_key
+    adopted_id = uuid4().hex
+    file = distributor.adopt_checkpoint(adopted_id, seeded_path)
+    assert file in distributor._files_by_key
 
     _submit_chunk(distributor, 1, Chunk("b.root", 0, 3))
     outcome_b = distributor.wait(timeout=WAIT_TIMEOUT)
 
-    reduce_id = distributor.submit(
+    reduce_id = uuid4().hex
+    distributor.submit(
+        reduce_id,
         10,
         "test:reduce",
         "reducer",
         reducer_wrapper,
         sum_reducer,
-        [handle.file, outcome_b.file],
+        [file, outcome_b.file],
         True,
         None,
     )
@@ -331,16 +346,15 @@ def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, 
     distributor.retrieve(reduce_outcome.result_id, str(dest))
     assert serialization.load(str(dest)) == 100 + 3
 
-    distributor.release_result(handle.result_id)
-    assert handle.file not in distributor._files_by_key
+    distributor.release_result(adopted_id)
+    assert file not in distributor._files_by_key
     assert not os.path.exists(seeded_path)
 
 
 def test_checkpoint_filenames_never_collide_across_restarts(monkeypatch, tmp_path):
-    """§2.7: both distributor instances' result_id/token counters start at
-    1, but a fresh instance's counter must not be able to mint an on-disk
-    checkpoint filename that collides with one still-live from an earlier
-    instance/run against the same checkpoint_dir."""
+    """§2.7: a fresh distributor instance must not be able to mint an
+    on-disk checkpoint filename that collides with one still-live from an
+    earlier instance/run against the same checkpoint_dir."""
     monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
     checkpoint_dir = str(tmp_path / "checkpoints")
 

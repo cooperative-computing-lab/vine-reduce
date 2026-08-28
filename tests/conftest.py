@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pytest
 
-from vine_reduce.types import RawOutcome, ResultHandle
+from vine_reduce.types import RawOutcome
 
 
 class FakeDistributor:
@@ -22,25 +22,23 @@ class FakeDistributor:
     def __init__(self, work_dir: str, capacity_amount: int = 1000):
         self._work_dir = work_dir
         self._capacity_amount = capacity_amount
-        self._next_id = itertools.count(1)
         self._seq = itertools.count()
-        self._ready: list[tuple[int, int, int, RawOutcome]] = []
-        self._files: dict[int, str] = {}
+        self._ready: list[tuple[int, int, str, RawOutcome]] = []
+        self._files: dict[str, str] = {}
 
     def submit(
         self,
+        result_id: str,
         priority: int,
         category: str,
         kind: str,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
-    ) -> int:
-        result_id = next(self._next_id)
+    ) -> None:
         dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
         raw: RawOutcome = func(dest_file, *args)
         heapq.heappush(self._ready, (-priority, next(self._seq), result_id, raw))
-        return result_id
 
     def wait(self, timeout: float | None = None):
         if not self._ready:
@@ -50,26 +48,25 @@ class FakeDistributor:
             self._files[result_id] = raw.file
         return raw.to_outcome(result_id)
 
-    def release_result(self, result_id: int) -> None:
+    def release_result(self, result_id: str) -> None:
         path = self._files.pop(result_id, None)
         if path is not None and os.path.exists(path):
             os.remove(path)
 
-    def adopt_checkpoint(self, path: str) -> ResultHandle:
-        """Mirror LocalDistributor.adopt_checkpoint: mint a result_id for an
-        existing on-disk checkpoint file, so it can be released/retrieved/
-        checkpointed exactly like a this-run result."""
-        result_id = next(self._next_id)
+    def adopt_checkpoint(self, result_id: str, path: str) -> str:
+        """Mirror LocalDistributor.adopt_checkpoint: register an existing
+        on-disk checkpoint file under result_id, so it can be released/
+        retrieved/checkpointed exactly like a this-run result."""
         self._files[result_id] = path
-        return ResultHandle(result_id, path)
+        return path
 
     def capacity(self) -> int:
         return self._capacity_amount
 
-    def retrieve(self, result_id: int, dest_path: str) -> None:
+    def retrieve(self, result_id: str, dest_path: str) -> None:
         shutil.copy(self._files[result_id], dest_path)
 
-    def checkpoint_path(self, result_id: int) -> str:
+    def checkpoint_path(self, result_id: str) -> str:
         return self._files[result_id]
 
 
