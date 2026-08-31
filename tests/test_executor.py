@@ -159,6 +159,18 @@ def test_num_workers_uses_distributor_cores_when_reported():
     assert _num_workers({"cores": 3}) == 3
 
 
-def test_num_workers_falls_back_to_machine_cores():
+def test_num_workers_falls_back_to_cores_env_var(monkeypatch):
+    monkeypatch.setenv("CORES", "5")
+    assert _num_workers(None) == 5
+    assert _num_workers({}) == 5
+
+
+def test_num_workers_distributor_cores_beats_cores_env_var(monkeypatch):
+    monkeypatch.setenv("CORES", "5")
+    assert _num_workers({"cores": 3}) == 3
+
+
+def test_num_workers_falls_back_to_machine_cores(monkeypatch):
+    monkeypatch.delenv("CORES", raising=False)
     assert _num_workers(None) == (os.process_cpu_count() or 1)
     assert _num_workers({}) == (os.process_cpu_count() or 1)

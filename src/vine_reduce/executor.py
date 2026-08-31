@@ -229,10 +229,14 @@ class CloudpickleExecutor:
 
 
 def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
-    """The task's own core allocation, as reported by the distributor, or
-    every core on the machine if the distributor doesn't report one."""
+    """The task's own core allocation, as reported by the distributor;
+    falling back to the CORES environment variable (set by some batch
+    systems/worker launchers), then every core on the machine, if the
+    distributor doesn't report one."""
     if distributor_metadata and "cores" in distributor_metadata:
         return distributor_metadata["cores"]
+    if "CORES" in os.environ:
+        return int(os.environ["CORES"])
     return os.process_cpu_count() or 1
 
 
@@ -242,8 +246,8 @@ class DaskExecutor:
     execution site, on dask's "processes" scheduler backed by a
     CloudpickleProcessPoolExecutor created (and torn down) per call, with one
     subprocess per core allocated to this task - num_workers from the
-    constructor if given, else distributor_metadata["cores"] (see
-    _num_workers). dask is not a vine_reduce dependency; it must already be
+    constructor if given, else the distributor/environment/machine core
+    count (see _num_workers). dask is not a vine_reduce dependency; it must already be
     installed wherever this executor actually runs. Holds no state between
     calls, so trivially picklable; shutdown() is a no-op."""
 
