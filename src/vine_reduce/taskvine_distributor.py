@@ -213,6 +213,15 @@ class TaskVineDistributor:
         self._files_by_key[dest_token] = result_file
         self._in_flight_by_taskvine_id[taskvine_id] = _InFlight(result_id=result_id, kind=kind)
 
+    def resources(self, kind: TaskKind) -> dict[str, Any] | None:
+        """The configured resources_processor/resources_reducer dict for
+        kind, e.g. {"cores": ...} - see the Distributor protocol docstring.
+        This is the category's cap, not necessarily what a given task
+        actually gets; TaskVine's own allocation, decided at dispatch time,
+        may be less, and takes precedence via the CORES environment variable
+        it sets on the worker (see DaskExecutor's _num_workers)."""
+        return self._resources_by_kind.get(kind) or None
+
     def _configure_category(self, category: str, kind: TaskKind) -> None:
         """Apply resources_processor/resources_reducer to `category` in
         TaskVine, once, the first time that category is submitted to -

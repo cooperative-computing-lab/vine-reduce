@@ -155,19 +155,23 @@ def test_dask_executor_raising_fn_surfaces_from_result_not_submit():
         future.result()
 
 
-def test_num_workers_uses_distributor_cores_when_reported():
+def test_num_workers_uses_distributor_cores_when_reported(monkeypatch):
+    monkeypatch.delenv("CORES", raising=False)
     assert _num_workers({"cores": 3}) == 3
 
 
-def test_num_workers_falls_back_to_cores_env_var(monkeypatch):
+def test_num_workers_uses_cores_env_var_when_distributor_reports_nothing(monkeypatch):
     monkeypatch.setenv("CORES", "5")
     assert _num_workers(None) == 5
     assert _num_workers({}) == 5
 
 
-def test_num_workers_distributor_cores_beats_cores_env_var(monkeypatch):
+def test_num_workers_cores_env_var_beats_distributor_metadata(monkeypatch):
+    """CORES reflects the execution site's real, dispatch-time allocation
+    (e.g. TaskVine's worker), which may be less than distributor_metadata's
+    static cap - so it takes precedence."""
     monkeypatch.setenv("CORES", "5")
-    assert _num_workers({"cores": 3}) == 3
+    assert _num_workers({"cores": 3}) == 5
 
 
 def test_num_workers_falls_back_to_machine_cores(monkeypatch):

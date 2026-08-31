@@ -380,8 +380,14 @@ The pieces, in flow order (each is user-overridable unless noted):
   (processor, dataset).
 - **chunk_to_args** (remote function): converts a `Chunk(url, start, stop)` into the data the
   processor is applied to. Takes a mandatory `dataset_metadata` argument and an optional
-  `distributor_metadata` argument, which may carry `"resources": {"cores": ..., "memory": ...}`
-  available to the processor.
+  `distributor_metadata` argument, which may carry `{"cores": ..., ...}` - `Pipeline` fills it in
+  per submission from `distributor.resources("processor")` (see "API vine_reduce <-> distributor"),
+  a *static* cap the distributor can report ahead of dispatch (e.g. TaskVineDistributor's
+  configured category limit). This is a default only: the execution site may report a more
+  precise, real allocation at dispatch time (e.g. TaskVine's worker setting the `CORES`
+  environment variable to whatever its own scheduling algorithm actually handed this task, which
+  can be less than the configured cap) - see `DaskExecutor`'s `_num_workers` in "Executors and
+  remote environments", which prefers that over `distributor_metadata`.
 - **executor** (remote object): an `Executor` protocol instance (`submit`/`map`/`shutdown`, named
   after `concurrent.futures.Executor`) that calls the processor on `chunk_to_args`' output.
   `executor_wrapper` calls `executor.submit(processor, args, dataset_metadata=...,
@@ -438,6 +444,16 @@ file = adopt_checkpoint(result_id, path): register path - an existing durable ch
     inside a later submit()'s args. This makes a restart-seeded pool item indistinguishable from
     one this run produced: one release channel and one file-cleanup owner cover both cases, with
     no distributor-side guessing about which task arguments are restart-seeded on-disk paths.
+metadata = resources(kind): a default resource dict (e.g. {"cores": ...}) for calls of this kind,
+    or None if this distributor has no meaningful default. A static cap known ahead of dispatch
+    (e.g. TaskVineDistributor's configured category limit via resources_processor/
+    resources_reducer; LocalDistributor always reports {"cores": 1}, since it runs on the same
+    machine as vine_reduce itself, often a shared frontend). Pipeline calls this once per
+    processor submission and passes the result as chunk_to_args/executor_wrapper's
+    distributor_metadata argument - see "Data Flow". It is a fallback default only: the execution
+    site itself may report a more precise, real allocation at dispatch time (e.g. TaskVine's
+    worker setting the CORES environment variable), which DaskExecutor's _num_workers prefers
+    over this value.
 chunks_wanted = capacity(): number of additional chunks the distributor could usefully accept
     right now.
 retrieve(result_id, dest_path): copy/materialize the file for a completed (Success) result_id to
@@ -586,6 +602,9 @@ the protocol.
   `processor`/`reducer`/etc. may be closures or lambdas, not just module-level callables.
 - Priority is best-effort only: a pending call waits in a priority queue until a worker slot is
   free, but once dispatched it cannot be preempted by a higher-priority call submitted later.
+- `resources(kind)` always returns `{"cores": 1}`: this runs on the same machine as vine_reduce
+  itself, often a shared frontend, so a task must not assume it can use every core in the pool -
+  one pool slot is meant to hold one task's work.
 
 ### TaskVineDistributor (`src/vine_reduce/taskvine_distributor.py`)
 
@@ -638,7 +657,11 @@ Runs vine_reduce across a real cluster of machines via
   an optional `{"cores", "memory_mb", "disk_mb"}` dict) are constructor args, applied via
   `manager.set_category_resources_max(category, ...)` the first time each distinct category
   string is seen. `submit()`'s `kind` parameter selects which of the two applies, since the
-  caller-supplied category string is not a reliable signal on its own.
+  caller-supplied category string is not a reliable signal on its own. `resources(kind)` exposes
+  the same dict to vine_reduce (via `distributor_metadata`, see "API vine_reduce <-> distributor")
+  as a configured cap - TaskVine's own scheduling algorithm, run manager-side at dispatch time,
+  decides the real per-task allocation, which can be less; its worker reports that decision via
+  the `CORES` environment variable, which `DaskExecutor` prefers over this cap.
 - `add_file`/`set_env_var` remember what's been added and attach it
   (`declare_file`/`add_input`, `set_env_var`) to every task submitted from then on. An optional
   poncho `environment` (see "Executors and remote environments") is likewise attached to every

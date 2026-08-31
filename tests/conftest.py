@@ -60,6 +60,9 @@ class FakeDistributor:
         self._files[result_id] = path
         return path
 
+    def resources(self, kind: str) -> dict[str, Any] | None:
+        return None
+
     def capacity(self) -> int:
         return self._capacity_amount
 

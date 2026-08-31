@@ -153,6 +153,13 @@ class LocalDistributor:
         self._files[result_id] = path
         return path
 
+    def resources(self, kind: str) -> dict[str, Any] | None:
+        """Always {"cores": 1} - see the Distributor protocol docstring.
+        This runs on the same machine as vine_reduce itself (often a shared
+        frontend), so a task must not assume it can use every core in the
+        pool; one pool slot is meant to hold one task's work."""
+        return {"cores": 1}
+
     def capacity(self) -> int:
         """Room left before the pool + its pending queue reaches twice
         max_workers, this distributor's target queue depth."""

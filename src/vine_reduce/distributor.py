@@ -81,6 +81,18 @@ class Distributor(Protocol):
         ResultHandle for use inside a later submit()'s args."""
         ...
 
+    def resources(self, kind: TaskKind) -> dict[str, Any] | None:
+        """A default resource dict (e.g. {"cores": ...}) for calls of this
+        kind, or None if this distributor has no meaningful default. This is
+        a static cap known ahead of dispatch (e.g. TaskVineDistributor's
+        configured category limit) - vine_reduce passes it as
+        distributor_metadata into executor_wrapper/chunk_to_args/executor,
+        for use as a fallback where the execution site itself doesn't report
+        a more precise, real allocation (e.g. TaskVine's worker setting the
+        CORES environment variable at dispatch time, which may be less than
+        this cap - see DaskExecutor's _num_workers)."""
+        ...
+
     def capacity(self) -> int:
         """How many more chunks the distributor could usefully accept right now."""
         ...

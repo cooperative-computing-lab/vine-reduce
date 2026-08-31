@@ -341,7 +341,7 @@ class Pipeline:
             self._processor,
             chunk,
             self._dataset_metadata,
-            None,
+            self._distributor.resources("processor"),
             None,
             self._chunk_to_args,
             self._executor,

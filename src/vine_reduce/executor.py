@@ -229,14 +229,17 @@ class CloudpickleExecutor:
 
 
 def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
-    """The task's own core allocation, as reported by the distributor;
-    falling back to the CORES environment variable (set by some batch
-    systems/worker launchers), then every core on the machine, if the
-    distributor doesn't report one."""
-    if distributor_metadata and "cores" in distributor_metadata:
-        return distributor_metadata["cores"]
+    """The task's actual core allocation, preferring the CORES environment
+    variable - set by the execution site itself (e.g. TaskVine's worker) at
+    dispatch time, so it reflects what was really handed to this task, which
+    may be less than any configured cap. Falls back to
+    distributor_metadata["cores"] - a static default the distributor can
+    report ahead of dispatch (e.g. TaskVineDistributor's configured category
+    cap) - then every core on the machine, if neither is available."""
     if "CORES" in os.environ:
         return int(os.environ["CORES"])
+    if distributor_metadata and "cores" in distributor_metadata:
+        return distributor_metadata["cores"]
     return os.process_cpu_count() or 1
 
 
