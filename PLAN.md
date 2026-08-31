@@ -700,9 +700,15 @@ once in the local process and cloudpickled fresh into every remote call, where
 an implementation holds (e.g. a process pool) must be created lazily and dropped before
 pickling, so a configured instance always pickles cleanly. `SimpleExecutor()` (default) calls
 `processor(args)` directly; `CloudpickleExecutor()` isolates the call in its own subprocess so a
-crash or memory leak in `processor` doesn't take down the worker task; `DaskExecutor()` is for a
-`processor` that returns a dask-delayed object (or array/dataframe) and computes it at the
-execution site. See the README's "Executors" section for the full rundown.
+crash or memory leak in `processor` doesn't take down the worker task; `DaskExecutor(num_workers=
+None)` is for a `processor` that returns a dask-delayed object (or array/dataframe) and computes
+it at the execution site, via `.compute(num_workers=...)`. If `num_workers` isn't given explicitly,
+`_num_workers` resolves it in priority order: the `CORES` environment variable, when set - the
+execution site's own report, at dispatch time, of what it actually handed this task (e.g.
+TaskVine's worker, echoing its manager's real per-task scheduling decision, which can be less than
+any configured cap); else `distributor_metadata["cores"]`, the distributor's static default (see
+"API vine_reduce <-> distributor"); else every core on the machine
+(`os.process_cpu_count()`). See the README's "Executors" section for the full rundown.
 
 Workers need nothing beyond a distributor pre-installed. `get_environment()`
 (`src/vine_reduce/remote_environment.py`) packs the calling conda environment (`$CONDA_PREFIX`
