@@ -9,6 +9,7 @@ from vine_reduce.defaults import (
     make_default_is_result,
     reducer_wrapper,
 )
+from vine_reduce.executor import SimpleExecutor
 from vine_reduce.types import Chunk
 
 from helpers import (
@@ -74,7 +75,7 @@ def test_executor_wrapper_success(tmp_path):
         None,
         None,
         lambda c, dm, dmeta=None: c,
-        lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
+        SimpleExecutor(),
     )
     assert outcome.status == "success"
     assert outcome.file == dest
@@ -93,7 +94,7 @@ def test_executor_wrapper_failure_captures_traceback(tmp_path):
         None,
         None,
         lambda c, dm, dmeta=None: c,
-        lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
+        SimpleExecutor(),
     )
     assert outcome.status == "failure"
     assert "ValueError: boom" in outcome.traceback
@@ -115,7 +116,7 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
         None,
         None,
         lambda c, dm, dmeta=None: c,
-        lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
+        SimpleExecutor(),
     )
     assert outcome.status == "exhausted"
     assert os.path.exists(dest)
@@ -135,7 +136,7 @@ def test_executor_wrapper_unpicklable_result_becomes_failure(tmp_path):
         None,
         None,
         lambda c, dm, dmeta=None: c,
-        lambda proc, args, dm, dmeta=None, emeta=None: proc(args),
+        SimpleExecutor(),
     )
     assert outcome.status == "failure"
     assert outcome.traceback is not None

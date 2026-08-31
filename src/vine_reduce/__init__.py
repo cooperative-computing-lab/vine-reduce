@@ -4,14 +4,17 @@ PLAN.md for the full design and the README for usage.
 Re-exports the package's public API: VineReduce/VineReduceError (engine.py),
 Distributor (the interface a distributor implements), LocalDistributor and
 TaskVineDistributor (the two Distributor implementations shipped here),
-get_environment/UnstagedChanges (remote_environment.py), and the Chunk/
-Outcome family of types shared between vine_reduce and a distributor.
+Executor (the interface an executor implements) and its SimpleExecutor/
+CloudpickleExecutor/DaskExecutor implementations, get_environment/
+UnstagedChanges (remote_environment.py), and the Chunk/Outcome family of
+types shared between vine_reduce and a distributor.
 """
 
 from typing import TYPE_CHECKING
 
 from .distributor import Distributor
 from .engine import VineReduce
+from .executor import CloudpickleExecutor, DaskExecutor, Executor, SimpleExecutor
 from .local_distributor import LocalDistributor
 from .pipeline import VineReduceError
 from .remote_environment import UnstagedChanges, get_environment
@@ -22,12 +25,16 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Chunk",
+    "CloudpickleExecutor",
+    "DaskExecutor",
     "Distributor",
+    "Executor",
     "LocalDistributor",
     "Outcome",
     "RawOutcome",
     "ResourceExhaustion",
     "RuntimeFailure",
+    "SimpleExecutor",
     "Success",
     "TaskVineDistributor",
     "UnstagedChanges",

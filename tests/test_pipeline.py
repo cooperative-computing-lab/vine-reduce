@@ -6,7 +6,7 @@ import pytest
 
 from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointRecord, CheckpointStore
-from vine_reduce.executor import simple_executor
+from vine_reduce.executor import SimpleExecutor
 from vine_reduce.pipeline import Pipeline, PoolItem, VineReduceError, plan_restart
 from vine_reduce.types import Chunk, ResultHandle
 
@@ -49,7 +49,7 @@ def make_pipeline(
             db=db,
             datasets_to_chunks=defaults.default_datasets_to_chunks,
             chunk_to_args=defaults.default_chunk_to_args,
-            executor=simple_executor,
+            executor=SimpleExecutor(),
             executor_wrapper=defaults.executor_wrapper,
             reducer=reducer,
             reducer_wrapper=defaults.reducer_wrapper,

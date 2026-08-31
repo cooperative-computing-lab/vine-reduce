@@ -9,8 +9,8 @@ Functions in this file run in two different places:
     may be closures or lambdas, and result files are compressed on disk.
 
 The `executor` step itself (what executor_wrapper calls to actually run
-processor(args)) lives in executor.py, not here - see simple_executor,
-cloudpickle_executor, and dask_executor.
+processor(args)) lives in executor.py, not here - see SimpleExecutor,
+CloudpickleExecutor, and DaskExecutor.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import traceback as traceback_module
 from typing import Any, Callable, Iterator
 
 from . import serialization
+from .executor import Executor
 from .types import Chunk, RawOutcome
 
 
@@ -120,14 +121,23 @@ def executor_wrapper(
     distributor_metadata: dict[str, Any] | None,
     executor_metadata: dict[str, Any] | None,
     chunk_to_args: Callable[..., Any],
-    executor: Callable[..., Any],
+    executor: Executor,
 ) -> RawOutcome:
-    """Runs remotely. Calls chunk_to_args then executor, measures resources,
-    and serializes the processing result to dest_file on success."""
+    """Runs remotely. Calls chunk_to_args then executor.submit, measures
+    resources, and serializes the processing result to dest_file on
+    success. executor is a fresh, just-deserialized copy for this call
+    alone - shut down via `with executor:` once run() returns."""
 
     def run() -> Any:
         args = chunk_to_args(chunk, dataset_metadata, distributor_metadata)
-        return executor(processor, args, dataset_metadata, distributor_metadata, executor_metadata)
+        with executor:
+            return executor.submit(
+                processor,
+                args,
+                dataset_metadata=dataset_metadata,
+                distributor_metadata=distributor_metadata,
+                executor_metadata=executor_metadata,
+            ).result()
 
     return _run_and_wrap(dest_file, run)
 

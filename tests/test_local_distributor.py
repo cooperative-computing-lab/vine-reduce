@@ -7,7 +7,7 @@ import pytest
 
 from vine_reduce import serialization
 from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
-from vine_reduce.executor import simple_executor
+from vine_reduce.executor import SimpleExecutor
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.types import Chunk, Success
 
@@ -39,7 +39,7 @@ def _submit_chunk(distributor, priority, chunk):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
     )
     return result_id
 
@@ -107,7 +107,7 @@ def test_checkpoint_result_is_written_to_checkpoint_dir_not_work_dir(distributor
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
         is_checkpoint=True,
     )
 
@@ -138,7 +138,7 @@ def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
         is_checkpoint=True,
     )
     outcome = dist.wait(timeout=30)
@@ -221,7 +221,7 @@ def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp
                 None,
                 None,
                 default_chunk_to_args,
-                simple_executor,
+                SimpleExecutor(),
                 is_checkpoint=True,
             )
             outcome = dist.wait(timeout=30)
@@ -250,7 +250,7 @@ def test_set_env_var_is_visible_to_submitted_calls(distributor):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
     )
     outcome = distributor.wait(timeout=30)
 

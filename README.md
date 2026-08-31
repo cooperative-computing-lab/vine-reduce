@@ -73,19 +73,36 @@ vr.compute()
 ## Executors
 
 `chunk_to_args`'s output for a chunk becomes the argument each processor
-call runs remotely on. The `executor` argument to `VineReduce` controls how
-that call actually runs, at the execution site:
+call runs remotely on. The `executor` argument to `VineReduce` takes a
+constructed `Executor` instance — mirroring how `distributor` takes a
+constructed `Distributor` instance — that controls how that call actually
+runs, at the execution site. It's configured once, in the local process, and
+cloudpickled into every remote call, where `defaults.executor_wrapper` uses
+it as:
 
-- `simple_executor` (default) — calls `processor(args)` directly.
-- `cloudpickle_executor` — runs `processor(args)` in its own subprocess, so a
-  crash or memory leak in `processor` doesn't take down the worker task
-  itself. Supports closures and lambdas as `processor`, unlike the stdlib
-  `pickle` a plain `ProcessPoolExecutor` would require.
-- `dask_executor` — for a `processor` that returns a dask-delayed object (or
-  dask array/dataframe) rather than a plain value; computes it at the
-  execution site using one subprocess per core allocated to the task. `dask`
-  is not a `vine_reduce` dependency and must already be installed wherever
-  this executor runs.
+```python
+executor.submit(
+    processor, args,
+    dataset_metadata=..., distributor_metadata=..., executor_metadata=...,
+).result()
+```
+
+`Executor` follows `concurrent.futures.Executor`'s `submit`/`map`/`shutdown`
+shape (and is usable as a context manager), though `submit`/`map` take the
+three metadata dicts above as extra keyword arguments.
+
+- `SimpleExecutor()` (default) — calls `processor(args)` directly.
+- `CloudpickleExecutor(max_workers=1)` — runs `processor(args)` in its own
+  subprocess, so a crash or memory leak in `processor` doesn't take down the
+  worker task itself. Supports closures and lambdas as `processor`, unlike
+  the stdlib `pickle` a plain `ProcessPoolExecutor` would require. A
+  `max_workers` above 1 lets `map()` run items in parallel.
+- `DaskExecutor(num_workers=None)` — for a `processor` that returns a
+  dask-delayed object (or dask array/dataframe) rather than a plain value;
+  computes it at the execution site using `num_workers` subprocesses, or (if
+  not given) one subprocess per core allocated to the task. `dask` is not a
+  `vine_reduce` dependency and must already be installed wherever this
+  executor runs.
 
 All three live in `src/vine_reduce/executor.py`.
 

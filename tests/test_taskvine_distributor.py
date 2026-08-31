@@ -13,7 +13,7 @@ from vine_reduce.defaults import (
     executor_wrapper,
     reducer_wrapper,
 )
-from vine_reduce.executor import simple_executor
+from vine_reduce.executor import SimpleExecutor
 from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token
 from vine_reduce.types import Chunk, RuntimeFailure, Success
 
@@ -69,7 +69,7 @@ def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
         is_checkpoint=is_checkpoint,
     )
     return result_id
@@ -170,7 +170,7 @@ def test_failed_task_reports_real_traceback_not_output_missing(distributor):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
     )
 
     outcome = distributor.wait(timeout=WAIT_TIMEOUT)
@@ -237,7 +237,7 @@ def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
     )
     outcome = distributor.wait(timeout=WAIT_TIMEOUT)
 
@@ -264,7 +264,7 @@ def test_set_env_var_is_visible_to_every_task(distributor, tmp_path):
         None,
         None,
         default_chunk_to_args,
-        simple_executor,
+        SimpleExecutor(),
     )
     outcome = distributor.wait(timeout=WAIT_TIMEOUT)
 

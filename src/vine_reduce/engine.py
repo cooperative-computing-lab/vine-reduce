@@ -18,7 +18,7 @@ from typing import Any, Callable
 from . import defaults
 from .checkpoint_store import CheckpointStore, checksum_dataset
 from .distributor import Distributor
-from .executor import simple_executor
+from .executor import Executor, SimpleExecutor
 from .pipeline import Pipeline, VineReduceError
 
 __all__ = ["VineReduce", "VineReduceError"]
@@ -84,9 +84,11 @@ class VineReduce:
         (e.g. opening the file and reading events); defaults to
         defaults.default_chunk_to_args, which passes the Chunk through
         unchanged. Runs remotely.
-    executor: runs `processor(args)` at the execution site - see
-        executor.py for simple_executor (default), cloudpickle_executor, and
-        dask_executor. Runs remotely.
+    executor: an Executor instance (submit/map/shutdown, named after
+        concurrent.futures.Executor) that runs `processor(args)` at the
+        execution site - see executor.py for SimpleExecutor (default),
+        CloudpickleExecutor, and DaskExecutor. Configured once here, then
+        cloudpickled into every remote call. Runs remotely.
     reducer: folds two processor outputs (or two partial reductions)
         together; must be commutative, associative, and distributive over a
         dataset's chunks. Defaults to defaults.default_reducer (`a += b`).
@@ -147,7 +149,7 @@ class VineReduce:
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] | None = None
     datasets_to_chunks: Callable | None = None
     chunk_to_args: Callable = defaults.default_chunk_to_args
-    executor: Callable = simple_executor
+    executor: Executor = field(default_factory=SimpleExecutor)
     reducer: Callable = defaults.default_reducer
     reduction_size: int | dict = 10
     is_result: Callable[[int, float, float], bool] | None = None

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor
+from .executor import Executor
 from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
 
 
@@ -160,7 +161,7 @@ class Pipeline:
         db: CheckpointStore,
         datasets_to_chunks: Callable[[dict, Callable[[], int | None], set[str]], Iterator[Chunk]],
         chunk_to_args: Callable,
-        executor: Callable,
+        executor: Executor,
         executor_wrapper: Callable,
         reducer: Callable,
         reducer_wrapper: Callable,

@@ -23,6 +23,7 @@ from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 from coffea.nanoevents import NanoAODSchema
 
 from .engine import VineReduce
+from .executor import SimpleExecutor
 from .types import Chunk
 
 T = TypeVar("T")
@@ -118,7 +119,9 @@ def _make_chunk_to_args(
 ) -> Callable[[Chunk, dict[str, Any], dict[str, Any] | None], Any]:
     """Builds a chunk_to_args that opens chunk.url at object_path and returns
     the NanoEvents for [chunk.start, chunk.stop). Runs remotely, at the
-    worker node handling the chunk."""
+    worker node handling the chunk. If distributor_metadata reports more than
+    one core for the task, the chunk's entries are split into that many
+    steps_per_file so NanoEventsFactory reads them in parallel."""
     uproot_options = dict(uproot_options or {})
 
     def chunk_to_args(
@@ -128,6 +131,8 @@ def _make_chunk_to_args(
     ) -> Any:
         from coffea.nanoevents import NanoEventsFactory
 
+        cores = (distributor_metadata or {}).get("cores", 1)
+
         return NanoEventsFactory.from_root(
             {chunk.url: object_path},
             entry_start=chunk.start,
@@ -136,27 +141,22 @@ def _make_chunk_to_args(
             schemaclass=schema,
             uproot_options=uproot_options,
             mode=mode,
+            steps_per_file=cores,
         ).events()
 
     return chunk_to_args
 
 
-def _make_executor(processor_args: Mapping[str, Any] | None) -> Callable[..., Any]:
-    """Builds an executor that calls the processor on the NanoEvents produced
-    by chunk_to_args, then materializes any virtual arrays in its result."""
-    processor_args = dict(processor_args or {})
+class CoffeaExecutor(SimpleExecutor):
+    """A SimpleExecutor that calls processor(events, **processor_args) on the
+    NanoEvents produced by chunk_to_args, then materializes any virtual
+    arrays in the result before it is pickled and sent back over the wire."""
 
-    def executor(
-        processor: Callable[..., Any],
-        events: Any,
-        dataset_metadata: dict[str, Any],
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Any:
-        result = processor(events, **processor_args)
-        return _materialize(result)
+    def __init__(self, processor_args: Mapping[str, Any] | None = None) -> None:
+        self.processor_args = dict(processor_args or {})
 
-    return executor
+    def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
+        return _materialize(fn(*args, **self.processor_args))
 
 
 def _checksum_fileset(fileset: dict[str, Any]) -> str:
@@ -242,7 +242,7 @@ class VineReduceCoffea(VineReduce):
         self.chunk_to_args = _make_chunk_to_args(
             self.schema, self.mode, self.uproot_options, self.object_path
         )
-        self.executor = _make_executor(self.processor_args)
+        self.executor = CoffeaExecutor(self.processor_args)
 
     @staticmethod
     def preprocess_cache(

@@ -5,11 +5,13 @@ import json
 import pytest
 
 from vine_reduce.coffea import (
+    CoffeaExecutor,
     VineReduceCoffea,
     _checksum_fileset,
     coffea_input_to_datasets,
     default_reducer,
 )
+from vine_reduce.types import Chunk
 
 
 def test_default_reducer_adds_plain_addables():
@@ -77,9 +79,51 @@ def test_vine_reduce_coffea_wires_chunk_to_args_and_executor():
     # chunk_to_args and executor are built in __post_init__ from schema/mode/etc,
     # so they must be present and distinct from the base VineReduce defaults.
     assert vr.chunk_to_args is not None
-    assert vr.executor is not None
+    assert isinstance(vr.executor, CoffeaExecutor)
     assert vr.reducer is default_reducer
     assert vr.input_to_datasets is coffea_input_to_datasets
+
+
+def test_chunk_to_args_defaults_steps_per_file_to_one(monkeypatch):
+    vr = VineReduceCoffea(processors={"p": lambda events: events}, input={})
+
+    captured = {}
+
+    def fake_from_root(*args, **kwargs):
+        captured.update(kwargs)
+
+        class _Fake:
+            def events(self):
+                return "events"
+
+        return _Fake()
+
+    monkeypatch.setattr("coffea.nanoevents.NanoEventsFactory.from_root", fake_from_root)
+
+    chunk = Chunk(url="a.root", start=0, stop=10)
+    vr.chunk_to_args(chunk, {}, distributor_metadata=None)
+    assert captured["steps_per_file"] == 1
+
+
+def test_chunk_to_args_uses_distributor_cores_as_steps_per_file(monkeypatch):
+    vr = VineReduceCoffea(processors={"p": lambda events: events}, input={})
+
+    captured = {}
+
+    def fake_from_root(*args, **kwargs):
+        captured.update(kwargs)
+
+        class _Fake:
+            def events(self):
+                return "events"
+
+        return _Fake()
+
+    monkeypatch.setattr("coffea.nanoevents.NanoEventsFactory.from_root", fake_from_root)
+
+    chunk = Chunk(url="a.root", start=0, stop=10)
+    vr.chunk_to_args(chunk, {}, distributor_metadata={"cores": 4})
+    assert captured["steps_per_file"] == 4
 
 
 def test_vine_reduce_coffea_executor_materializes_result():
@@ -88,8 +132,20 @@ def test_vine_reduce_coffea_executor_materializes_result():
     def processor(events):
         return {"count": len(events)}
 
-    result = vr.executor(processor, [1, 2, 3], {})
+    result = vr.executor.submit(processor, [1, 2, 3], dataset_metadata={}).result()
     assert result == {"count": 3}
+
+
+def test_vine_reduce_coffea_executor_forwards_processor_args():
+    vr = VineReduceCoffea(
+        processors={"p": lambda events: events}, input={}, processor_args={"k": 2}
+    )
+
+    def processor(events, k):
+        return len(events) * k
+
+    result = vr.executor.submit(processor, [1, 2]).result()
+    assert result == 4
 
 
 def test_coffea_input_to_datasets_raises_on_missing_num_entries():
