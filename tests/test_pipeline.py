@@ -7,10 +7,24 @@ import pytest
 from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointRecord, CheckpointStore
 from vine_reduce.executor import SimpleExecutor
-from vine_reduce.pipeline import Pipeline, PoolItem, VineReduceError, plan_restart
-from vine_reduce.types import Chunk, ResultHandle
+from vine_reduce.pipeline import (
+    Pipeline,
+    PoolItem,
+    VineReduceError,
+    _ChunkTask,
+    _ReduceTask,
+    plan_restart,
+)
+from vine_reduce.types import Chunk, ResourceExhaustion, ResultHandle
 
-from helpers import count_events, sum_reducer
+from helpers import (
+    count_events,
+    exhausting_processor,
+    failing_processor,
+    make_flaky_n_times,
+    make_flaky_reducer_n_times,
+    sum_reducer,
+)
 
 
 def flaky_processor(chunk):
@@ -36,6 +50,7 @@ def make_pipeline(
     db=None,
     dataset_name="ds",
     is_result=None,
+    attempts=3,
 ):
     db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
@@ -63,6 +78,7 @@ def make_pipeline(
             results_dir=str(tmp_path / "results"),
             process_priority=1,
             reduce_priority=2,
+            attempts=attempts,
         ),
         db,
     )
@@ -608,4 +624,159 @@ def test_resource_exhaustion_halves_chunksize_and_eventually_succeeds(fake_distr
 
     assert final_value(pipeline) == 8
     assert pipeline.chunksize < 8
+    db.close()
+
+
+def test_chunk_runtime_failure_retries_within_attempts_then_succeeds(fake_distributor, tmp_path):
+    dataset = {"files": {"a.root": 5}}
+    processor = make_flaky_n_times(2)  # fails twice, then succeeds
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, processor=processor, reduction_size=10, attempts=3
+    )
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 5
+    assert processor.calls["count"] == 3  # 2 failures + 1 success, all counted
+    db.close()
+
+
+def test_chunk_runtime_failure_exhausts_attempts_and_raises(fake_distributor, tmp_path):
+    dataset = {"files": {"a.root": 5}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, processor=failing_processor, attempts=2
+    )
+
+    with pytest.raises(VineReduceError, match=r"after 2 attempts \(attempts=2\)"):
+        run_to_completion(pipeline, fake_distributor)
+    db.close()
+
+
+def test_chunk_resource_exhaustion_at_minimum_size_raises_immediately(fake_distributor, tmp_path):
+    """Once a chunk is down to a single event, ResourceExhaustion has no
+    smaller size left to retry at - it must raise right away, regardless of
+    how much of the attempts budget remains."""
+    dataset = {"files": {"a.root": 1}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        processor=exhausting_processor,
+        chunksize=1,
+        attempts=5,
+    )
+
+    with pytest.raises(VineReduceError, match="minimum chunk size"):
+        run_to_completion(pipeline, fake_distributor)
+    db.close()
+
+
+def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor, tmp_path):
+    """A ResourceExhaustion-driven halving is a fresh start for the smaller
+    chunks it produces, not a strike against the attempts already used."""
+    dataset = {"files": {"a.root": 4}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=4, attempts=2)
+
+    chunk = Chunk("a.root", 0, 4)
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=1)  # 1 of 2 already used
+    pipeline._handle_chunk_outcome(
+        pipeline._in_flight.pop("r1"),
+        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+    )
+    assert pipeline.chunksize == 2
+    # not yet split - attempts_used still carried as-is until it actually splits
+    assert pipeline._retry_chunks == [(chunk, 1)]
+
+    next_chunk = pipeline._next_chunk()
+    assert next_chunk == (Chunk("a.root", 0, 2), 0)  # fresh budget for both halves
+    assert pipeline._retry_chunks == [(Chunk("a.root", 2, 4), 0)]
+    db.close()
+
+
+def test_reduction_runtime_failure_retries_within_attempts_then_succeeds(
+    fake_distributor, tmp_path
+):
+    dataset = {"files": {"a.root": 1, "b.root": 1}}
+    reducer = make_flaky_reducer_n_times(2)  # fails twice, then folds
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reducer=reducer, reduction_size=2, attempts=3
+    )
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 2
+    assert reducer.calls["count"] == 3
+    db.close()
+
+
+def test_reduction_runtime_failure_exhausts_attempts_and_raises(fake_distributor, tmp_path):
+    def always_fails(a, b):
+        raise ValueError("boom")
+
+    dataset = {"files": {"a.root": 1, "b.root": 1}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reducer=always_fails, reduction_size=2, attempts=2
+    )
+
+    with pytest.raises(VineReduceError, match=r"after 2 attempts \(attempts=2\)"):
+        run_to_completion(pipeline, fake_distributor)
+    db.close()
+
+
+def test_reduction_resource_exhaustion_at_minimum_size_raises_immediately(
+    fake_distributor, tmp_path
+):
+    """reduction_size=2 is already the floor - a ResourceExhaustion there
+    must raise right away, regardless of how much of the attempts budget
+    remains."""
+
+    def always_exhausts(a, b):
+        raise MemoryError("simulated resource exhaustion")
+
+    dataset = {"files": {"a.root": 1, "b.root": 1}}
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reducer=always_exhausts, reduction_size=2, attempts=5
+    )
+
+    with pytest.raises(VineReduceError, match="minimum reduction_size"):
+        run_to_completion(pipeline, fake_distributor)
+    db.close()
+
+
+def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distributor, tmp_path):
+    """A ResourceExhaustion-driven halving of reduction_size is a fresh
+    start for the disbanded items, not a strike against attempts already
+    used - see PoolItem.attempts."""
+    dataset = {"files": {f"{c}.root": 1 for c in "abcd"}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=4, attempts=2)
+
+    items = [
+        PoolItem(
+            handle=ResultHandle(f"r{i}", f"f{i}"),
+            num_events=1,
+            wall_time_s=0.0,
+            memory_mb=0.0,
+            files=frozenset({f"{c}.root"}),
+            since_checkpoint_time=0.0,
+            since_checkpoint_distance=0,
+            attempts=1,  # 1 of 2 already used
+        )
+        for i, c in enumerate("abcd")
+    ]
+    pipeline._in_flight["r"] = _ReduceTask(
+        group=items,
+        is_final=False,
+        is_checkpoint=False,
+        num_events=4,
+        total_time=0.0,
+        total_memory=0.0,
+    )
+    pipeline._handle_reduce_outcome(
+        pipeline._in_flight.pop("r"),
+        ResourceExhaustion(result_id="r", resources={}, std_output=None),
+    )
+
+    assert pipeline.reduction_size == 2
+    assert all(item.attempts == 0 for item in items)  # reset, not incremented
+    assert pipeline.pool[:4] == items
     db.close()

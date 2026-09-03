@@ -319,7 +319,46 @@ processor, or per dataset; when more than one applies, the most specific wins (p
 per-processor over the global default). If none is given, all events of a file form one chunk.
 Chunksize is dynamic: when the distributor reports that a processing call exhausted its
 resources, the chunksize is halved (down to a minimum of 1) and the failed chunk is retried -
-re-split first if it predates the halving, so the retry actually runs at the smaller size.
+re-split first if it predates the halving, so the retry actually runs at the smaller size. See
+"Attempts and Retries" below for how many times this (and a plain runtime failure) can happen
+before vine_reduce gives up.
+
+## Attempts and Retries
+
+**Rule**
+
+Every chunk (processor call) and every reduction (reducer call) gets up to `attempts` total tries
+(default 3) before vine_reduce gives up and raises `VineReduceError`, carrying the last failure's
+detail. Both outcome kinds a call can fail with count against that same budget, but are retried
+differently:
+
+- **RuntimeFailure** (the call raised an exception): retried unchanged - same chunk range, same
+  reduction group, no size change - since a bug in user code is not a sizing problem.
+- **ResourceExhaustion** (the call was killed for exceeding memory/wall time/disk): retried at a
+  halved chunksize/reduction_size, same halving as "Chunksize" above (down to a minimum of 1
+  event / reduction_size 2) - *except* a halving is a fresh start for the smaller chunk/items it
+  produces, not a strike against the attempts already used against the larger one. Once a
+  chunk/reduction is already at that minimum size, a further ResourceExhaustion has nowhere
+  smaller to retry at, so it raises immediately instead of consuming the budget.
+
+`attempts=1` means no retries at all - the first failure of either kind raises right away (this
+was, and remains, the only behavior for a RuntimeFailure prior to this feature).
+
+**Why**
+
+A RuntimeFailure and a ResourceExhaustion call for different responses. Retrying an exception
+verbatim can still help if the failure was transient (a flaky remote read, a worker hiccup)
+rather than a deterministic bug - but retrying an *oversized* call at the same size almost never
+helps, only a smaller size does. Sharing one `attempts` budget between them, while resetting it
+on every halving, keeps both stories straight: a chunk or reduction that keeps failing at a
+*fixed* size - of either failure kind - is bounded by `attempts` and eventually gives up, while
+shrinking to look for a size that works is never penalized for how many sizes it took. The size
+floor closes the one remaining way this could still loop forever: a chunk or reduction stuck at
+the smallest possible size that keeps exhausting resources no matter what - that raises
+immediately rather than retrying the same doomed call forever. See
+`Pipeline._handle_chunk_outcome`/`_handle_reduce_outcome` for where this is decided, and
+`PoolItem.attempts` for how a reduction's budget survives its items being disbanded back into the
+pool on a halving.
 
 ## Data Flow
 
@@ -610,6 +649,10 @@ progress bool = True: Whether to show the live status bars (events, processing, 
                                success/failure status (plus its captured stdout, if any, on
                                failure). See "Progress Reporting" below. Set False for a quiet
                                run, e.g. under a test harness or a non-interactive batch log.
+attempts int = 3: Total tries for a single chunk (processor call) or reduction (reducer call)
+                               before giving up - counting a RuntimeFailure and a
+                               ResourceExhaustion against the same budget. attempts=1 means no
+                               retries. See "Attempts and Retries" above.
 ```
 
 ```python

@@ -98,6 +98,13 @@ class PoolItem:
         durable checkpoint finally covers it, clearing `inputs` as it goes
         (a checkpointed item's own durable copy is backup enough, so there
         is nothing left in its lineage still worth holding onto).
+    attempts: how many failed reduction attempts this item has survived
+        while in its current grouping, for the `attempts` retry budget (see
+        Pipeline._handle_reduce_outcome). 0 for a freshly produced item (a
+        raw chunk's output, or a fresh fold result) - a RuntimeFailure on a
+        reduction this item is part of raises it towards `attempts`, while a
+        ResourceExhaustion resets it back to 0 (a smaller reduction_size is
+        a fresh start, not a strike against the budget).
     """
 
     handle: ResultHandle | None
@@ -109,6 +116,7 @@ class PoolItem:
     since_checkpoint_distance: int
     checkpoint: CheckpointRef | None = None
     inputs: list[PoolItem] = field(default_factory=list)
+    attempts: int = 0
 
     @property
     def is_checkpointed(self) -> bool:
@@ -170,6 +178,7 @@ class _FileProgress:
 @dataclass
 class _ChunkTask:
     chunk: Chunk
+    attempts_used: int = 0
 
 
 @dataclass
@@ -211,6 +220,7 @@ class Pipeline:
         results_dir: str,
         process_priority: int,
         reduce_priority: int,
+        attempts: int = 3,
         task_reporter: TaskReporter | None = None,
     ):
         self.processor_name = processor_name
@@ -236,6 +246,7 @@ class Pipeline:
         self._results_dir = os.path.join(results_dir, dataset_name, processor_name)
         self._process_priority = process_priority
         self._reduce_priority = reduce_priority
+        self._attempts = attempts
         self._process_category = f"{processor_name}:{dataset_name}:process"
         self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
         self._task_reporter = task_reporter
@@ -243,7 +254,7 @@ class Pipeline:
         self.pool: list[PoolItem] = []
         self.final_results: list[PoolItem] = []
         self._files_in_progress: dict[str, _FileProgress] = {}
-        self._retry_chunks: list[Chunk] = []
+        self._retry_chunks: list[tuple[Chunk, int]] = []  # (chunk, attempts_used)
         self._in_flight: dict[str, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
@@ -413,35 +424,40 @@ class Pipeline:
 
         submitted = 0
         while submitted < budget:
-            chunk = self._next_chunk()
-            if chunk is None:
+            next_chunk = self._next_chunk()
+            if next_chunk is None:
                 break
-            self._submit_chunk(chunk)
+            chunk, attempts_used = next_chunk
+            self._submit_chunk(chunk, attempts_used)
             submitted += 1
         return submitted
 
-    def _next_chunk(self) -> Chunk | None:
-        """The next chunk to submit - retries first, then freshly generated
-        ones - or None when there is nothing left to submit right now."""
+    def _next_chunk(self) -> tuple[Chunk, int] | None:
+        """The next chunk to submit (with the attempts already used against
+        it) - retries first, then freshly generated ones - or None when
+        there is nothing left to submit right now."""
         if self._retry_chunks:
-            chunk = self._retry_chunks.pop()
+            chunk, attempts_used = self._retry_chunks.pop()
             # A retry chunk may predate the last chunksize halving; re-split it
             # so we actually retry at the smaller size, not the size that just
-            # failed.
+            # failed. A split is a fresh start for both pieces - see
+            # PoolItem.attempts's docstring for the equivalent reduction rule.
             if self.chunksize is not None and chunk.num_events > self.chunksize:
                 split_point = chunk.start + self.chunksize
-                self._retry_chunks.append(Chunk(chunk.url, split_point, chunk.stop))
+                self._retry_chunks.append((Chunk(chunk.url, split_point, chunk.stop), 0))
                 chunk = Chunk(chunk.url, chunk.start, split_point)
-            return chunk
+                attempts_used = 0
+            return chunk, attempts_used
 
         if self._generator_exhausted:
             return None
         chunk = next(self._generator, None)
         if chunk is None:
             self._generator_exhausted = True
-        return chunk
+            return None
+        return chunk, 0
 
-    def _submit_chunk(self, chunk: Chunk) -> None:
+    def _submit_chunk(self, chunk: Chunk, attempts_used: int = 0) -> None:
         self._files_in_progress.setdefault(
             chunk.url, _FileProgress(num_entries=self._dataset["files"][chunk.url])
         )
@@ -460,7 +476,7 @@ class Pipeline:
             self._chunk_to_args,
             self._executor,
         )
-        self._in_flight[result_id] = _ChunkTask(chunk=chunk)
+        self._in_flight[result_id] = _ChunkTask(chunk=chunk, attempts_used=attempts_used)
         self._proc_tasks_submitted += 1
         self._events_submitted += chunk.num_events
 
@@ -548,15 +564,35 @@ class Pipeline:
         self._report_task("processor", f"{chunk.url}[{chunk.start}:{chunk.stop}]", outcome)
 
         if isinstance(outcome, RuntimeFailure):
-            raise VineReduceError(
-                f"processor {self.processor_name!r} failed on "
-                f"{chunk.url}[{chunk.start}:{chunk.stop}]:\n{outcome.traceback}"
-            )
-        if isinstance(outcome, ResourceExhaustion):
+            attempts_used = task.attempts_used + 1
             self._proc_tasks_failed += 1
             self._events_failed += chunk.num_events
-            self.chunksize = max(1, (self.chunksize or chunk.num_events) // 2)
-            self._retry_chunks.append(chunk)
+            if attempts_used >= self._attempts:
+                raise VineReduceError(
+                    f"processor {self.processor_name!r} failed on "
+                    f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
+                    f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
+                    f"{outcome.traceback}"
+                )
+            self._retry_chunks.append((chunk, attempts_used))
+            return
+        if isinstance(outcome, ResourceExhaustion):
+            current_size = self.chunksize if self.chunksize is not None else chunk.num_events
+            self._proc_tasks_failed += 1
+            self._events_failed += chunk.num_events
+            if current_size <= 1:
+                raise VineReduceError(
+                    f"processor {self.processor_name!r} exhausted resources on "
+                    f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk size "
+                    "(1 event); cannot retry smaller."
+                )
+            self.chunksize = max(1, current_size // 2)
+            # attempts_used carries over unchanged here - it is reset to 0 in
+            # _next_chunk once this chunk is actually split at the new,
+            # smaller chunksize (a halving is a fresh start, not a strike
+            # against the budget - see PoolItem.attempts's docstring for the
+            # equivalent reduction rule).
+            self._retry_chunks.append((chunk, task.attempts_used))
             return
 
         assert isinstance(outcome, Success)
@@ -590,13 +626,30 @@ class Pipeline:
         self._report_task("reducer", description, outcome)
 
         if isinstance(outcome, RuntimeFailure):
-            raise VineReduceError(
-                f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed:\n"
-                f"{outcome.traceback}"
-            )
+            attempts_used = 1 + max((item.attempts for item in group), default=0)
+            self._reduce_tasks_failed += 1
+            if attempts_used >= self._attempts:
+                raise VineReduceError(
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
+                    f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
+                    f"(attempts={self._attempts}):\n{outcome.traceback}"
+                )
+            for item in group:
+                item.attempts = attempts_used
+            self._submit_reduction(group)  # retry the exact same group unchanged
+            return
         if isinstance(outcome, ResourceExhaustion):
             self._reduce_tasks_failed += 1
+            if self.reduction_size <= 2:
+                raise VineReduceError(
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
+                    "resources at the minimum reduction_size (2); cannot retry smaller."
+                )
             self.reduction_size = max(2, self.reduction_size // 2)
+            # A halved reduction_size is a fresh start for these items, not a
+            # strike against the budget - see PoolItem.attempts's docstring.
+            for item in group:
+                item.attempts = 0
             self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
             return
 

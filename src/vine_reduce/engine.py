@@ -149,6 +149,18 @@ class VineReduce:
         success/failure status (plus its captured stdout, if any, on
         failure). See progress.py. Defaults to True; set False for a quiet
         run, e.g. under a test harness or a non-interactive batch log.
+    attempts: how many times a single chunk (processor call) or reduction
+        (reducer call) is tried, total, before giving up - counting both a
+        RuntimeFailure (the call raised) and a ResourceExhaustion (the call
+        was killed for exceeding its allocation) against the same budget.
+        attempts=1 means no retries. A halving of chunksize/reduction_size
+        resets the budget for the smaller unit it produces (a fresh start,
+        not a strike against it); once a chunk/reduction is already at the
+        minimum size (1 event / reduction_size 2) a further
+        ResourceExhaustion raises immediately, since there is no smaller
+        size left to retry at. Once the budget for a specific chunk/
+        reduction is exhausted, VineReduceError is raised and the run stops
+        - see Pipeline._handle_chunk_outcome/_handle_reduce_outcome.
     """
 
     processors: dict[str, Callable[[Any], Any]]
@@ -173,6 +185,7 @@ class VineReduce:
     extra_files: list[str] = field(default_factory=list)
     environment_variables: dict[str, str] = field(default_factory=dict)
     progress: bool = True
+    attempts: int = 3
 
     def compute(self) -> None:
         """Run the computation to completion: build one Pipeline per
@@ -270,6 +283,7 @@ class VineReduce:
                         results_dir=self.results_dir,
                         process_priority=process_priority,
                         reduce_priority=reduce_priority,
+                        attempts=self.attempts,
                         task_reporter=task_reporter,
                     )
                 )
