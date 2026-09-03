@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Protocol
 from uuid import uuid4
 
 from .checkpoint_store import CheckpointRecord, CheckpointStore
@@ -19,6 +19,42 @@ from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFail
 class VineReduceError(RuntimeError):
     """Raised when a processing or reduction function fails remotely. Carries
     the remote traceback so the failure can be debugged from the local side."""
+
+
+@dataclass(frozen=True)
+class TaskReport:
+    """One finished processor/reducer task, handed to a TaskReporter right
+    when its Outcome is examined - before Pipeline acts on it (pooling a
+    chunk's output, folding a reduction, retrying, or raising on failure).
+    See progress.py's ProgressReporter for the status display this feeds."""
+
+    processor_name: str
+    dataset_name: str
+    kind: str  # "processor" | "reducer"
+    result_id: str
+    description: str
+    status: str  # "success" | "resource_exhaustion" | "failure"
+    resources: dict[str, Any]
+    std_output: str | None
+
+
+class TaskReporter(Protocol):
+    """What a Pipeline needs to surface its finished tasks - see
+    progress.py's ProgressReporter (the rich-based implementation) and
+    NullProgressReporter (used when VineReduce(progress=False))."""
+
+    def report(self, task: TaskReport) -> None:
+        """Called once per finished processor/reducer task, regardless of
+        outcome (success, resource exhaustion, or failure)."""
+        ...
+
+
+def _status_of(outcome: Outcome) -> str:
+    if isinstance(outcome, Success):
+        return "success"
+    if isinstance(outcome, ResourceExhaustion):
+        return "resource_exhaustion"
+    return "failure"
 
 
 @dataclass(frozen=True)
@@ -175,6 +211,7 @@ class Pipeline:
         results_dir: str,
         process_priority: int,
         reduce_priority: int,
+        task_reporter: TaskReporter | None = None,
     ):
         self.processor_name = processor_name
         self.dataset_name = dataset_name
@@ -201,6 +238,7 @@ class Pipeline:
         self._reduce_priority = reduce_priority
         self._process_category = f"{processor_name}:{dataset_name}:process"
         self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
+        self._task_reporter = task_reporter
 
         self.pool: list[PoolItem] = []
         self.final_results: list[PoolItem] = []
@@ -211,6 +249,22 @@ class Pipeline:
         self._generator: Iterator[Chunk] | None = None
         self._skip_files: set[str] = set()
         self.finished = False
+
+        # Progress-bar counters (see events_*/proc_tasks_*/reduce_tasks_*
+        # properties below) - cumulative across the whole run, not reset on
+        # retry, so progress.py's totals estimate has a stable ratio to
+        # extrapolate from. events_total is fixed at construction; the dataset
+        # dict is never mutated after this.
+        self.events_total = sum(dataset["files"].values())
+        self._events_completed = 0
+        self._events_failed = 0
+        self._events_submitted = 0
+        self._proc_tasks_completed = 0
+        self._proc_tasks_failed = 0
+        self._proc_tasks_submitted = 0
+        self._reduce_tasks_completed = 0
+        self._reduce_tasks_failed = 0
+        self._reduce_tasks_submitted = 0
 
         self._seed_from_checkpoints()
         if not self.finished:
@@ -260,6 +314,66 @@ class Pipeline:
         """How many chunk/reduce tasks this pipeline currently has submitted
         and not yet resolved."""
         return len(self._in_flight)
+
+    # -- progress-bar counters -----------------------------------------------
+    # Raw facts only - progress.py owns all bar-rendering and totals-estimate
+    # math, so a pipeline's contribution to a processor's four aggregate bars
+    # (see ProgressReporter) is just these properties summed across every
+    # pipeline sharing that processor_name.
+
+    @property
+    def events_completed(self) -> int:
+        return self._events_completed
+
+    @property
+    def events_failed(self) -> int:
+        return self._events_failed
+
+    @property
+    def events_submitted(self) -> int:
+        return self._events_submitted
+
+    @property
+    def events_safe(self) -> int:
+        """Events whose result is durably checkpointed right now - i.e.
+        covered by a PoolItem or final result with is_checkpointed True, and
+        so would survive a crash/restart without recomputation. See
+        PoolItem.is_checkpointed and Pipeline._checkpoint."""
+        return sum(item.num_events for item in self.pool if item.is_checkpointed) + sum(
+            item.num_events for item in self.final_results
+        )
+
+    @property
+    def proc_tasks_completed(self) -> int:
+        return self._proc_tasks_completed
+
+    @property
+    def proc_tasks_failed(self) -> int:
+        return self._proc_tasks_failed
+
+    @property
+    def proc_tasks_submitted(self) -> int:
+        return self._proc_tasks_submitted
+
+    @property
+    def proc_tasks_in_flight(self) -> int:
+        return sum(1 for task in self._in_flight.values() if isinstance(task, _ChunkTask))
+
+    @property
+    def reduce_tasks_completed(self) -> int:
+        return self._reduce_tasks_completed
+
+    @property
+    def reduce_tasks_failed(self) -> int:
+        return self._reduce_tasks_failed
+
+    @property
+    def reduce_tasks_submitted(self) -> int:
+        return self._reduce_tasks_submitted
+
+    @property
+    def reduce_tasks_in_flight(self) -> int:
+        return self.in_flight_count() - self.proc_tasks_in_flight
 
     def owns(self, result_id: str) -> bool:
         """Whether result_id was submitted by this pipeline (as opposed to
@@ -347,6 +461,8 @@ class Pipeline:
             self._executor,
         )
         self._in_flight[result_id] = _ChunkTask(chunk=chunk)
+        self._proc_tasks_submitted += 1
+        self._events_submitted += chunk.num_events
 
     # -- reduction pool ------------------------------------------------------
 
@@ -394,8 +510,25 @@ class Pipeline:
             total_time=total_time,
             total_memory=total_memory,
         )
+        self._reduce_tasks_submitted += 1
 
     # -- outcome handling ------------------------------------------------------
+
+    def _report_task(self, kind: str, description: str, outcome: Outcome) -> None:
+        if self._task_reporter is None:
+            return
+        self._task_reporter.report(
+            TaskReport(
+                processor_name=self.processor_name,
+                dataset_name=self.dataset_name,
+                kind=kind,
+                result_id=outcome.result_id,
+                description=description,
+                status=_status_of(outcome),
+                resources=outcome.resources,
+                std_output=outcome.std_output,
+            )
+        )
 
     def handle_outcome(self, outcome: Outcome) -> None:
         """React to the Outcome of one of this pipeline's own chunk/reduce
@@ -412,17 +545,23 @@ class Pipeline:
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
+        self._report_task("processor", f"{chunk.url}[{chunk.start}:{chunk.stop}]", outcome)
+
         if isinstance(outcome, RuntimeFailure):
             raise VineReduceError(
                 f"processor {self.processor_name!r} failed on "
                 f"{chunk.url}[{chunk.start}:{chunk.stop}]:\n{outcome.traceback}"
             )
         if isinstance(outcome, ResourceExhaustion):
+            self._proc_tasks_failed += 1
+            self._events_failed += chunk.num_events
             self.chunksize = max(1, (self.chunksize or chunk.num_events) // 2)
             self._retry_chunks.append(chunk)
             return
 
         assert isinstance(outcome, Success)
+        self._proc_tasks_completed += 1
+        self._events_completed += chunk.num_events
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
 
@@ -445,17 +584,24 @@ class Pipeline:
 
     def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
         group = task.group
+        description = f"fold of {len(group)} item{'s' if len(group) != 1 else ''}"
+        if task.is_final:
+            description += " (final)"
+        self._report_task("reducer", description, outcome)
+
         if isinstance(outcome, RuntimeFailure):
             raise VineReduceError(
                 f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed:\n"
                 f"{outcome.traceback}"
             )
         if isinstance(outcome, ResourceExhaustion):
+            self._reduce_tasks_failed += 1
             self.reduction_size = max(2, self.reduction_size // 2)
             self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
             return
 
         assert isinstance(outcome, Success)
+        self._reduce_tasks_completed += 1
         # group's own handles are deliberately not released here: new_item
         # isn't durable yet, so if it's lost before something checkpoints
         # it, group (kept below as new_item.inputs) is the only way to

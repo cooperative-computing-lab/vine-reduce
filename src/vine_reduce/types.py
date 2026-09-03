@@ -41,10 +41,16 @@ class Outcome:
     resources: usage reported for the call, e.g. {"cores", "memory_mb",
         "wall_time_s"} - see each Distributor implementation for exactly
         which keys it fills in.
+    std_output: whatever the call printed to stdout, if the distributor is
+        able to capture it (e.g. TaskVineDistributor, from task.std_output)
+        and None otherwise (e.g. LocalDistributor, which runs in a plain
+        ProcessPoolExecutor worker with no separate stdout capture). Used
+        for debug printing on failure - see progress.py's TaskReporter.
     """
 
     result_id: str
     resources: dict[str, Any]
+    std_output: str | None
 
 
 @dataclass(frozen=True)
@@ -90,14 +96,25 @@ class RawOutcome:
     file: str | None = None
     traceback: str | None = None
 
-    def to_outcome(self, result_id: str) -> Outcome:
-        """Attach result_id and convert to the matching Outcome subclass."""
+    def to_outcome(self, result_id: str, std_output: str | None = None) -> Outcome:
+        """Attach result_id (and std_output, when the distributor has it -
+        see Outcome) and convert to the matching Outcome subclass."""
         if self.status == "success":
-            return Success(result_id=result_id, resources=self.resources, file=self.file)
+            return Success(
+                result_id=result_id,
+                resources=self.resources,
+                std_output=std_output,
+                file=self.file,
+            )
         if self.status == "failure":
             return RuntimeFailure(
-                result_id=result_id, resources=self.resources, traceback=self.traceback
+                result_id=result_id,
+                resources=self.resources,
+                std_output=std_output,
+                traceback=self.traceback,
             )
         if self.status == "exhausted":
-            return ResourceExhaustion(result_id=result_id, resources=self.resources)
+            return ResourceExhaustion(
+                result_id=result_id, resources=self.resources, std_output=std_output
+            )
         raise ValueError(f"unknown RawOutcome status: {self.status!r}")

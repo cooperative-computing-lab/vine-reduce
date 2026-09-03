@@ -278,7 +278,7 @@ class TaskVineDistributor:
 
         if task.successful():
             raw: RawOutcome = task.output
-            outcome = raw.to_outcome(result_id)
+            outcome = raw.to_outcome(result_id, std_output=task.std_output)
             if not isinstance(outcome, Success):
                 # The wrapper ran to completion but reported a Python-level
                 # failure/exhaustion (see defaults.py's _run_and_wrap) -
@@ -300,10 +300,13 @@ class TaskVineDistributor:
         self.release_result(result_id)
         resources = self._resources_from_task(task, kind)
         if task.result in _RESOURCE_EXHAUSTION_RESULTS:
-            return ResourceExhaustion(result_id=result_id, resources=resources)
+            return ResourceExhaustion(
+                result_id=result_id, resources=resources, std_output=task.std_output
+            )
         return RuntimeFailure(
             result_id=result_id,
             resources=resources,
+            std_output=task.std_output,
             traceback=f"taskvine result: {task.result}\n{task.std_output}",
         )
 

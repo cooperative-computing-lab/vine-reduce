@@ -20,6 +20,7 @@ from .checkpoint_store import CheckpointStore, checksum_dataset
 from .distributor import Distributor
 from .executor import Executor, SimpleExecutor
 from .pipeline import Pipeline, VineReduceError
+from .progress import NullProgressReporter, ProgressReporter
 
 __all__ = ["VineReduce", "VineReduceError"]
 
@@ -142,6 +143,12 @@ class VineReduce:
         every processor/reducer call runs - see Distributor.add_file().
     environment_variables: environment variables set for every
         processor/reducer call - see Distributor.set_env_var().
+    progress: whether to show the live status bars (events, processing,
+        reductions, datasets - four per processor) and print one debug line
+        per finished processor/reducer task, with its resource usage and
+        success/failure status (plus its captured stdout, if any, on
+        failure). See progress.py. Defaults to True; set False for a quiet
+        run, e.g. under a test harness or a non-interactive batch log.
     """
 
     processors: dict[str, Callable[[Any], Any]]
@@ -165,6 +172,7 @@ class VineReduce:
     db_path: str | None = None
     extra_files: list[str] = field(default_factory=list)
     environment_variables: dict[str, str] = field(default_factory=dict)
+    progress: bool = True
 
     def compute(self) -> None:
         """Run the computation to completion: build one Pipeline per
@@ -211,8 +219,11 @@ class VineReduce:
             for name, dataset in datasets.items():
                 db.dataset_changed(name, checksum_dataset(dataset))
 
-            pipelines = self._build_pipelines(datasets, distributor, db, datasets_to_chunks)
-            self._run(pipelines, distributor)
+            reporter: ProgressReporter | NullProgressReporter = stack.enter_context(
+                ProgressReporter() if self.progress else NullProgressReporter()
+            )
+            pipelines = self._build_pipelines(datasets, distributor, db, datasets_to_chunks, reporter)
+            self._run(pipelines, distributor, reporter)
 
     def _build_pipelines(
         self,
@@ -220,6 +231,7 @@ class VineReduce:
         distributor: Distributor,
         db: CheckpointStore,
         datasets_to_chunks: Callable,
+        task_reporter: ProgressReporter | NullProgressReporter,
     ) -> list[Pipeline]:
         num_processors = len(self.processors)
         pipelines: list[Pipeline] = []
@@ -258,11 +270,17 @@ class VineReduce:
                         results_dir=self.results_dir,
                         process_priority=process_priority,
                         reduce_priority=reduce_priority,
+                        task_reporter=task_reporter,
                     )
                 )
         return pipelines
 
-    def _run(self, pipelines: list[Pipeline], distributor: Distributor) -> None:
+    def _run(
+        self,
+        pipelines: list[Pipeline],
+        distributor: Distributor,
+        reporter: ProgressReporter | NullProgressReporter,
+    ) -> None:
         while True:
             for pipeline in pipelines:
                 if pipeline.finished:
@@ -271,8 +289,11 @@ class VineReduce:
                 pipeline.maybe_drain_final_group()
                 pipeline.refresh_finished()
 
+            reporter.refresh(pipelines)
+
             remaining = [p for p in pipelines if not p.finished]
             if not remaining:
+                reporter.refresh(pipelines, force=True)
                 break
 
             in_flight_total = sum(p.in_flight_count() for p in pipelines)
@@ -306,3 +327,4 @@ class VineReduce:
                 continue
             pipeline = next(p for p in pipelines if p.owns(outcome.result_id))
             pipeline.handle_outcome(outcome)
+            reporter.refresh(pipelines)
