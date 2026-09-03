@@ -1,0 +1,120 @@
+// Life of a chunk through vine_reduce: from its dataset file to a final
+// result. Generated for PLAN.md / architecture review.
+//
+// Render with:
+//   dot -Tpng diagrams/chunk_lifecycle.dot -o diagrams/chunk_lifecycle.png
+//
+// Color key:
+//   green  = success / durable outcome
+//   yellow = resource exhaustion -> retry at a smaller size
+//   red    = fatal error (attempts exhausted, or exhaustion at the size floor)
+//   cyan   = checkpoint (durability side effect)
+
+digraph chunk_lifecycle {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", shape=box, style="rounded,filled", fillcolor="#f2f2f2"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // -- origin -------------------------------------------------------
+    file [label="Dataset file\n(url, entry count)", shape=cylinder, fillcolor="#e0e0e0"];
+    gen  [label="Chunk generation\n(datasets_to_chunks)\nsplits file into Chunk(url, start, stop)"];
+    file -> gen;
+
+    // -- process stage --------------------------------------------------
+    subgraph cluster_process {
+        label="Process stage  (one chunk)";
+        style=dashed; color="#888888";
+
+        submit_p [label="Pipeline.feed():\nDistributor.submit(\n  executor_wrapper, processor, chunk, ...)"];
+        dist_p   [label="Distributor\ndispatches to an execution site\n(Local subprocess / TaskVine worker)"];
+        exec_p   [label="Executor\nruns processor(chunk)\n(Simple / Proc Pool / Dask)"];
+        submit_p -> dist_p -> exec_p;
+    }
+    gen -> submit_p [label="next chunk\n(attempts_used=0)"];
+
+    outcome_p [label="Outcome?", shape=diamond, fillcolor="#ffffff"];
+    exec_p -> outcome_p;
+
+    fatal_p [label="VineReduceError raised\n(fatal - run stops)", fillcolor="#f4a3a3"];
+
+    // RuntimeFailure: retried unchanged, up to `attempts` total tries.
+    rf_check_p [label="attempts_used + 1\n>= attempts?", shape=diamond, fillcolor="#ffffff"];
+    outcome_p -> rf_check_p [label="RuntimeFailure", color="#c0392b", fontcolor="#c0392b"];
+    rf_check_p -> fatal_p [label="yes"];
+    retry_rf_p [label="retry same chunk unchanged;\nattempts_used += 1", fillcolor="#fdf1a3"];
+    rf_check_p -> retry_rf_p [label="no"];
+    retry_rf_p -> submit_p [label="resubmit", style=dashed];
+
+    // ResourceExhaustion: halved and retried, unless already at the size floor.
+    re_check_p [label="chunksize already at\nminimum (1 event)?", shape=diamond, fillcolor="#ffffff"];
+    outcome_p -> re_check_p [label="ResourceExhaustion", color="#b7950b", fontcolor="#b7950b"];
+    re_check_p -> fatal_p [label="yes\n(no smaller size left)"];
+    retry_re_p [label="halve chunksize;\nre-split & retry\n(fresh attempts_used=0\nfor each half)", fillcolor="#fdf1a3"];
+    re_check_p -> retry_re_p [label="no"];
+    retry_re_p -> submit_p [label="resubmit", style=dashed];
+
+    pool_item [label="PoolItem created\n(chunk's output, one file's worth\nof events, not yet folded)", fillcolor="#c8e6c9"];
+    outcome_p -> pool_item [label="Success", color="#2e7d32", fontcolor="#2e7d32"];
+
+    staged [label="Staged until every chunk\nof this file has completed"];
+    pool_item -> staged;
+
+    pool [label="Added to the reduction pool\n(shared across all chunks/folds\nfor this processor+dataset)", shape=folder, fillcolor="#c8e6c9"];
+    staged -> pool;
+
+    // -- reduce stage ---------------------------------------------------
+    join [label="Pool reaches reduction_size:\njoins with N-1 other pool items", fillcolor="#c8e6c9"];
+    pool -> join;
+
+    subgraph cluster_reduce {
+        label="Reduce stage  (fold one group)";
+        style=dashed; color="#888888";
+
+        submit_r [label="Pipeline.submit_ready_reductions():\nDistributor.submit(\n  reducer_wrapper, reducer, group, ...)"];
+        dist_r   [label="Distributor\ndispatches to an execution site"];
+        exec_r   [label="Executor\nruns reducer(group)\n(Simple / Proc Pool / Dask)"];
+        submit_r -> dist_r -> exec_r;
+    }
+    join -> submit_r [label="group items'\nattempts=0"];
+
+    outcome_r [label="Outcome?", shape=diamond, fillcolor="#ffffff"];
+    exec_r -> outcome_r;
+
+    fatal_r [label="VineReduceError raised\n(fatal - run stops)", fillcolor="#f4a3a3"];
+
+    // RuntimeFailure: retried unchanged (same group), up to `attempts` total tries.
+    rf_check_r [label="1 + max(item.attempts)\n>= attempts?", shape=diamond, fillcolor="#ffffff"];
+    outcome_r -> rf_check_r [label="RuntimeFailure", color="#c0392b", fontcolor="#c0392b"];
+    rf_check_r -> fatal_r [label="yes"];
+    retry_rf_r [label="retry same group unchanged;\neach item.attempts = new count", fillcolor="#fdf1a3"];
+    rf_check_r -> retry_rf_r [label="no"];
+    retry_rf_r -> submit_r [label="resubmit", style=dashed];
+
+    // ResourceExhaustion: group disbands back to the pool at a halved
+    // reduction_size, unless already at the size floor.
+    re_check_r [label="reduction_size already\nat minimum (2)?", shape=diamond, fillcolor="#ffffff"];
+    outcome_r -> re_check_r [label="ResourceExhaustion", color="#b7950b", fontcolor="#b7950b"];
+    re_check_r -> fatal_r [label="yes\n(no smaller size left)"];
+    retry_re_r [label="halve reduction_size;\ndisband group into pool,\neach item.attempts reset to 0", fillcolor="#fdf1a3"];
+    re_check_r -> retry_re_r [label="no"];
+    retry_re_r -> pool [label="requeue", style=dashed];
+
+    new_item [label="new_item: folded result\n(events/time/memory summed,\ngroup kept as inputs, attempts=0)", fillcolor="#c8e6c9"];
+    outcome_r -> new_item [label="Success", color="#2e7d32", fontcolor="#2e7d32"];
+
+    ckpt_due [label="is_checkpoint due?\n(always if final;\nelse checkpoint_time /\ncheckpoint_distance threshold)", shape=diamond, fillcolor="#ffffff"];
+    new_item -> ckpt_due;
+
+    ckpt [label="Checkpoint written\n(sqlite row + on-disk copy);\nsuperseded inputs released", fillcolor="#b3e5fc"];
+    ckpt_due -> ckpt [label="yes"];
+
+    final_q [label="is_final?\n(is_result accepts\nevents/time/memory)", shape=diamond, fillcolor="#ffffff"];
+    ckpt_due -> final_q [label="no"];
+    ckpt -> final_q;
+
+    final [label="Final result\ncopied to results_dir,\ndistributor copy released", shape=cds, fillcolor="#81c784"];
+    final_q -> final [label="yes"];
+
+    final_q -> pool [label="no: append to pool\n(fold again later)", style=dashed];
+}
