@@ -86,6 +86,40 @@ class Executor(Protocol):
         self.shutdown(wait=True)
 
 
+class _ExecutorBase:
+    """Shared map()/__enter__/__exit__ for every Executor implementation below.
+    map() is defined once, in terms of submit(), and __enter__/__exit__ once,
+    in terms of shutdown() - so a concrete implementation only needs to
+    provide submit() and shutdown()."""
+
+    def map(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *iterables: Any,
+        dataset_metadata: dict[str, Any] | None = None,
+        distributor_metadata: dict[str, Any] | None = None,
+        executor_metadata: dict[str, Any] | None = None,
+    ) -> Iterator[Any]:
+        futures = [
+            self.submit(
+                fn,
+                *items,
+                dataset_metadata=dataset_metadata,
+                distributor_metadata=distributor_metadata,
+                executor_metadata=executor_metadata,
+            )
+            for items in zip(*iterables)
+        ]
+        return (future.result() for future in futures)
+
+    def __enter__(self) -> "_ExecutorBase":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.shutdown(wait=True)
+
+
 def _submitted(fn: Callable[..., Any], *args: Any) -> Future:
     """Runs fn(*args) inline and wraps its outcome in an already-done
     Future, the way a synchronous Executor.submit reports its result."""
@@ -98,7 +132,7 @@ def _submitted(fn: Callable[..., Any], *args: Any) -> Future:
     return future
 
 
-class SimpleExecutor:
+class SimpleExecutor(_ExecutorBase):
     """Calls fn(*args) directly, in the same process/task running
     executor_wrapper. The default `executor` for VineReduce. Ignores all
     three metadata dicts. Stateless, so trivially picklable."""
@@ -120,26 +154,8 @@ class SimpleExecutor:
         the Future/exception plumbing above."""
         return fn(*args)
 
-    def map(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *iterables: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[Any]:
-        futures = [self.submit(fn, *items) for items in zip(*iterables)]
-        return (future.result() for future in futures)
-
     def shutdown(self, wait: bool = True) -> None:
         pass
-
-    def __enter__(self) -> "SimpleExecutor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown(wait=True)
 
 
 def _run_cloudpickled(payload: bytes) -> Any:
@@ -166,7 +182,7 @@ class CloudpickleProcessPoolExecutor(ProcessPoolExecutor):
         return super().submit(_run_cloudpickled, payload)
 
 
-class CloudpickleExecutor:
+class CloudpickleExecutor(_ExecutorBase):
     """Runs each fn(*args) in its own subprocess (via
     CloudpickleProcessPoolExecutor), isolating a crash or memory leak in fn
     from the worker task running executor_wrapper. fn may be a closure or
@@ -196,19 +212,6 @@ class CloudpickleExecutor:
     ) -> Future:
         return self._ensure_pool().submit(fn, *args)
 
-    def map(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *iterables: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[Any]:
-        pool = self._ensure_pool()
-        futures = [pool.submit(fn, *items) for items in zip(*iterables)]
-        return (future.result() for future in futures)
-
     def shutdown(self, wait: bool = True) -> None:
         if self._pool is not None:
             self._pool.shutdown(wait=wait)
@@ -220,12 +223,6 @@ class CloudpickleExecutor:
         state = self.__dict__.copy()
         state["_pool"] = None
         return state
-
-    def __enter__(self) -> "CloudpickleExecutor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown(wait=True)
 
 
 def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
@@ -243,7 +240,7 @@ def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
     return os.process_cpu_count() or 1
 
 
-class DaskExecutor:
+class DaskExecutor(_ExecutorBase):
     """For an fn that returns a dask-delayed object (or dask
     array/dataframe): calls fn(*args), then computes the result at the
     execution site, on dask's "processes" scheduler backed by a
@@ -282,31 +279,5 @@ class DaskExecutor:
 
         return _submitted(call)
 
-    def map(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *iterables: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[Any]:
-        return (
-            self.submit(
-                fn,
-                *items,
-                dataset_metadata=dataset_metadata,
-                distributor_metadata=distributor_metadata,
-                executor_metadata=executor_metadata,
-            ).result()
-            for items in zip(*iterables)
-        )
-
     def shutdown(self, wait: bool = True) -> None:
         pass
-
-    def __enter__(self) -> "DaskExecutor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown(wait=True)
