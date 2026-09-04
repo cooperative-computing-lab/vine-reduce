@@ -524,16 +524,24 @@ class Pipeline:
 
     def maybe_drain_final_group(self) -> None:
         """If nothing more can ever arrive in the pool, reduce whatever's left
-        as one last group, however small."""
+        as one last group, however small, and make it final unconditionally -
+        see _submit_reduction's force_final."""
         if self.pool and self.chunks_all_done and self.in_flight_count() == 0:
             group, self.pool = self.pool, []
-            self._submit_reduction(group)
+            self._submit_reduction(group, force_final=True)
 
-    def _submit_reduction(self, group: list[PoolItem]) -> None:
+    def _submit_reduction(self, group: list[PoolItem], force_final: bool = False) -> None:
+        """force_final skips is_result entirely and makes this group final
+        regardless of what it returns - only maybe_drain_final_group passes
+        it, since by construction that's the last group this (processor,
+        dataset) pipeline will ever form: nothing else can ever arrive to
+        give is_result a different group to judge, so asking it at all could
+        only either agree (redundant) or deadlock forever resubmitting the
+        same no-op fold - is_result is never consulted here."""
         num_events = sum(item.num_events for item in group)
         total_time = sum(item.wall_time_s for item in group)
         total_memory = sum(item.memory_mb for item in group)
-        is_final = self._is_result(num_events, total_time, total_memory)
+        is_final = force_final or self._is_result(num_events, total_time, total_memory)
         is_checkpoint = is_final or self._checkpoint_due(
             sum(item.since_checkpoint_time for item in group),
             max(item.since_checkpoint_distance for item in group),
@@ -798,20 +806,6 @@ class Pipeline:
 
         if task.is_final:
             self.final_results.append(new_item)
-        elif len(group) == 1:
-            # Only maybe_drain_final_group ever reduces a group of size 1 -
-            # folding a single item with itself changes nothing, so if
-            # is_result still rejects the result, nothing else ever will
-            # either: chunk generation is exhausted and nothing else is in
-            # flight, so there is no future group is_result could see instead.
-            # Looping this back into the pool would just resubmit the same
-            # no-op reduction forever.
-            raise VineReduceError(
-                f"is_result never accepted a final result for "
-                f"{self.processor_name!r}/{self.dataset_name!r}: "
-                f"{new_item.num_events} events reduced, no chunks or reductions "
-                "left to add more. is_result is unsatisfiable for this run."
-            )
         else:
             self.pool.append(new_item)
 

@@ -599,18 +599,20 @@ def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distribut
     db.close()
 
 
-def test_unsatisfiable_is_result_raises_instead_of_looping_forever(fake_distributor, tmp_path):
-    """A custom is_result that the dataset's total can never reach must raise,
-    not silently keep re-submitting a no-op fold of the one remaining item
-    forever - see maybe_drain_final_group/_handle_reduce_outcome."""
+def test_unsatisfiable_is_result_still_finishes_on_the_last_drain(fake_distributor, tmp_path):
+    """A custom is_result that the dataset's total can never reach must not
+    loop forever re-submitting a no-op fold of the one remaining item -
+    the pool's final drain is always final, is_result or not - see
+    maybe_drain_final_group/_submit_reduction."""
     dataset = {"files": {"a.root": 3, "b.root": 3}}
     never_satisfied = lambda num_events, total_time, total_memory: False  # noqa: E731
     pipeline, db = make_pipeline(
         fake_distributor, tmp_path, dataset, reduction_size=10, is_result=never_satisfied
     )
 
-    with pytest.raises(VineReduceError, match="is_result"):
-        run_to_completion(pipeline, fake_distributor)
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 6
     db.close()
 
 

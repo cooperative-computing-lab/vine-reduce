@@ -30,10 +30,11 @@ from [0, num_entries), from which chunks are formed. Chunks never cross file bou
   output, the output stops being eligible for further reduction, and a new group starts forming.
   Default `is_result`: `True` once the group covers every event of the dataset (one final result
   per dataset).
-- Deadlock guard: if a drained single-item group is still rejected by `is_result`, `Pipeline`
-  raises `VineReduceError` instead of resubmitting - nothing can ever arrive to change the answer.
-  Only reachable with a custom `is_result` whose threshold the dataset's remaining events can
-  never reach; the default can't hit it.
+- Last group: `is_result` is never consulted for the group formed by the pool's final drain (once
+  chunk generation is exhausted, the pool empties, and nothing is in flight) - it is always final,
+  whatever it totals. Nothing can ever arrive afterward to give `is_result` a different group to
+  judge, so asking it could only agree (redundant) or reject forever, resubmitting the same no-op
+  fold as a deadlock.
 - `reduction_size`: per (processor, dataset), default 10, must resolve to an int >= 2 (else
   `VineReduceError` at config time). Halves (floor 2) on distributor resource exhaustion; the
   group is requeued at the front of the pool and retried at the smaller size.
@@ -389,12 +390,9 @@ are available). What happens next depends on which kind of call it was:
   cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
 
 If a run finishes with at least one file left permanently unprocessed, a warning is printed in red
-naming `failed_files.log`. `is_result` itself is never adjusted to account for skipped files - a
-dataset using the default `is_result` ("every event of the dataset") together with
-`failure_proportion > 0` may still hit the pre-existing "is_result never accepted a final result"
-deadlock guard once chunk generation is exhausted, if some of its files were permanently skipped;
-this is a known limitation of combining the two, not something this feature tries to paper over. A
-custom `is_result` that doesn't require full coverage does not have this problem.
+naming `failed_files.log`. The dataset's final result still comes out short of "every event of the
+dataset" in that case - the last group's `is_result` bypass (see "Reduction and Final Results")
+means this is no longer a deadlock, just a result computed over less data than the full dataset.
 
 **Mechanics** (`src/vine_reduce/pipeline.py`, `src/vine_reduce/failure_log.py`)
 
