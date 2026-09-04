@@ -328,9 +328,8 @@ before vine_reduce gives up.
 **Rule**
 
 Every chunk (processor call) and every reduction (reducer call) gets up to `attempts` total tries
-(default 3) before vine_reduce gives up and raises `VineReduceError`, carrying the last failure's
-detail. Both outcome kinds a call can fail with count against that same budget, but are retried
-differently:
+(default 3) before vine_reduce gives up on it, carrying the last failure's detail. Both outcome
+kinds a call can fail with count against that same budget, but are retried differently:
 
 - **RuntimeFailure** (the call raised an exception): retried unchanged - same chunk range, same
   reduction group, no size change - since a bug in user code is not a sizing problem.
@@ -359,6 +358,53 @@ immediately rather than retrying the same doomed call forever. See
 `Pipeline._handle_chunk_outcome`/`_handle_reduce_outcome` for where this is decided, and
 `PoolItem.attempts` for how a reduction's budget survives its items being disbanded back into the
 pool on a halving.
+
+## Failure Tolerance
+
+**Rule**
+
+Once a chunk's or reduction's `attempts` budget (see above) is exhausted, it is logged to
+`failed_files.log` - one shared, append-only, plain-text file for the whole run, at the directory
+`compute()` was called from, written to immediately as each permanent failure is found (dataset,
+filename, `kind` ("processor"|"reducer"), attempts made, `Distributor.resources(kind)` as the
+allocated cap, the last attempt's measured resource usage, and its traceback, whichever of these
+are available). What happens next depends on which kind of call it was:
+
+- **A processor (chunk) permanent failure** removes just that one dataset file from the
+  `(processor, dataset)` pipeline going forward: it is dropped from `_files_in_progress` (any
+  already-staged sibling chunk results for it are released back to the distributor, never pooled),
+  purged from `_retry_chunks`, and skipped by both `_next_chunk` and any of its own sibling chunks
+  whose outcome arrives after the fact. The run only aborts (`VineReduceError`) once, for some
+  dataset, `permanently_failed_files / max(files_concluded_so_far, 100) > failure_proportion` - the
+  100-file floor means a single early failure can't spuriously trip a nonzero threshold on a small
+  dataset. `failure_proportion` defaults to `0`, which reproduces the historical behavior exactly
+  (the first permanent failure gives a ratio of `1/100 = 0.01`, already `> 0`); it must be in
+  `[0, 1)` - a value `< 1` can never trip the check on its own, since the ratio never exceeds 1.
+- **A reducer (reduction) permanent failure** always aborts the whole run, unconditionally -
+  `failure_proportion` is never consulted for it. A partially-folded reduction result can't be
+  trusted not to be corrupted, so there is no "skip and continue" for this case, same as before
+  this feature. Every file folded into the failing group is logged (there is no attempt to
+  attribute the failure to one specific input with any precision - the run is stopping anyway), and
+  the group's own distributor-held results are released (`Pipeline._release_covered`, the same
+  cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
+
+If a run finishes with at least one file left permanently unprocessed, a warning is printed in red
+naming `failed_files.log`. `is_result` itself is never adjusted to account for skipped files - a
+dataset using the default `is_result` ("every event of the dataset") together with
+`failure_proportion > 0` may still hit the pre-existing "is_result never accepted a final result"
+deadlock guard once chunk generation is exhausted, if some of its files were permanently skipped;
+this is a known limitation of combining the two, not something this feature tries to paper over. A
+custom `is_result` that doesn't require full coverage does not have this problem.
+
+**Mechanics** (`src/vine_reduce/pipeline.py`, `src/vine_reduce/failure_log.py`)
+
+`Pipeline._give_up_on_file` handles the processor case (called from `_handle_chunk_outcome`);
+`Pipeline._give_up_on_reduction` handles the reducer case (called from `_handle_reduce_outcome`,
+immediately before each of its two `raise VineReduceError` sites). `FailureLog` (`failure_log.py`)
+is the shared log writer, one instance per `VineReduce.compute()` call, passed to every `Pipeline`
+alongside `task_reporter`. `Pipeline.failed_files` exposes the set of permanently-failed files for
+this (processor, dataset) pair, read by `VineReduce.compute()` after `_run()` returns to decide
+whether to print the end-of-run warning.
 
 ## Data Flow
 
@@ -653,6 +699,13 @@ attempts int = 3: Total tries for a single chunk (processor call) or reduction (
                                before giving up - counting a RuntimeFailure and a
                                ResourceExhaustion against the same budget. attempts=1 means no
                                retries. See "Attempts and Retries" above.
+failure_proportion float = 0.0: Only applies to a processor permanent failure - a reducer
+                               permanent failure always aborts the run, regardless of this
+                               setting. The run aborts once, for some dataset,
+                               permanently_failed_files / max(files_concluded_so_far, 100) is
+                               greater than this value. Must be in [0, 1); 0 (default) aborts on
+                               the very first permanent processor failure, matching the
+                               historical behavior. See "Failure Tolerance" above.
 ```
 
 ```python

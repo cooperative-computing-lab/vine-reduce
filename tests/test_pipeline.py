@@ -7,6 +7,7 @@ import pytest
 from vine_reduce import defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointRecord, CheckpointStore
 from vine_reduce.executor import SimpleExecutor
+from vine_reduce.failure_log import FailureLog
 from vine_reduce.pipeline import (
     Pipeline,
     PoolItem,
@@ -51,6 +52,8 @@ def make_pipeline(
     dataset_name="ds",
     is_result=None,
     attempts=3,
+    failure_proportion=0.0,
+    failure_log=None,
 ):
     db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
@@ -79,6 +82,8 @@ def make_pipeline(
             process_priority=1,
             reduce_priority=2,
             attempts=attempts,
+            failure_proportion=failure_proportion,
+            failure_log=failure_log,
         ),
         db,
     )
@@ -779,4 +784,98 @@ def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distrib
     assert pipeline.reduction_size == 2
     assert all(item.attempts == 0 for item in items)  # reset, not incremented
     assert pipeline.pool[:4] == items
+    db.close()
+
+
+def test_processor_permanent_failure_is_skipped_within_failure_proportion(
+    fake_distributor, tmp_path
+):
+    """A permanently-failed file is removed from the pool for good, but the
+    rest of the dataset keeps going - and the pipeline still reaches a
+    final result over what's left - as long as failure_proportion tolerates
+    it. is_result is custom here since the default ("every event") could
+    never be satisfied once a file is permanently missing - see PLAN.md."""
+    dataset = {"files": {"a.root": 5, "b.root": 5, "c.root": 5}}
+
+    def processor(chunk):
+        if chunk.url == "b.root":
+            raise ValueError("boom")
+        return chunk.stop - chunk.start
+
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        processor=processor,
+        reduction_size=10,
+        attempts=1,
+        failure_proportion=0.5,
+        is_result=lambda num_events, total_time, total_memory: num_events >= 10,
+    )
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert pipeline.failed_files == frozenset({"b.root"})
+    assert final_value(pipeline) == 10
+    db.close()
+
+
+def test_processor_permanent_failures_abort_once_proportion_exceeded(fake_distributor, tmp_path):
+    """failure_proportion tolerates the first permanent failure but not the
+    second, for the same dataset."""
+    dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
+
+    def processor(chunk):
+        if chunk.url in ("b.root", "d.root"):
+            raise ValueError("boom")
+        return chunk.stop - chunk.start
+
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        processor=processor,
+        reduction_size=10,
+        attempts=1,
+        failure_proportion=0.015,  # 1/100 tolerated, 2/100 is not
+        is_result=lambda num_events, total_time, total_memory: num_events >= 2,
+    )
+
+    with pytest.raises(VineReduceError, match=r"after 1 attempt \(attempts=1\)"):
+        run_to_completion(pipeline, fake_distributor)
+    assert pipeline.failed_files == frozenset({"b.root", "d.root"})
+    db.close()
+
+
+def test_reducer_permanent_failure_logs_group_files_and_ignores_failure_proportion(
+    fake_distributor, tmp_path
+):
+    """Unlike a processor failure, a reducer permanent failure always aborts
+    the whole run - failure_proportion is never consulted for it - but every
+    file folded into the failing group is still logged first."""
+
+    def always_fails(a, b):
+        raise ValueError("boom")
+
+    dataset = {"files": {"a.root": 1, "b.root": 1}}
+    log_path = str(tmp_path / "failed_files.log")
+    failure_log = FailureLog(log_path)
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reducer=always_fails,
+        reduction_size=2,
+        attempts=1,
+        failure_proportion=0.99,  # would tolerate nearly anything for a processor failure
+        failure_log=failure_log,
+    )
+
+    with pytest.raises(VineReduceError, match=r"after 1 attempt \(attempts=1\)"):
+        run_to_completion(pipeline, fake_distributor)
+
+    contents = open(log_path).read()
+    assert "a.root" in contents
+    assert "b.root" in contents
+    assert "reducer" in contents
     db.close()

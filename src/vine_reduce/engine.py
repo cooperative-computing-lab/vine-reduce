@@ -19,6 +19,7 @@ from . import defaults
 from .checkpoint_store import CheckpointStore, checksum_dataset
 from .distributor import Distributor
 from .executor import Executor, SimpleExecutor
+from .failure_log import FailureLog
 from .pipeline import Pipeline, VineReduceError
 from .progress import NullProgressReporter, ProgressReporter
 
@@ -158,9 +159,27 @@ class VineReduce:
         not a strike against it); once a chunk/reduction is already at the
         minimum size (1 event / reduction_size 2) a further
         ResourceExhaustion raises immediately, since there is no smaller
-        size left to retry at. Once the budget for a specific chunk/
-        reduction is exhausted, VineReduceError is raised and the run stops
+        size left to retry at. Once the budget for a specific chunk is
+        exhausted, the file it belongs to is given up on for good (see
+        failure_proportion); once the budget for a reduction is exhausted,
+        VineReduceError is raised and the whole run stops, unconditionally
         - see Pipeline._handle_chunk_outcome/_handle_reduce_outcome.
+    failure_proportion: only applies to a processor permanent failure (a
+        chunk that exhausted `attempts`) - a reducer permanent failure
+        always stops the run, regardless of this setting, since a
+        partially-folded reduction can't be trusted not to be corrupted.
+        A file whose chunk permanently fails is logged to failed_files.log
+        (dataset, filename, resources allocated/measured, last traceback)
+        the moment it happens and removed from that (processor, dataset)
+        pipeline for good - never retried, never pooled. The run only
+        aborts once, for some dataset, `permanently_failed_files /
+        max(files_concluded_so_far, 100) > failure_proportion` - the
+        100-file floor means a lone early failure can't spuriously trip a
+        nonzero threshold on a small dataset. Must be in [0, 1). The
+        default, 0, reproduces the historical behavior: the very first
+        permanent processor failure aborts the run (1/100 = 0.01 > 0).
+        A run that finishes with any file left permanently unprocessed
+        prints a warning in red naming failed_files.log.
     """
 
     processors: dict[str, Callable[[Any], Any]]
@@ -186,6 +205,7 @@ class VineReduce:
     environment_variables: dict[str, str] = field(default_factory=dict)
     progress: bool = True
     attempts: int = 3
+    failure_proportion: float = 0.0
 
     def compute(self) -> None:
         """Run the computation to completion: build one Pipeline per
@@ -193,6 +213,10 @@ class VineReduce:
         disk) and drive them until every pipeline has a final result. If
         `distributor` was not supplied, a LocalDistributor is created for
         this call and shut down again before returning."""
+        if not 0.0 <= self.failure_proportion < 1.0:
+            raise ValueError(
+                f"failure_proportion must be in [0, 1); got {self.failure_proportion!r}"
+            )
         with ExitStack() as stack:
             if self.distributor is not None:
                 distributor = self.distributor
@@ -235,8 +259,27 @@ class VineReduce:
             reporter: ProgressReporter | NullProgressReporter = stack.enter_context(
                 ProgressReporter() if self.progress else NullProgressReporter()
             )
-            pipelines = self._build_pipelines(datasets, distributor, db, datasets_to_chunks, reporter)
+            # failed_files.log lives at the directory the run was started
+            # from, shared across every (processor, dataset) pipeline of
+            # this run, and appended to immediately as each permanent
+            # processor/reducer failure is found - see failure_log.py and
+            # failure_proportion's docstring above.
+            failure_log_path = os.path.join(os.getcwd(), "failed_files.log")
+            failure_log = FailureLog(failure_log_path)
+            pipelines = self._build_pipelines(
+                datasets, distributor, db, datasets_to_chunks, reporter, failure_log
+            )
             self._run(pipelines, distributor, reporter)
+
+            unprocessed = sum(len(p.failed_files) for p in pipelines)
+            if unprocessed:
+                from rich.console import Console
+
+                Console().print(
+                    f"WARNING: {unprocessed} file(s) were permanently skipped and left "
+                    f"unprocessed; see {failure_log_path}",
+                    style="bold red",
+                )
 
     def _build_pipelines(
         self,
@@ -245,6 +288,7 @@ class VineReduce:
         db: CheckpointStore,
         datasets_to_chunks: Callable,
         task_reporter: ProgressReporter | NullProgressReporter,
+        failure_log: FailureLog,
     ) -> list[Pipeline]:
         num_processors = len(self.processors)
         pipelines: list[Pipeline] = []
@@ -284,6 +328,8 @@ class VineReduce:
                         process_priority=process_priority,
                         reduce_priority=reduce_priority,
                         attempts=self.attempts,
+                        failure_proportion=self.failure_proportion,
+                        failure_log=failure_log,
                         task_reporter=task_reporter,
                     )
                 )

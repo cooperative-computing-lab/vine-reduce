@@ -13,6 +13,7 @@ from uuid import uuid4
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor
 from .executor import Executor
+from .failure_log import FailureLog, FailureRecord
 from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
 
 
@@ -221,6 +222,8 @@ class Pipeline:
         process_priority: int,
         reduce_priority: int,
         attempts: int = 3,
+        failure_proportion: float = 0.0,
+        failure_log: FailureLog | None = None,
         task_reporter: TaskReporter | None = None,
     ):
         self.processor_name = processor_name
@@ -247,6 +250,8 @@ class Pipeline:
         self._process_priority = process_priority
         self._reduce_priority = reduce_priority
         self._attempts = attempts
+        self._failure_proportion = failure_proportion
+        self._failure_log = failure_log
         self._process_category = f"{processor_name}:{dataset_name}:process"
         self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
         self._task_reporter = task_reporter
@@ -260,6 +265,15 @@ class Pipeline:
         self._generator: Iterator[Chunk] | None = None
         self._skip_files: set[str] = set()
         self.finished = False
+
+        # Failure tolerance: files given up on during preprocessing (see
+        # _give_up_on_file) are removed from the pool going forward, never
+        # retried, and counted against failure_proportion -
+        # _files_concluded is the proportion's denominator (files that
+        # reached a terminal outcome, successful or not; see
+        # PLAN.md's "Attempts and Retries").
+        self._failed_files: set[str] = set()
+        self._files_concluded = 0
 
         # Progress-bar counters (see events_*/proc_tasks_*/reduce_tasks_*
         # properties below) - cumulative across the whole run, not reset on
@@ -386,6 +400,14 @@ class Pipeline:
     def reduce_tasks_in_flight(self) -> int:
         return self.in_flight_count() - self.proc_tasks_in_flight
 
+    @property
+    def failed_files(self) -> frozenset[str]:
+        """Dataset file URLs permanently given up on during preprocessing -
+        see _give_up_on_file. Does not include files caught up in a reducer
+        permanent failure, since that always aborts the whole run instead
+        (see _give_up_on_reduction)."""
+        return frozenset(self._failed_files)
+
     def owns(self, result_id: str) -> bool:
         """Whether result_id was submitted by this pipeline (as opposed to
         another pipeline sharing the same distributor)."""
@@ -451,11 +473,16 @@ class Pipeline:
 
         if self._generator_exhausted:
             return None
-        chunk = next(self._generator, None)
-        if chunk is None:
-            self._generator_exhausted = True
-            return None
-        return chunk, 0
+        while True:
+            chunk = next(self._generator, None)
+            if chunk is None:
+                self._generator_exhausted = True
+                return None
+            if chunk.url not in self._failed_files:
+                return chunk, 0
+            # A file already given up on (see _give_up_on_file) may still
+            # have chunks left to yield from the generator's current
+            # position - skip them without submitting.
 
     def _submit_chunk(self, chunk: Chunk, attempts_used: int = 0) -> None:
         self._files_in_progress.setdefault(
@@ -563,17 +590,34 @@ class Pipeline:
         chunk = task.chunk
         self._report_task("processor", f"{chunk.url}[{chunk.start}:{chunk.stop}]", outcome)
 
+        if chunk.url in self._failed_files:
+            # A sibling chunk of this (now abandoned) file already exhausted
+            # its attempts and gave up on the whole file - see
+            # _give_up_on_file. Discard whatever this one produced instead
+            # of staging or retrying it.
+            if isinstance(outcome, Success):
+                self._distributor.release_result(outcome.result_id)
+            return
+
         if isinstance(outcome, RuntimeFailure):
             attempts_used = task.attempts_used + 1
             self._proc_tasks_failed += 1
             self._events_failed += chunk.num_events
             if attempts_used >= self._attempts:
-                raise VineReduceError(
-                    f"processor {self.processor_name!r} failed on "
-                    f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
-                    f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
-                    f"{outcome.traceback}"
+                self._give_up_on_file(
+                    chunk,
+                    kind="processor",
+                    attempts=attempts_used,
+                    resources_measured=outcome.resources,
+                    traceback=outcome.traceback,
+                    abort_message=(
+                        f"processor {self.processor_name!r} failed on "
+                        f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
+                        f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
+                        f"{outcome.traceback}"
+                    ),
                 )
+                return
             self._retry_chunks.append((chunk, attempts_used))
             return
         if isinstance(outcome, ResourceExhaustion):
@@ -581,11 +625,19 @@ class Pipeline:
             self._proc_tasks_failed += 1
             self._events_failed += chunk.num_events
             if current_size <= 1:
-                raise VineReduceError(
-                    f"processor {self.processor_name!r} exhausted resources on "
-                    f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk size "
-                    "(1 event); cannot retry smaller."
+                self._give_up_on_file(
+                    chunk,
+                    kind="processor",
+                    attempts=task.attempts_used + 1,
+                    resources_measured=outcome.resources,
+                    traceback=None,
+                    abort_message=(
+                        f"processor {self.processor_name!r} exhausted resources on "
+                        f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk size "
+                        "(1 event); cannot retry smaller."
+                    ),
                 )
+                return
             self.chunksize = max(1, current_size // 2)
             # attempts_used carries over unchanged here - it is reset to 0 in
             # _next_chunk once this chunk is actually split at the new,
@@ -617,6 +669,54 @@ class Pipeline:
         if progress.covered_events >= progress.num_entries:
             self.pool.extend(progress.staged_items)
             del self._files_in_progress[chunk.url]
+            self._files_concluded += 1
+
+    def _give_up_on_file(
+        self,
+        chunk: Chunk,
+        *,
+        kind: str,
+        attempts: int,
+        resources_measured: dict[str, Any] | None,
+        traceback: str | None,
+        abort_message: str,
+    ) -> None:
+        """A processor permanent failure: log it, drop the file from the
+        pool for good (it is never retried or staged), and either continue
+        (most of the dataset's other files are unaffected) or abort the
+        whole run, per failure_proportion - see PLAN.md's "Attempts and
+        Retries". Unlike a reducer permanent failure (_give_up_on_reduction),
+        this does NOT unconditionally abort."""
+        url = chunk.url
+        self._failed_files.add(url)
+        self._files_concluded += 1
+
+        if self._failure_log is not None:
+            self._failure_log.log(
+                FailureRecord(
+                    dataset_name=self.dataset_name,
+                    filename=url,
+                    kind=kind,
+                    attempts=attempts,
+                    resources_allocated=self._distributor.resources(kind),
+                    resources_measured=resources_measured,
+                    traceback=traceback,
+                )
+            )
+
+        # This file will never be pooled - release any sibling chunks of it
+        # already staged (partial progress, now moot) instead of leaking
+        # them at the distributor.
+        progress = self._files_in_progress.pop(url, None)
+        if progress is not None:
+            for item in progress.staged_items:
+                assert item.handle is not None
+                self._distributor.release_result(item.handle.result_id)
+        self._retry_chunks = [(c, a) for c, a in self._retry_chunks if c.url != url]
+
+        ratio = len(self._failed_files) / max(self._files_concluded, 100)
+        if ratio > self._failure_proportion:
+            raise VineReduceError(abort_message)
 
     def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
         group = task.group
@@ -629,6 +729,12 @@ class Pipeline:
             attempts_used = 1 + max((item.attempts for item in group), default=0)
             self._reduce_tasks_failed += 1
             if attempts_used >= self._attempts:
+                self._give_up_on_reduction(
+                    group,
+                    attempts=attempts_used,
+                    resources_measured=outcome.resources,
+                    traceback=outcome.traceback,
+                )
                 raise VineReduceError(
                     f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
                     f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
@@ -641,6 +747,12 @@ class Pipeline:
         if isinstance(outcome, ResourceExhaustion):
             self._reduce_tasks_failed += 1
             if self.reduction_size <= 2:
+                self._give_up_on_reduction(
+                    group,
+                    attempts=1 + max((item.attempts for item in group), default=0),
+                    resources_measured=outcome.resources,
+                    traceback=None,
+                )
                 raise VineReduceError(
                     f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
                     "resources at the minimum reduction_size (2); cannot retry smaller."
@@ -695,6 +807,38 @@ class Pipeline:
             )
         else:
             self.pool.append(new_item)
+
+    def _give_up_on_reduction(
+        self,
+        group: list[PoolItem],
+        *,
+        attempts: int,
+        resources_measured: dict[str, Any] | None,
+        traceback: str | None,
+    ) -> None:
+        """A reducer permanent failure: log every file folded into the
+        failed group and release the group's own distributor-held results
+        (they will never be used again). Unlike a processor permanent
+        failure (_give_up_on_file), this never checks failure_proportion -
+        the caller always aborts the whole run right after this returns, since
+        a partially-folded result can't be trusted not to be corrupted."""
+        if self._failure_log is not None:
+            allocated = self._distributor.resources("reducer")
+            files = frozenset().union(*(item.files for item in group))
+            for url in sorted(files):
+                self._failure_log.log(
+                    FailureRecord(
+                        dataset_name=self.dataset_name,
+                        filename=url,
+                        kind="reducer",
+                        attempts=attempts,
+                        resources_allocated=allocated,
+                        resources_measured=resources_measured,
+                        traceback=traceback,
+                    )
+                )
+        for item in group:
+            self._release_covered(item)
 
     def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall
