@@ -31,7 +31,7 @@ class TaskReport:
 
     processor_name: str
     dataset_name: str
-    kind: str  # "processor" | "reducer"
+    kind: str  # "processor" | "reducer" | "checkpoint" | "result" | "final"
     result_id: str
     description: str
     status: str  # "success" | "resource_exhaustion" | "failure"
@@ -197,6 +197,7 @@ class _ReduceTask:
     num_events: int
     total_time: float
     total_memory: float
+    force_final: bool = False
 
 
 class Pipeline:
@@ -564,6 +565,7 @@ class Pipeline:
             group=group,
             is_final=is_final,
             is_checkpoint=is_checkpoint,
+            force_final=force_final,
             num_events=num_events,
             total_time=total_time,
             total_memory=total_memory,
@@ -738,7 +740,15 @@ class Pipeline:
         description = f"reduction of {len(group)} partial{'s' if len(group) != 1 else ''}"
         if task.is_final:
             description += " (final)"
-        self._report_task("reducer", description, outcome)
+        if task.force_final:
+            reduce_kind = "final"
+        elif task.is_final:
+            reduce_kind = "result"
+        elif task.is_checkpoint:
+            reduce_kind = "checkpoint"
+        else:
+            reduce_kind = "reducer"
+        self._report_task(reduce_kind, description, outcome)
 
         if isinstance(outcome, RuntimeFailure):
             attempts_used = 1 + max((item.attempts for item in group), default=0)
