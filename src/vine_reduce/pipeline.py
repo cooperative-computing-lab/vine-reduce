@@ -639,7 +639,9 @@ class Pipeline:
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
-        self._report_task("processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome)
+        self._report_task(
+            "processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome
+        )
 
         if chunk.url in self._failed_files:
             # A sibling chunk of this (now abandoned) file already exhausted
