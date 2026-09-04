@@ -17,31 +17,35 @@ digraph chunk_lifecycle {
     edge [fontname="Helvetica", fontsize=10];
 
     // -- origin -------------------------------------------------------
-    file [label="Dataset file\n(url, entry count)", shape=cylinder, fillcolor="#e0e0e0"];
+    file [label="Dataset file\n(start here)", shape=cylinder, fillcolor="#e0e0e0"];
     gen  [label="Chunk generation\n(datasets_to_chunks)\nsplits file into Chunk(url, start, stop)"];
     file -> gen;
 
     // -- process stage --------------------------------------------------
     subgraph cluster_process {
-        label="Process stage  (one chunk)";
         style=dashed; color="#888888";
 
-        submit_p [label="Pipeline.feed():\nDistributor.submit(\n  executor_wrapper, processor, chunk, ...)"];
-        dist_p   [label="Distributor\ndispatches to an execution site\n(Local subprocess / TaskVine worker)"];
-        exec_p   [label="Executor\nruns processor(chunk)\n(Simple / Proc Pool / Dask)"];
-        submit_p -> dist_p -> exec_p;
+        dist   [label="Distributor\ndispatches to an execution site\n(Local subprocess / TaskVine worker)"];
+        exec   [label="Executor\nruns processor(chunk)\n(Simple / Proc Pool / Dask)"];
     }
+
+    submit_p [label="Pipeline.feed():\nDistributor.submit(\n  executor_wrapper, processor, chunk, ...)"];
+    submit_p -> dist
     gen -> submit_p [label="next chunk\n(attempts_used=0)"];
 
-    outcome_p [label="Outcome?", shape=diamond, fillcolor="#ffffff"];
-    exec_p -> outcome_p;
+    outcome [label="Type?", shape=diamond, fillcolor="#ffffff"];
+    exec -> outcome;
 
-    fatal_p [label="VineReduceError raised\n(fatal - run stops)", fillcolor="#f4a3a3"];
+    outcome -> outcome_p [label="processor"];
+    outcome -> outcome_r [label="reduction"];
+    fatal [label="VineReduceError raised\n(fatal - run stops)", fillcolor="#f4a3a3"];
+
+    outcome_p [label="Outcome?", shape=diamond, fillcolor="#ffffff"];
 
     // RuntimeFailure: retried unchanged, up to `attempts` total tries.
     rf_check_p [label="attempts_used + 1\n>= attempts?", shape=diamond, fillcolor="#ffffff"];
     outcome_p -> rf_check_p [label="RuntimeFailure", color="#c0392b", fontcolor="#c0392b"];
-    rf_check_p -> fatal_p [label="yes"];
+    rf_check_p -> fatal [label="yes"];
     retry_rf_p [label="retry same chunk unchanged;\nattempts_used += 1", fillcolor="#fdf1a3"];
     rf_check_p -> retry_rf_p [label="no"];
     retry_rf_p -> submit_p [label="resubmit", style=dashed];
@@ -49,7 +53,7 @@ digraph chunk_lifecycle {
     // ResourceExhaustion: halved and retried, unless already at the size floor.
     re_check_p [label="chunksize already at\nminimum (1 event)?", shape=diamond, fillcolor="#ffffff"];
     outcome_p -> re_check_p [label="ResourceExhaustion", color="#b7950b", fontcolor="#b7950b"];
-    re_check_p -> fatal_p [label="yes\n(no smaller size left)"];
+    re_check_p -> fatal [label="yes\n(no smaller size left)"];
     retry_re_p [label="halve chunksize;\nre-split & retry\n(fresh attempts_used=0\nfor each half)", fillcolor="#fdf1a3"];
     re_check_p -> retry_re_p [label="no"];
     retry_re_p -> submit_p [label="resubmit", style=dashed];
@@ -67,26 +71,17 @@ digraph chunk_lifecycle {
     join [label="Pool reaches reduction_size:\njoins with N-1 other pool items", fillcolor="#c8e6c9"];
     pool -> join;
 
-    subgraph cluster_reduce {
-        label="Reduce stage  (fold one group)";
-        style=dashed; color="#888888";
+    submit_r [label="Pipeline.submit_ready_reductions():\nDistributor.submit(\n  reducer_wrapper, reducer, group, ...)"];
+    submit_r -> dist
 
-        submit_r [label="Pipeline.submit_ready_reductions():\nDistributor.submit(\n  reducer_wrapper, reducer, group, ...)"];
-        dist_r   [label="Distributor\ndispatches to an execution site"];
-        exec_r   [label="Executor\nruns reducer(group)\n(Simple / Proc Pool / Dask)"];
-        submit_r -> dist_r -> exec_r;
-    }
     join -> submit_r [label="group items'\nattempts=0"];
 
     outcome_r [label="Outcome?", shape=diamond, fillcolor="#ffffff"];
-    exec_r -> outcome_r;
-
-    fatal_r [label="VineReduceError raised\n(fatal - run stops)", fillcolor="#f4a3a3"];
 
     // RuntimeFailure: retried unchanged (same group), up to `attempts` total tries.
     rf_check_r [label="1 + max(item.attempts)\n>= attempts?", shape=diamond, fillcolor="#ffffff"];
     outcome_r -> rf_check_r [label="RuntimeFailure", color="#c0392b", fontcolor="#c0392b"];
-    rf_check_r -> fatal_r [label="yes"];
+    rf_check_r -> fatal [label="yes"];
     retry_rf_r [label="retry same group unchanged;\neach item.attempts = new count", fillcolor="#fdf1a3"];
     rf_check_r -> retry_rf_r [label="no"];
     retry_rf_r -> submit_r [label="resubmit", style=dashed];
@@ -95,7 +90,7 @@ digraph chunk_lifecycle {
     // reduction_size, unless already at the size floor.
     re_check_r [label="reduction_size already\nat minimum (2)?", shape=diamond, fillcolor="#ffffff"];
     outcome_r -> re_check_r [label="ResourceExhaustion", color="#b7950b", fontcolor="#b7950b"];
-    re_check_r -> fatal_r [label="yes\n(no smaller size left)"];
+    re_check_r -> fatal [label="yes\n(no smaller size left)"];
     retry_re_r [label="halve reduction_size;\ndisband group into pool,\neach item.attempts reset to 0", fillcolor="#fdf1a3"];
     re_check_r -> retry_re_r [label="no"];
     retry_re_r -> pool [label="requeue", style=dashed];
