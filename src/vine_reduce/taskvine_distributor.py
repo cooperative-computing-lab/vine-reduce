@@ -131,6 +131,12 @@ class TaskVineDistributor:
         self._manager = manager if manager is not None else vine.Manager(port=port, name=name)
         self._manager.enable_monitoring(watchdog=True)
 
+        if self._owns_manager:
+            self._manager.tune("category-steady-n-tasks", 2)
+            self._manager.tune("hungry-minimum", 100)
+            self._manager.tune("prefer-dispatch", 1)
+            self._manager.tune("temp-replica-count", 3)
+
         self._resources_by_kind: dict[TaskKind, dict[str, int]] = {
             "processor": resources_processor or {},
             "reducer": resources_reducer or {},
