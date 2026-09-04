@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from uuid import uuid4
 
 import ndcctools.taskvine as vine
@@ -24,6 +25,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 WAIT_TIMEOUT = 30  # generous, to absorb the worker's first-connect latency
+
+
+def _wait(distributor, timeout=WAIT_TIMEOUT):
+    """distributor.wait(t) can return None well before t elapses even
+    though a submitted task is still legitimately in flight - dispatch/
+    completion isn't synchronous with the call. So, mirroring TaskVine's
+    own idiom for draining a manager (`while not m.empty(): t =
+    m.wait()`), keep polling as long as there's something outstanding,
+    instead of treating one None as "nothing happened"."""
+    deadline = time.monotonic() + timeout
+    while not distributor._manager.empty():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        outcome = distributor.wait(timeout=remaining)
+        if outcome is not None:
+            return outcome
+    return None
 
 
 @pytest.fixture
@@ -78,7 +97,7 @@ def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
 def test_submit_and_wait_round_trip(distributor, tmp_path):
     result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
 
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     assert isinstance(outcome, Success)
     assert outcome.result_id == result_id
@@ -95,7 +114,7 @@ def test_wait_returns_none_when_nothing_pending(distributor):
 
 def test_retrieve_copies_file(distributor, tmp_path):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     dest = tmp_path / "copy.pkl.zst"
     distributor.retrieve(outcome.result_id, str(dest))
@@ -105,7 +124,7 @@ def test_retrieve_copies_file(distributor, tmp_path):
 
 def test_release_result_allows_reuse(distributor):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     distributor.release_result(outcome.result_id)
     # release_result is fire-and-forget cleanup; the main guarantee is that
@@ -119,7 +138,7 @@ def test_ordinary_result_is_not_written_to_checkpoint_dir(distributor):
     checkpoint_path() (only meaningful for is_checkpoint=True results) must
     not know about it."""
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     assert _result_token(outcome.result_id) not in distributor._checkpoint_paths_by_token
     assert os.listdir(distributor._checkpoint_dir) == []
@@ -132,7 +151,7 @@ def test_checkpoint_result_is_durably_written_to_checkpoint_dir(distributor):
     TaskVine already wrote it there as part of completing the task (see the
     module docstring)."""
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     path = distributor.checkpoint_path(outcome.result_id)
     assert path.startswith(distributor._checkpoint_dir + os.sep)
@@ -141,7 +160,7 @@ def test_checkpoint_result_is_durably_written_to_checkpoint_dir(distributor):
 
 def test_release_result_removes_checkpoint_file_from_disk(distributor):
     _submit_chunk(distributor, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
     path = distributor.checkpoint_path(outcome.result_id)
     assert os.path.exists(path)
 
@@ -173,7 +192,7 @@ def test_failed_task_reports_real_traceback_not_output_missing(distributor):
         SimpleExecutor(),
     )
 
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     assert isinstance(outcome, RuntimeFailure)
     assert outcome.result_id == result_id
@@ -209,7 +228,7 @@ def test_constructor_reuses_a_pre_built_manager(monkeypatch, tmp_path):
     workers.timeout = WAIT_TIMEOUT
     with workers:
         result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 4))
-        outcome = dist.wait(timeout=WAIT_TIMEOUT)
+        outcome = _wait(dist)
     dist.shutdown()
 
     assert isinstance(outcome, Success)
@@ -239,7 +258,7 @@ def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
         default_chunk_to_args,
         SimpleExecutor(),
     )
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     assert isinstance(outcome, Success)
     assert outcome.result_id == result_id
@@ -266,7 +285,7 @@ def test_set_env_var_is_visible_to_every_task(distributor, tmp_path):
         default_chunk_to_args,
         SimpleExecutor(),
     )
-    outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome = _wait(distributor)
 
     assert isinstance(outcome, Success)
     assert outcome.result_id == result_id
@@ -284,7 +303,7 @@ def test_reduction_chains_across_two_tasks(distributor, tmp_path):
 
     outcomes = {}
     for _ in range(2):
-        outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+        outcome = _wait(distributor)
         outcomes[outcome.result_id] = outcome
 
     file_a, file_b = outcomes[id_a].file, outcomes[id_b].file
@@ -301,7 +320,7 @@ def test_reduction_chains_across_two_tasks(distributor, tmp_path):
         True,
         None,
     )
-    reduce_outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    reduce_outcome = _wait(distributor)
 
     assert isinstance(reduce_outcome, Success)
     assert reduce_outcome.result_id == reduce_id
@@ -324,7 +343,7 @@ def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, 
     assert file in distributor._files_by_key
 
     _submit_chunk(distributor, 1, Chunk("b.root", 0, 3))
-    outcome_b = distributor.wait(timeout=WAIT_TIMEOUT)
+    outcome_b = _wait(distributor)
 
     reduce_id = uuid4().hex
     distributor.submit(
@@ -338,7 +357,7 @@ def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, 
         True,
         None,
     )
-    reduce_outcome = distributor.wait(timeout=WAIT_TIMEOUT)
+    reduce_outcome = _wait(distributor)
 
     assert isinstance(reduce_outcome, Success)
     assert reduce_outcome.result_id == reduce_id
@@ -371,7 +390,7 @@ def test_checkpoint_filenames_never_collide_across_restarts(monkeypatch, tmp_pat
         workers.timeout = WAIT_TIMEOUT
         with workers:
             _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-            outcome = dist.wait(timeout=WAIT_TIMEOUT)
+            outcome = _wait(dist)
             path = dist.checkpoint_path(outcome.result_id)
         dist.shutdown()
         return path
