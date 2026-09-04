@@ -50,6 +50,13 @@ class TaskReporter(Protocol):
         ...
 
 
+def _truncate_name(name: str, width: int = 20) -> str:
+    """Shorten a long name (e.g. a dataset file URL) for display, keeping
+    only its last `width` characters - e.g. ".../xyz/ffff.root" - so a
+    single task-status line doesn't get lost under a long path."""
+    return name if len(name) <= width else "..." + name[-width:]
+
+
 def _status_of(outcome: Outcome) -> str:
     if isinstance(outcome, Success):
         return "success"
@@ -588,7 +595,7 @@ class Pipeline:
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
-        self._report_task("processor", f"{chunk.url}[{chunk.start}:{chunk.stop}]", outcome)
+        self._report_task("processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome)
 
         if chunk.url in self._failed_files:
             # A sibling chunk of this (now abandoned) file already exhausted
@@ -720,7 +727,7 @@ class Pipeline:
 
     def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
         group = task.group
-        description = f"fold of {len(group)} item{'s' if len(group) != 1 else ''}"
+        description = f"reduction of {len(group)} partial{'s' if len(group) != 1 else ''}"
         if task.is_final:
             description += " (final)"
         self._report_task("reducer", description, outcome)
