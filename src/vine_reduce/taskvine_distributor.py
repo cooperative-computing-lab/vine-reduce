@@ -153,6 +153,10 @@ class TaskVineDistributor:
         self._extra_files: list[tuple[str, vine.File]] = []
         self._extra_env: dict[str, str] = {}
 
+        # Whether last wait received a task. If yes, we set timeout to 0
+        # to try to receive as many tasks as possible.
+        self._task_last_wait = False
+
     @property
     def port(self) -> int:
         """The manager's actual listening port - useful when `port=0` (or a
@@ -264,14 +268,25 @@ class TaskVineDistributor:
         """Block until a submitted task finishes, returning its Outcome
         (Success/RuntimeFailure/ResourceExhaustion, translated from
         TaskVine's own result string when the task didn't run its Python
-        function to completion), or None if timeout elapses first."""
+        function to completion), or None if timeout elapses first.
+        If timeout is None, a default of 5 seconds is used."""
         # TaskVine's C API only accepts an integer number of seconds; round
         # up so a small positive float still waits at least that long
         # instead of truncating to 0 ("return immediately").
-        vine_timeout = "wait_forever" if timeout is None else max(0, math.ceil(timeout))
+        if self._task_last_wait is True:
+            vine_timeout = 0
+        else:
+            if timeout is None:
+                vine_timeout = 5
+            else:
+                vine_timeout = max(0, math.ceil(timeout))
+
         task = self._manager.wait(vine_timeout)
         if task is None:
+            self._task_last_wait = False
             return None
+
+        self._task_last_wait = True
 
         entry = self._in_flight_by_taskvine_id.pop(task.id)
         result_id, kind = entry.result_id, entry.kind
