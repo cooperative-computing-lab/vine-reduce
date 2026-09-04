@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -16,6 +17,7 @@ from vine_reduce.pipeline import (
     _ReduceTask,
     plan_restart,
 )
+from vine_reduce.size_log import SizeLog
 from vine_reduce.types import Chunk, ResourceExhaustion, ResultHandle
 
 from helpers import (
@@ -54,6 +56,7 @@ def make_pipeline(
     attempts=3,
     failure_proportion=0.0,
     failure_log=None,
+    size_log=None,
 ):
     db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
@@ -84,6 +87,7 @@ def make_pipeline(
             attempts=attempts,
             failure_proportion=failure_proportion,
             failure_log=failure_log,
+            size_log=size_log,
         ),
         db,
     )
@@ -120,6 +124,47 @@ def test_pools_across_files_and_produces_one_final_result(fake_distributor, tmp_
 
     assert final_value(pipeline) == 10
     assert pipeline.final_results[0].num_events == 10
+    db.close()
+
+
+def test_finish_writes_one_size_log_row_with_measured_maxima(fake_distributor, tmp_path):
+    size_log_path = str(tmp_path / "size.jsonl")
+    dataset = {"files": {"a.root": 5, "b.root": 5}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reduction_size=10,
+        chunksize=3,
+        size_log=SizeLog(size_log_path),
+    )
+
+    run_to_completion(pipeline, fake_distributor)
+
+    rows = [json.loads(line) for line in open(size_log_path).read().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["dataset_name"] == "ds"
+    assert row["processor_name"] == "proc"
+    assert row["chunk_size"] == 3
+    assert row["reduction_size"] == 10
+    # FakeDistributor runs the real executor_wrapper/reducer_wrapper, so
+    # cores/memory are genuinely measured (see defaults.py's _measure) - not
+    # every distributor reports "disk", so it must be absent, not null.
+    assert row["processing"]["cores"] == 1
+    assert row["processing"]["memory"] > 0
+    assert "disk" not in row["processing"]
+    assert row["reduction"]["cores"] == 1
+    assert row["reduction"]["memory"] > 0
+    db.close()
+
+
+def test_finish_without_a_size_log_does_not_error(fake_distributor, tmp_path):
+    dataset = {"files": {"a.root": 5}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset)
+
+    run_to_completion(pipeline, fake_distributor)  # size_log=None by default - must not raise
+
     db.close()
 
 
@@ -439,6 +484,37 @@ def test_restart_with_final_checkpoint_for_all_files_skips_pipeline_entirely(
     assert pipeline.pool == []
     assert pipeline.in_flight_count() == 0
     assert len(pipeline.final_results) == 1
+    db.close()
+
+
+def test_restart_with_no_fresh_tasks_logs_size_with_null_resources(fake_distributor, tmp_path):
+    """A pipeline that starts out finished (fully covered by checkpoints from
+    a previous run) never runs a processor/reducer task itself in this
+    process, so there is nothing to report a measured max over - processing/
+    reduction must be null, not an all-zero dict (see _log_size_once and
+    Pipeline.__init__'s finished-at-construction branch)."""
+    size_log_path = str(tmp_path / "size.jsonl")
+    dataset = {"files": {"a.root": 5, "b.root": 5}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers_files=["a.root", "b.root"],
+        num_events=10,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=True,
+        path="/tmp/final.pkl",
+    )
+
+    pipeline, _ = make_pipeline(
+        fake_distributor, tmp_path, dataset, db=db, size_log=SizeLog(size_log_path)
+    )
+
+    assert pipeline.finished is True
+    row = json.loads(open(size_log_path).read())
+    assert row["processing"] is None
+    assert row["reduction"] is None
     db.close()
 
 

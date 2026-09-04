@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -109,6 +110,23 @@ def test_end_to_end_two_processors_two_datasets(tmp_path, dataset_input, distrib
     assert _read_only_result(vr.results_dir, "more_numbers", "count") == 4
     assert _read_only_result(vr.results_dir, "numbers", "double_count") == 20
     assert _read_only_result(vr.results_dir, "more_numbers", "double_count") == 8
+
+    # size.jsonl gets one row per (processor, dataset) pair too, at the top
+    # of results_dir rather than nested per-pipeline.
+    rows = [
+        json.loads(line)
+        for line in open(os.path.join(vr.results_dir, "size.jsonl")).read().splitlines()
+    ]
+    pairs = {(row["processor_name"], row["dataset_name"]) for row in rows}
+    assert pairs == {
+        ("count", "numbers"),
+        ("count", "more_numbers"),
+        ("double_count", "numbers"),
+        ("double_count", "more_numbers"),
+    }
+    for row in rows:
+        assert row["processing"]["cores"] == 1
+        assert row["processing"]["memory"] > 0
 
 
 def test_per_dataset_reduction_size_config_is_respected(tmp_path, dataset_input, distributor):

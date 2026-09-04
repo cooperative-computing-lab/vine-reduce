@@ -22,6 +22,7 @@ from .executor import Executor, SimpleExecutor
 from .failure_log import FailureLog
 from .pipeline import Pipeline, VineReduceError
 from .progress import NullProgressReporter, ProgressReporter
+from .size_log import SizeLog
 
 __all__ = ["VineReduce", "VineReduceError"]
 
@@ -121,6 +122,8 @@ class VineReduce:
         result, regardless of checkpoint_time/checkpoint_distance.
     results_dir: directory final, per-(processor, dataset) results are
         written under, at results_dir/<dataset_name>/<processor_name>/.
+        results_dir/size.jsonl also lives here - one line per (processor,
+        dataset) pipeline, written as soon as it finishes; see size_log.py.
     distributor: where processor/reducer calls actually run - a Distributor
         implementation such as TaskVineDistributor. Defaults to a
         LocalDistributor (ProcessPoolExecutor-backed) that compute() creates
@@ -266,8 +269,12 @@ class VineReduce:
             # failure_proportion's docstring above.
             failure_log_path = os.path.join(os.getcwd(), "failed_files.log")
             failure_log = FailureLog(failure_log_path)
+            # size.jsonl lives at the top of results_dir, shared across every
+            # (processor, dataset) pipeline of this run - see size_log.py and
+            # Pipeline._log_size_once, the only place it's written to.
+            size_log = SizeLog(os.path.join(self.results_dir, "size.jsonl"))
             pipelines = self._build_pipelines(
-                datasets, distributor, db, datasets_to_chunks, reporter, failure_log
+                datasets, distributor, db, datasets_to_chunks, reporter, failure_log, size_log
             )
             self._run(pipelines, distributor, reporter)
 
@@ -289,6 +296,7 @@ class VineReduce:
         datasets_to_chunks: Callable,
         task_reporter: ProgressReporter | NullProgressReporter,
         failure_log: FailureLog,
+        size_log: SizeLog,
     ) -> list[Pipeline]:
         num_processors = len(self.processors)
         pipelines: list[Pipeline] = []
@@ -330,6 +338,7 @@ class VineReduce:
                         attempts=self.attempts,
                         failure_proportion=self.failure_proportion,
                         failure_log=failure_log,
+                        size_log=size_log,
                         task_reporter=task_reporter,
                     )
                 )

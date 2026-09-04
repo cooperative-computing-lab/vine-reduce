@@ -14,6 +14,7 @@ from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor
 from .executor import Executor
 from .failure_log import FailureLog, FailureRecord
+from .size_log import SizeLog, SizeRecord
 from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
 
 
@@ -63,6 +64,26 @@ def _status_of(outcome: Outcome) -> str:
     if isinstance(outcome, ResourceExhaustion):
         return "resource_exhaustion"
     return "failure"
+
+
+# Maps an Outcome.resources key onto its size.jsonl name (see size_log.py) -
+# only a key a distributor actually reports ends up in a SizeRecord's
+# processing/reduction dict, so e.g. "disk" stays absent until some
+# distributor starts measuring it.
+_SIZE_RESOURCE_KEYS = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
+
+
+def _update_resource_max(maxes: dict[str, float], resources: dict[str, Any]) -> None:
+    """Folds one Success outcome's measured resources into a running
+    {"cores"/"memory"/"disk": peak} dict - see SizeRecord.processing/
+    reduction. Only called for Success outcomes (see Pipeline._handle_chunk_
+    outcome/_handle_reduce_outcome) - a killed/failed task's numbers aren't
+    trusted as a genuine peak."""
+    for internal_key, output_key in _SIZE_RESOURCE_KEYS.items():
+        value = resources.get(internal_key)
+        if value is None:
+            continue
+        maxes[output_key] = max(maxes.get(output_key, value), value)
 
 
 @dataclass(frozen=True)
@@ -232,6 +253,7 @@ class Pipeline:
         attempts: int = 3,
         failure_proportion: float = 0.0,
         failure_log: FailureLog | None = None,
+        size_log: SizeLog | None = None,
         task_reporter: TaskReporter | None = None,
     ):
         self.processor_name = processor_name
@@ -260,6 +282,10 @@ class Pipeline:
         self._attempts = attempts
         self._failure_proportion = failure_proportion
         self._failure_log = failure_log
+        self._size_log = size_log
+        self._size_logged = False
+        self._processing_max: dict[str, float] = {}
+        self._reduction_max: dict[str, float] = {}
         self._process_category = f"{processor_name}:{dataset_name}:process"
         self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
         self._task_reporter = task_reporter
@@ -300,7 +326,13 @@ class Pipeline:
         self._reduce_tasks_submitted = 0
 
         self._seed_from_checkpoints()
-        if not self.finished:
+        if self.finished:
+            # Already fully covered by checkpoints from a previous run -
+            # refresh_finished (the usual trigger for _log_size_once) is
+            # never reached for a pipeline that starts out finished, since
+            # the scheduling loop skips it outright (see VineReduce._run).
+            self._log_size_once()
+        else:
             os.makedirs(self._results_dir, exist_ok=True)
 
     # -- restart -----------------------------------------------------------
@@ -429,6 +461,8 @@ class Pipeline:
         file but not yet marked finished at construction."""
         if not self.finished:
             self.finished = self.chunks_all_done and not self.pool and self.in_flight_count() == 0
+            if self.finished:
+                self._log_size_once()
 
     @property
     def chunks_all_done(self) -> bool:
@@ -667,6 +701,7 @@ class Pipeline:
         assert isinstance(outcome, Success)
         self._proc_tasks_completed += 1
         self._events_completed += chunk.num_events
+        _update_resource_max(self._processing_max, outcome.resources)
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
 
@@ -792,6 +827,7 @@ class Pipeline:
 
         assert isinstance(outcome, Success)
         self._reduce_tasks_completed += 1
+        _update_resource_max(self._reduction_max, outcome.resources)
         # group's own handles are deliberately not released here: new_item
         # isn't durable yet, so if it's lost before something checkpoints
         # it, group (kept below as new_item.inputs) is the only way to
@@ -948,3 +984,32 @@ class Pipeline:
             if not item.is_checkpointed:
                 stack.extend(item.inputs)
             item.inputs = []
+
+    def _log_size_once(self) -> None:
+        """Writes this pipeline's size.jsonl row (see size_log.py) the first
+        time it finishes - guarded by _size_logged since __init__ and
+        refresh_finished can both be the trigger, but a row must land
+        exactly once."""
+        if self._size_logged or self._size_log is None:
+            return
+        self._size_logged = True
+        self._size_log.log(
+            SizeRecord(
+                dataset_name=self.dataset_name,
+                processor_name=self.processor_name,
+                chunk_size=self.chunksize,
+                reduction_size=self.reduction_size,
+                processing=self._rounded_max(self._processing_max),
+                reduction=self._rounded_max(self._reduction_max),
+            )
+        )
+
+    @staticmethod
+    def _rounded_max(maxes: dict[str, float]) -> dict[str, float] | None:
+        """None (not {}) when nothing of this kind was ever measured - e.g. a
+        restart that resumed entirely from checkpoints, running no fresh
+        processor/reducer task itself - so size.jsonl can tell "not measured
+        this run" apart from "measured, all zero"."""
+        if not maxes:
+            return None
+        return {key: round(value, 2) for key, value in maxes.items()}
