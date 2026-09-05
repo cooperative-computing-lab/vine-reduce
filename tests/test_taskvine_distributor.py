@@ -45,35 +45,6 @@ def _wait(distributor, timeout=WAIT_TIMEOUT):
     return None
 
 
-@pytest.fixture
-def distributor(monkeypatch, tmp_path):
-    # The worker is a real separate process, unlike LocalDistributor's forked
-    # ProcessPoolExecutor workers, which inherit the test process's already-
-    # imported modules for free. cloudpickle pickles tests/helpers.py's
-    # functions by reference, so the worker needs tests/ on its own
-    # PYTHONPATH to import them when unpickling. vine.Factory launches
-    # vine_factory (and, transitively, vine_worker and the per-task Python
-    # subprocess it forks) by inheriting this process's environment as-is,
-    # so setting PYTHONPATH here is enough - no need to route it through
-    # Factory's own --env option.
-    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
-
-    dist = TaskVineDistributor(
-        port=0,
-        resources_processor={"cores": 1},
-        resources_reducer={"cores": 1},
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
-    workers = vine.Factory(manager=dist._manager)
-    workers.cores = 2
-    workers.min_workers = 1
-    workers.max_workers = 1
-    workers.timeout = WAIT_TIMEOUT
-    with workers:
-        yield dist
-    dist.shutdown()
-
-
 def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
     result_id = uuid4().hex
     distributor.submit(
@@ -94,115 +65,238 @@ def _submit_chunk(distributor, priority, chunk, is_checkpoint=False):
     return result_id
 
 
-def test_submit_and_wait_round_trip(distributor, tmp_path):
-    result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+def test_submit_and_wait_round_trip(monkeypatch, tmp_path):
+    # The worker is a real separate process, unlike LocalDistributor's forked
+    # ProcessPoolExecutor workers, which inherit the test process's already-
+    # imported modules for free. cloudpickle pickles tests/helpers.py's
+    # functions by reference, so the worker needs tests/ on its own
+    # PYTHONPATH to import them when unpickling. vine.Factory launches
+    # vine_factory (and, transitively, vine_worker and the per-task Python
+    # subprocess it forks) by inheriting this process's environment as-is,
+    # so setting PYTHONPATH here is enough - no need to route it through
+    # Factory's own --env option.
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 5))
 
-    outcome = _wait(distributor)
+            outcome = _wait(dist)
 
-    assert isinstance(outcome, Success)
-    assert outcome.result_id == result_id
-    # outcome.file is an opaque token, not a readable path (see
-    # taskvine_distributor.py's docstring) - retrieve() is how it's read.
-    dest = tmp_path / "copy.pkl.zst"
-    distributor.retrieve(outcome.result_id, str(dest))
-    assert serialization.load(str(dest)) == 5
-
-
-def test_wait_returns_none_when_nothing_pending(distributor):
-    assert distributor.wait(timeout=0.1) is None
-
-
-def test_retrieve_copies_file(distributor, tmp_path):
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = _wait(distributor)
-
-    dest = tmp_path / "copy.pkl.zst"
-    distributor.retrieve(outcome.result_id, str(dest))
-
-    assert serialization.load(str(dest)) == 3
-
-
-def test_release_result_allows_reuse(distributor):
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = _wait(distributor)
-
-    distributor.release_result(outcome.result_id)
-    # release_result is fire-and-forget cleanup; the main guarantee is that
-    # it doesn't raise, and that the distributor's own bookkeeping is cleared.
-    assert _result_token(outcome.result_id) not in distributor._files_by_key
+            assert isinstance(outcome, Success)
+            assert outcome.result_id == result_id
+            # outcome.file is an opaque token, not a readable path (see
+            # taskvine_distributor.py's docstring) - retrieve() is how it's read.
+            dest = tmp_path / "copy.pkl.zst"
+            dist.retrieve(outcome.result_id, str(dest))
+            assert serialization.load(str(dest)) == 5
 
 
-def test_ordinary_result_is_not_written_to_checkpoint_dir(distributor):
+def test_wait_returns_none_when_nothing_pending(monkeypatch, tmp_path):
+    # No task is ever submitted here, so no worker is needed - skip the
+    # Factory entirely. cctools has a bug (see CCTOOLS_BUG.txt) where, for
+    # batch_type="local", a worker can get stuck mid-SSL-handshake and then
+    # Factory.stop() hangs forever trying to reap it; not spinning up a
+    # worker at all is the workaround until that's fixed upstream.
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        assert dist.wait(timeout=0.1) is None
+
+
+def test_retrieve_copies_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 3))
+            outcome = _wait(dist)
+
+            dest = tmp_path / "copy.pkl.zst"
+            dist.retrieve(outcome.result_id, str(dest))
+
+            assert serialization.load(str(dest)) == 3
+
+
+def test_release_result_allows_reuse(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 3))
+            outcome = _wait(dist)
+
+            dist.release_result(outcome.result_id)
+            # release_result is fire-and-forget cleanup; the main guarantee is
+            # that it doesn't raise, and that the distributor's own bookkeeping
+            # is cleared.
+            assert _result_token(outcome.result_id) not in dist._files_by_key
+
+
+def test_ordinary_result_is_not_written_to_checkpoint_dir(monkeypatch, tmp_path):
     """A result submitted without is_checkpoint=True must be an ordinary
     vine_temp() - it should never appear under checkpoint_dir, and
     checkpoint_path() (only meaningful for is_checkpoint=True results) must
     not know about it."""
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    outcome = _wait(distributor)
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 3))
+            outcome = _wait(dist)
 
-    assert _result_token(outcome.result_id) not in distributor._checkpoint_paths_by_token
-    assert os.listdir(distributor._checkpoint_dir) == []
+            assert _result_token(outcome.result_id) not in dist._checkpoint_paths_by_token
+            assert os.listdir(dist._checkpoint_dir) == []
 
 
-def test_checkpoint_result_is_durably_written_to_checkpoint_dir(distributor):
+def test_checkpoint_result_is_durably_written_to_checkpoint_dir(monkeypatch, tmp_path):
     """A result submitted with is_checkpoint=True must be a
     vine_file(cache=True) written under checkpoint_dir - readable straight
     off disk via checkpoint_path(), with no retrieve() call needed, since
     TaskVine already wrote it there as part of completing the task (see the
     module docstring)."""
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-    outcome = _wait(distributor)
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
+            outcome = _wait(dist)
 
-    path = distributor.checkpoint_path(outcome.result_id)
-    assert path.startswith(distributor._checkpoint_dir + os.sep)
-    assert serialization.load(path) == 5
+            path = dist.checkpoint_path(outcome.result_id)
+            assert path.startswith(dist._checkpoint_dir + os.sep)
+            assert serialization.load(path) == 5
 
 
-def test_release_result_removes_checkpoint_file_from_disk(distributor):
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-    outcome = _wait(distributor)
-    path = distributor.checkpoint_path(outcome.result_id)
-    assert os.path.exists(path)
+def test_release_result_removes_checkpoint_file_from_disk(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
+            outcome = _wait(dist)
+            path = dist.checkpoint_path(outcome.result_id)
+            assert os.path.exists(path)
 
-    distributor.release_result(outcome.result_id)
+            dist.release_result(outcome.result_id)
 
-    assert not os.path.exists(path)
-    assert _result_token(outcome.result_id) not in distributor._checkpoint_paths_by_token
+            assert not os.path.exists(path)
+            assert _result_token(outcome.result_id) not in dist._checkpoint_paths_by_token
 
 
-def test_failed_task_reports_real_traceback_not_output_missing(distributor):
+def test_failed_task_reports_real_traceback_not_output_missing(monkeypatch, tmp_path):
     """A processor that raises must come back as the wrapper's own
     RuntimeFailure, with the real traceback - not as a generic "output
     missing" RuntimeFailure with no traceback, which is what happens if the
     declared dest_file output isn't produced on failure (see defaults.py's
     _run_and_wrap)."""
-    result_id = uuid4().hex
-    distributor.submit(
-        result_id,
-        1,
-        "test:process",
-        "processor",
-        executor_wrapper,
-        failing_processor,
-        Chunk("a.root", 0, 5),
-        {},
-        None,
-        None,
-        default_chunk_to_args,
-        SimpleExecutor(),
-    )
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            result_id = uuid4().hex
+            dist.submit(
+                result_id,
+                1,
+                "test:process",
+                "processor",
+                executor_wrapper,
+                failing_processor,
+                Chunk("a.root", 0, 5),
+                {},
+                None,
+                None,
+                default_chunk_to_args,
+                SimpleExecutor(),
+            )
 
-    outcome = _wait(distributor)
+            outcome = _wait(dist)
 
-    assert isinstance(outcome, RuntimeFailure)
-    assert outcome.result_id == result_id
-    assert "ValueError: boom" in outcome.traceback
-    # The placeholder dest_file must not leak once its outcome is consumed.
-    assert _result_token(result_id) not in distributor._files_by_key
+            assert isinstance(outcome, RuntimeFailure)
+            assert outcome.result_id == result_id
+            assert "ValueError: boom" in outcome.traceback
+            # The placeholder dest_file must not leak once its outcome is consumed.
+            assert _result_token(result_id) not in dist._files_by_key
 
 
-def test_capacity_reports_a_non_negative_capacity(distributor):
-    assert distributor.capacity() >= 0
+def test_capacity_reports_a_non_negative_capacity(monkeypatch, tmp_path):
+    # No task is ever submitted here, so no worker is needed - skip the
+    # Factory entirely (see test_wait_returns_none_when_nothing_pending and
+    # CCTOOLS_BUG.txt).
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        assert dist.capacity() >= 0
 
 
 def test_constructor_reuses_a_pre_built_manager(monkeypatch, tmp_path):
@@ -213,161 +307,212 @@ def test_constructor_reuses_a_pre_built_manager(monkeypatch, tmp_path):
     monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
     manager = vine.Manager(port=0, ssl=True)
 
-    dist = TaskVineDistributor(
+    with TaskVineDistributor(
         manager=manager,
         resources_processor={"cores": 1},
         resources_reducer={"cores": 1},
         checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
-    assert dist._manager is manager
+    ) as dist:
+        assert dist._manager is manager
 
-    workers = vine.Factory(manager=manager)
-    workers.cores = 2
-    workers.min_workers = 1
-    workers.max_workers = 1
-    workers.timeout = WAIT_TIMEOUT
-    with workers:
-        result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 4))
-        outcome = _wait(dist)
-    dist.shutdown()
+        workers = vine.Factory(manager=manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 4))
+            outcome = _wait(dist)
 
     assert isinstance(outcome, Success)
     assert outcome.result_id == result_id
 
 
-def test_add_file_ships_file_to_every_task_sandbox(distributor, tmp_path):
+def test_add_file_ships_file_to_every_task_sandbox(monkeypatch, tmp_path):
     # add_file places the file under its basename in the task's own sandbox,
     # so the processor must open it by that relative name (see
     # helpers.read_shipped_file), not by its local path.
-    shipped = tmp_path / "shipped.txt"
-    shipped.write_text("hello from add_file")
-    distributor.add_file(str(shipped))
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            shipped = tmp_path / "shipped.txt"
+            shipped.write_text("hello from add_file")
+            dist.add_file(str(shipped))
 
-    result_id = uuid4().hex
-    distributor.submit(
-        result_id,
-        1,
-        "test:process",
-        "processor",
-        executor_wrapper,
-        read_shipped_file,
-        Chunk("a.root", 0, 1),
-        {},
-        None,
-        None,
-        default_chunk_to_args,
-        SimpleExecutor(),
-    )
-    outcome = _wait(distributor)
+            result_id = uuid4().hex
+            dist.submit(
+                result_id,
+                1,
+                "test:process",
+                "processor",
+                executor_wrapper,
+                read_shipped_file,
+                Chunk("a.root", 0, 1),
+                {},
+                None,
+                None,
+                default_chunk_to_args,
+                SimpleExecutor(),
+            )
+            outcome = _wait(dist)
 
-    assert isinstance(outcome, Success)
-    assert outcome.result_id == result_id
-    dest = tmp_path / "copy.pkl.zst"
-    distributor.retrieve(outcome.result_id, str(dest))
-    assert serialization.load(str(dest)) == "hello from add_file"
-
-
-def test_set_env_var_is_visible_to_every_task(distributor, tmp_path):
-    distributor.set_env_var("VINE_REDUCE_TEST_VAR", "abc123")
-
-    result_id = uuid4().hex
-    distributor.submit(
-        result_id,
-        1,
-        "test:process",
-        "processor",
-        executor_wrapper,
-        read_env_var,
-        Chunk("a.root", 0, 1),
-        {},
-        None,
-        None,
-        default_chunk_to_args,
-        SimpleExecutor(),
-    )
-    outcome = _wait(distributor)
-
-    assert isinstance(outcome, Success)
-    assert outcome.result_id == result_id
-    dest = tmp_path / "copy.pkl.zst"
-    distributor.retrieve(outcome.result_id, str(dest))
-    assert serialization.load(str(dest)) == "abc123"
+            assert isinstance(outcome, Success)
+            assert outcome.result_id == result_id
+            dest = tmp_path / "copy.pkl.zst"
+            dist.retrieve(outcome.result_id, str(dest))
+            assert serialization.load(str(dest)) == "hello from add_file"
 
 
-def test_reduction_chains_across_two_tasks(distributor, tmp_path):
+def test_set_env_var_is_visible_to_every_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            dist.set_env_var("VINE_REDUCE_TEST_VAR", "abc123")
+
+            result_id = uuid4().hex
+            dist.submit(
+                result_id,
+                1,
+                "test:process",
+                "processor",
+                executor_wrapper,
+                read_env_var,
+                Chunk("a.root", 0, 1),
+                {},
+                None,
+                None,
+                default_chunk_to_args,
+                SimpleExecutor(),
+            )
+            outcome = _wait(dist)
+
+            assert isinstance(outcome, Success)
+            assert outcome.result_id == result_id
+            dest = tmp_path / "copy.pkl.zst"
+            dist.retrieve(outcome.result_id, str(dest))
+            assert serialization.load(str(dest)) == "abc123"
+
+
+def test_reduction_chains_across_two_tasks(monkeypatch, tmp_path):
     """The core file-passing bridge: a reduction task's input_files list
     contains tokens minted by earlier Success outcomes, not real paths -
     _remap_files must turn those into real task inputs."""
-    id_a = _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
-    id_b = _submit_chunk(distributor, 1, Chunk("a.root", 3, 8))
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            id_a = _submit_chunk(dist, 1, Chunk("a.root", 0, 3))
+            id_b = _submit_chunk(dist, 1, Chunk("a.root", 3, 8))
 
-    outcomes = {}
-    for _ in range(2):
-        outcome = _wait(distributor)
-        outcomes[outcome.result_id] = outcome
+            outcomes = {}
+            for _ in range(2):
+                outcome = _wait(dist)
+                outcomes[outcome.result_id] = outcome
 
-    file_a, file_b = outcomes[id_a].file, outcomes[id_b].file
+            file_a, file_b = outcomes[id_a].file, outcomes[id_b].file
 
-    reduce_id = uuid4().hex
-    distributor.submit(
-        reduce_id,
-        10,
-        "test:reduce",
-        "reducer",
-        reducer_wrapper,
-        sum_reducer,
-        [file_a, file_b],
-        True,
-        None,
-    )
-    reduce_outcome = _wait(distributor)
+            reduce_id = uuid4().hex
+            dist.submit(
+                reduce_id,
+                10,
+                "test:reduce",
+                "reducer",
+                reducer_wrapper,
+                sum_reducer,
+                [file_a, file_b],
+                True,
+                None,
+            )
+            reduce_outcome = _wait(dist)
 
-    assert isinstance(reduce_outcome, Success)
-    assert reduce_outcome.result_id == reduce_id
-    dest = tmp_path / "reduced.pkl.zst"
-    distributor.retrieve(reduce_outcome.result_id, str(dest))
-    assert serialization.load(str(dest)) == 3 + 5
+            assert isinstance(reduce_outcome, Success)
+            assert reduce_outcome.result_id == reduce_id
+            dest = tmp_path / "reduced.pkl.zst"
+            dist.retrieve(reduce_outcome.result_id, str(dest))
+            assert serialization.load(str(dest)) == 3 + 5
 
 
-def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(distributor, tmp_path):
+def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(monkeypatch, tmp_path):
     """A seeded checkpoint adopted via adopt_checkpoint must behave exactly
     like a this-run checkpoint from then on: its file token remaps/declares
     as a task input, the reduction using it succeeds, and release_result
     undeclares it and removes it from disk - no special-casing needed."""
-    seeded_path = str(tmp_path / "checkpoints" / "seeded.p")
-    os.makedirs(os.path.dirname(seeded_path), exist_ok=True)
-    serialization.dump(100, seeded_path)  # stands in for a prior run's checkpoint
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            seeded_path = str(tmp_path / "checkpoints" / "seeded.p")
+            os.makedirs(os.path.dirname(seeded_path), exist_ok=True)
+            serialization.dump(100, seeded_path)  # stands in for a prior run's checkpoint
 
-    adopted_id = uuid4().hex
-    file = distributor.adopt_checkpoint(adopted_id, seeded_path)
-    assert file in distributor._files_by_key
+            adopted_id = uuid4().hex
+            file = dist.adopt_checkpoint(adopted_id, seeded_path)
+            assert file in dist._files_by_key
 
-    _submit_chunk(distributor, 1, Chunk("b.root", 0, 3))
-    outcome_b = _wait(distributor)
+            _submit_chunk(dist, 1, Chunk("b.root", 0, 3))
+            outcome_b = _wait(dist)
 
-    reduce_id = uuid4().hex
-    distributor.submit(
-        reduce_id,
-        10,
-        "test:reduce",
-        "reducer",
-        reducer_wrapper,
-        sum_reducer,
-        [file, outcome_b.file],
-        True,
-        None,
-    )
-    reduce_outcome = _wait(distributor)
+            reduce_id = uuid4().hex
+            dist.submit(
+                reduce_id,
+                10,
+                "test:reduce",
+                "reducer",
+                reducer_wrapper,
+                sum_reducer,
+                [file, outcome_b.file],
+                True,
+                None,
+            )
+            reduce_outcome = _wait(dist)
 
-    assert isinstance(reduce_outcome, Success)
-    assert reduce_outcome.result_id == reduce_id
-    dest = tmp_path / "reduced.pkl.zst"
-    distributor.retrieve(reduce_outcome.result_id, str(dest))
-    assert serialization.load(str(dest)) == 100 + 3
+            assert isinstance(reduce_outcome, Success)
+            assert reduce_outcome.result_id == reduce_id
+            dest = tmp_path / "reduced.pkl.zst"
+            dist.retrieve(reduce_outcome.result_id, str(dest))
+            assert serialization.load(str(dest)) == 100 + 3
 
-    distributor.release_result(adopted_id)
-    assert file not in distributor._files_by_key
-    assert not os.path.exists(seeded_path)
+            dist.release_result(adopted_id)
+            assert file not in dist._files_by_key
+            assert not os.path.exists(seeded_path)
 
 
 def test_checkpoint_filenames_never_collide_across_restarts(monkeypatch, tmp_path):
@@ -378,21 +523,20 @@ def test_checkpoint_filenames_never_collide_across_restarts(monkeypatch, tmp_pat
     checkpoint_dir = str(tmp_path / "checkpoints")
 
     def _write_one_checkpoint():
-        dist = TaskVineDistributor(
+        with TaskVineDistributor(
             port=0,
             resources_processor={"cores": 1},
             checkpoint_dir=checkpoint_dir,
-        )
-        workers = vine.Factory(manager=dist._manager)
-        workers.cores = 2
-        workers.min_workers = 1
-        workers.max_workers = 1
-        workers.timeout = WAIT_TIMEOUT
-        with workers:
-            _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
-            outcome = _wait(dist)
-            path = dist.checkpoint_path(outcome.result_id)
-        dist.shutdown()
+        ) as dist:
+            workers = vine.Factory(manager=dist._manager)
+            workers.cores = 2
+            workers.min_workers = 1
+            workers.max_workers = 1
+            workers.timeout = WAIT_TIMEOUT
+            with workers:
+                _submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
+                outcome = _wait(dist)
+                path = dist.checkpoint_path(outcome.result_id)
         return path
 
     path_1 = _write_one_checkpoint()
@@ -422,22 +566,37 @@ def test_shutdown_leaves_a_caller_supplied_manager_alone(monkeypatch, tmp_path):
     assert dist._manager is manager
 
 
-def test_engine_end_to_end_via_taskvine(tmp_path, dataset_input, distributor):
+def test_engine_end_to_end_via_taskvine(monkeypatch, tmp_path, dataset_input):
     """The distributor in isolation only proves submit/wait/retrieve work;
     this drives it through the real VineReduce pipeline (chunking, pooled
     reduction across two files, checkpointing) the way a user actually would."""
-    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}})
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    with TaskVineDistributor(
+        port=0,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=dist._manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            input_path = dataset_input(
+                {"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}}
+            )
 
-    vr = VineReduce(
-        processors={"count": count_events},
-        input=input_path,
-        reducer=sum_reducer,
-        results_dir=str(tmp_path / "results"),
-        distributor=distributor,
-    )
-    vr.compute()
+            vr = VineReduce(
+                processors={"count": count_events},
+                input=input_path,
+                reducer=sum_reducer,
+                results_dir=str(tmp_path / "results"),
+                distributor=dist,
+            )
+            vr.compute()
 
-    dataset_dir = os.path.join(vr.results_dir, "numbers", "count")
-    files = os.listdir(dataset_dir)
-    assert len(files) == 1
-    assert serialization.load(os.path.join(dataset_dir, files[0])) == 10
+            dataset_dir = os.path.join(vr.results_dir, "numbers", "count")
+            files = os.listdir(dataset_dir)
+            assert len(files) == 1
+            assert serialization.load(os.path.join(dataset_dir, files[0])) == 10
