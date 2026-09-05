@@ -103,6 +103,7 @@ flake8 = ">=3.8"
 pyright = "*"
 python-build = ">=1.5.0,<2"
 twine = ">=7.0.0,<8"
+gdb = ">=17.2,<18"
 
 [tool.pixi.feature.pack.pypi-dependencies]
 vine_reduce = { path = ".", editable = false }
