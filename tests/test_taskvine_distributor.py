@@ -211,7 +211,7 @@ def test_constructor_reuses_a_pre_built_manager(monkeypatch, tmp_path):
     # worker pool - see PLAN.md) must be used as-is, not replaced by a second
     # one built from port/name.
     monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
-    manager = vine.Manager(port=0)
+    manager = vine.Manager(port=0, ssl=True)
 
     dist = TaskVineDistributor(
         manager=manager,
