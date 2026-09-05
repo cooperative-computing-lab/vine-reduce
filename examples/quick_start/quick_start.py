@@ -165,7 +165,11 @@ def main():
     # no separate `vine_worker` process started by hand. In production, workers
     # normally run as their own long-lived processes across a cluster, entirely
     # outside of vine_reduce's or this script's control.
-    workers = vine.Factory(manager_host_port=f"localhost:{distributor.port}")
+    #
+    # Passing the manager itself (rather than manager_host_port=) lets
+    # Factory read its settings directly - including ssl (TaskVineDistributor
+    # defaults to ssl=True), so workers automatically speak SSL too.
+    workers = vine.Factory(manager=distributor.manager)
     workers.cores = 2
     workers.min_workers = 1
     workers.max_workers = 1

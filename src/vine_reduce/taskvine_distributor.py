@@ -104,6 +104,7 @@ class TaskVineDistributor:
         environment: str | None = None,
         manager: vine.Manager | None = None,
         checkpoint_dir: str = "checkpoints",
+        ssl: bool = True,
     ):
         """port: port (or [min, max] range) the manager listens on, or 0 to
         pick one automatically - see `port` below. name: the manager's
@@ -121,14 +122,22 @@ class TaskVineDistributor:
         one manager/port and worker pool. checkpoint_dir: local directory
         (on this process's filesystem, i.e. wherever the manager runs) this
         distributor writes a result's file to when submit() is called with
-        is_checkpoint=True - see the module docstring and checkpoint_path()."""
+        is_checkpoint=True - see the module docstring and checkpoint_path().
+        ssl: whether the manager encrypts its connections to workers, via a
+        self-signed cert vine.Manager generates on the fly; ignored when
+        manager is given (that manager's own ssl setting, if any, applies
+        instead). Workers started with vine.Factory(manager=...) pick this
+        up automatically (Factory reads it off the manager); Factory started
+        with manager_host_port= instead needs `ssl=True` passed to it too."""
         # manager lets a caller hand in an already-constructed vine.Manager
         # (or a subclass, e.g. vine.DaskVine) instead of having this class
         # build its own - the way to run coffea's own preprocess() and this
         # distributor's tasks against the same manager/port, sharing workers
-        # between the two. port/name are ignored when manager is given.
+        # between the two. port/name/ssl are ignored when manager is given.
         self._owns_manager = manager is None
-        self._manager = manager if manager is not None else vine.Manager(port=port, name=name)
+        self._manager = (
+            manager if manager is not None else vine.Manager(port=port, name=name, ssl=ssl)
+        )
         self._manager.enable_monitoring(watchdog=True)
 
         if self._owns_manager:
@@ -169,6 +178,14 @@ class TaskVineDistributor:
         range) was passed to __init__ and the resolved port is needed to
         point workers at this manager."""
         return self._manager.port
+
+    @property
+    def manager(self) -> vine.Manager:
+        """The underlying vine.Manager - pass this to vine.Factory(manager=...)
+        so it provisions workers against the right host/port and picks up
+        settings (e.g. ssl) straight from the manager, rather than
+        duplicating them via manager_host_port=."""
+        return self._manager
 
     def submit(
         self,
