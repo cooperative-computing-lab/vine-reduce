@@ -113,30 +113,23 @@ def _bar(
     return text
 
 
-def _dataset_counts_colored(completed: int, total: int) -> Text:
-    """Colored counts text for the datasets row: completed (green) / total
-    (cyan) - no in-flight count, unlike the other rows' _counts_colored."""
+def _counts_colored(completed: int, failed: int | None, total: int, safe: int | None = None) -> Text:
+    """Colored counts text: completed - yellow, or green when `failed` is
+    None (the datasets row, which has no failed count) - with, for the
+    events row, the safe/checkpointed subset (green) in parentheses right
+    after it - then failed (red) if given, then total - blue, or cyan when
+    `failed` is None. See module docstring."""
     text = Text()
-    text.append(str(completed), style="green")
-    text.append("/")
-    text.append(str(total), style="cyan")
-    return text
-
-
-def _counts_colored(completed: int, failed: int, total: int, safe: int | None = None) -> Text:
-    """Colored counts text: completed (yellow) - with, for the events row,
-    the safe/checkpointed subset (green) in parentheses right after it -
-    then failed (red), then total (blue). See module docstring."""
-    text = Text()
-    text.append(str(completed), style="yellow")
+    text.append(str(completed), style="yellow" if failed is not None else "green")
     if safe is not None:
         text.append("(")
         text.append(str(safe), style="green")
         text.append(")")
+    if failed is not None:
+        text.append("/")
+        text.append(str(failed), style="red")
     text.append("/")
-    text.append(str(failed), style="red")
-    text.append("/")
-    text.append(str(total), style="blue")
+    text.append(str(total), style="blue" if failed is not None else "cyan")
     return text
 
 
@@ -263,7 +256,7 @@ class ProgressReporter:
             # reduction_size can diverge across a processor's pipelines (each
             # halves independently on resource exhaustion) - the smallest
             # current value gives the most folds, the safer (larger) estimate.
-            fold_size=min((p.reduction_size for p in procs), default=2),
+            fold_size=min(p.reduction_size for p in procs),
         )
         reduce_ = (reduce_completed, reduce_failed, reduce_total)
 
@@ -280,5 +273,5 @@ class ProgressReporter:
         table.add_row(
             "datasets",
             _bar(datasets_completed, 0, datasets_total),
-            _dataset_counts_colored(datasets_completed, datasets_total),
+            _counts_colored(datasets_completed, None, datasets_total),
         )
