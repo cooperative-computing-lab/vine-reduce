@@ -243,6 +243,7 @@ class Pipeline:
         is_result: Callable[[int, float, float], bool],
         result_postprocess: Callable | None,
         chunksize: int | None,
+        minimum_chunksize: int = 1000,
         reduction_size: int,
         minimum_reduction_size: int = 2,
         checkpoint_time: float | None,
@@ -273,6 +274,7 @@ class Pipeline:
         self._is_result = is_result
         self._result_postprocess = result_postprocess
         self.chunksize = chunksize
+        self._minimum_chunksize = minimum_chunksize
         self.reduction_size = reduction_size
         self._minimum_reduction_size = minimum_reduction_size
         self._checkpoint_time = checkpoint_time
@@ -563,7 +565,7 @@ class Pipeline:
         """If nothing more can ever arrive in the pool, reduce whatever's left
         as one last group, however small, and make it final unconditionally -
         see _submit_reduction's force_final."""
-        if self.pool and self.chunks_all_done and self.in_flight_count() == 0:
+        if self.pool and self.chunks_all_done and self.in_flight_count() == 0 and len(self.pool) > 0 and len(self.pool) <= self.reduction_size:
             group, self.pool = self.pool, []
             self._submit_reduction(group, force_final=True)
 
@@ -689,7 +691,8 @@ class Pipeline:
                 # in _handle_reduce_resource_exhaustion.
                 self._retry_chunks.append((chunk, 0))
                 return
-            if current_size <= 1:
+            new_size = max(chunk.num_events, current_size) // 2
+            if new_size < self._minimum_chunksize:
                 self._give_up_on_file(
                     chunk,
                     kind="processor",
@@ -698,12 +701,12 @@ class Pipeline:
                     traceback=None,
                     abort_message=(
                         f"processor {self.processor_name!r} exhausted resources on "
-                        f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk size "
-                        "(1 event); cannot retry smaller."
+                        f"{chunk.url}[{chunk.start}:{chunk.stop}] below the minimum chunk "
+                        f"size ({self._minimum_chunksize} events); cannot retry smaller."
                     ),
                 )
                 return
-            self.chunksize = max(1, current_size // 2)
+            self.chunksize = new_size
             # attempts_used carries over unchanged here - it is reset to 0 in
             # _next_chunk once this chunk is actually split at the new,
             # smaller chunksize (a halving is a fresh start, not a strike
@@ -798,7 +801,8 @@ class Pipeline:
             # regardless of size) was never tried at the current size, so it
             # is not such evidence and falls through unshrunk to the re-pool
             # below.
-            if self.reduction_size <= self._minimum_reduction_size:
+            new_size = max(len(group), self.reduction_size) // 2
+            if new_size < self._minimum_reduction_size:
                 self._give_up_on_reduction(
                     group,
                     attempts=1 + max((item.attempts for item in group), default=0),
@@ -807,10 +811,10 @@ class Pipeline:
                 )
                 raise VineReduceError(
                     f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                    "resources at the minimum reduction_size "
+                    "resources below the minimum reduction_size "
                     f"({self._minimum_reduction_size}); cannot retry smaller."
                 )
-            self.reduction_size = max(self._minimum_reduction_size, self.reduction_size // 2)
+            self.reduction_size = new_size
         # Any ResourceExhaustion is a fresh start for these items, not a
         # strike against the budget - see PoolItem.attempts's docstring.
         for item in group:

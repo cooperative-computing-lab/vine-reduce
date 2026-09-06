@@ -72,6 +72,15 @@ def _resolve_minimum_reduction_size(minimum_reduction_size: int | None, reductio
     return min(max(2, minimum_reduction_size), reduction_size)
 
 
+def _resolve_minimum_chunksize(minimum_chunksize: int | None) -> int:
+    """Clamps VineReduce.minimum_chunksize: None defaults to 1000, anything
+    below 1 is raised to 1 (a chunk can never shrink below a single
+    event)."""
+    if minimum_chunksize is None:
+        minimum_chunksize = 1000
+    return max(1, minimum_chunksize)
+
+
 @dataclass
 class VineReduce:
     """Drives a dynamic data reduction computation over one or more datasets: for
@@ -149,6 +158,11 @@ class VineReduce:
         dict of the same {"default"/"processors"/"datasets"} shape as
         reduction_size. None means one chunk per file. Halved automatically
         on resource exhaustion, taking effect for chunks not yet generated.
+    minimum_chunksize: the floor chunksize is halved down to on resource
+        exhaustion, below which a further ResourceExhaustion gives up on the
+        chunk's file for good instead of shrinking further (see attempts's
+        docstring). None (the default) means 1000. A value below 1 is raised
+        to 1.
     max_chunks_active: cap on chunks in flight (submitted but not yet
         finished) across all pipelines at once.
     max_chunks_cycle: cap on new chunks submitted per scheduling cycle,
@@ -176,7 +190,7 @@ class VineReduce:
         attempts=1 means no retries. A halving of chunksize/reduction_size
         resets the budget for the smaller unit it produces (a fresh start,
         not a strike against it); once a chunk/reduction is already at the
-        minimum size (1 event / minimum_reduction_size) a further
+        minimum size (minimum_chunksize / minimum_reduction_size) a further
         ResourceExhaustion raises immediately, since there is no smaller
         size left to retry at. Once the budget for a specific chunk is
         exhausted, the file it belongs to is given up on for good (see
@@ -218,6 +232,7 @@ class VineReduce:
     results_dir: str = "results"
     distributor: Distributor | None = None
     chunksize: int | dict | None = None
+    minimum_chunksize: int | None = None
     max_chunks_active: int = 1000
     max_chunks_cycle: int = 100
     db_path: str | None = None
@@ -336,6 +351,7 @@ class VineReduce:
                 minimum_reduction_size = _resolve_minimum_reduction_size(
                     self.minimum_reduction_size, reduction_size
                 )
+                minimum_chunksize = _resolve_minimum_chunksize(self.minimum_chunksize)
                 pipelines.append(
                     Pipeline(
                         processor_name=proc_name,
@@ -353,6 +369,7 @@ class VineReduce:
                         is_result=is_result,
                         result_postprocess=self.result_postprocess,
                         chunksize=_resolve_sized_config(self.chunksize, proc_name, dataset_name),
+                        minimum_chunksize=minimum_chunksize,
                         reduction_size=reduction_size,
                         minimum_reduction_size=minimum_reduction_size,
                         checkpoint_time=self.checkpoint_time,

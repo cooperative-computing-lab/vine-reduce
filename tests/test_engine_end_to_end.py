@@ -8,6 +8,7 @@ import pytest
 from vine_reduce import VineReduce, VineReduceError, defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
 from vine_reduce.engine import (
+    _resolve_minimum_chunksize,
     _resolve_minimum_reduction_size,
     _resolve_reduction_size,
     _resolve_sized_config,
@@ -94,6 +95,19 @@ def test_resolve_minimum_reduction_size_caps_at_reduction_size():
 
 def test_resolve_minimum_reduction_size_passes_through_valid_value():
     assert _resolve_minimum_reduction_size(4, 10) == 4
+
+
+def test_resolve_minimum_chunksize_defaults_to_1000_when_not_given():
+    assert _resolve_minimum_chunksize(None) == 1000
+
+
+def test_resolve_minimum_chunksize_raises_values_below_one_to_one():
+    assert _resolve_minimum_chunksize(0) == 1
+    assert _resolve_minimum_chunksize(-5) == 1
+
+
+def test_resolve_minimum_chunksize_passes_through_valid_value():
+    assert _resolve_minimum_chunksize(50) == 50
 
 
 def test_reduction_size_dict_missing_default_raises_clearly(tmp_path, dataset_input, distributor):
