@@ -977,8 +977,14 @@ class Pipeline:
         # replaces: the new row and the superseded rows' deletes are one
         # transaction, so this checkpoint event either fully lands or, on a
         # crash mid-way, fully doesn't (never leaves both old and new rows
-        # covering the same files on disk).
-        superseded = [item.checkpoint.row_id for item in inputs if item.is_checkpointed]
+        # covering the same files on disk). Walk each input's whole lineage,
+        # not just the direct inputs: phase 3's _release_covered below will
+        # free the durable file of every checkpoint it reaches, however deep,
+        # so every one of those rows must be superseded here too - otherwise
+        # a checkpoint folded in through a non-checkpointed intermediate
+        # would have its file deleted while its row stays on file, pointing
+        # nowhere.
+        superseded = [row_id for item in inputs for row_id in self._checkpoints_in(item)]
         row_id = self._db.record(
             processor=self.processor_name,
             dataset=self.dataset_name,
@@ -1004,6 +1010,25 @@ class Pipeline:
         new_item.checkpoint = CheckpointRef(row_id, path)
         new_item.since_checkpoint_time = 0
         new_item.since_checkpoint_distance = 0
+
+    @staticmethod
+    def _checkpoints_in(root: PoolItem) -> list[int]:
+        """Row ids of every checkpoint reachable from root that
+        _release_covered(root) will free the durable file of - same
+        traversal rule as _release_covered itself: descend through
+        not-yet-checkpointed items, but stop descending past a checkpointed
+        one (its own lineage was already freed when IT was checkpointed).
+        Used by _checkpoint to supersede every row whose file phase 3 is
+        about to delete, not just root's."""
+        row_ids = []
+        stack = [root]
+        while stack:
+            item = stack.pop()
+            if item.is_checkpointed:
+                row_ids.append(item.checkpoint.row_id)
+            else:
+                stack.extend(item.inputs)
+        return row_ids
 
     def _release_covered(self, root: PoolItem) -> None:
         """Retention rule (invariant #3): a result may be freed only once a
