@@ -5,10 +5,13 @@ import os
 
 import pytest
 
-from vine_reduce import VineReduce, VineReduceError, serialization
+from vine_reduce import VineReduce, VineReduceError, defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
 from vine_reduce.engine import _resolve_reduction_size, _resolve_sized_config
+from vine_reduce.failure_log import FailureLog
 from vine_reduce.local_distributor import LocalDistributor
+from vine_reduce.progress import NullProgressReporter
+from vine_reduce.size_log import SizeLog
 
 from helpers import count_events, read_env_var, sum_reducer
 
@@ -314,3 +317,79 @@ def test_extra_files_and_environment_variables_are_passed_to_the_distributor(
 
     assert dist.added_files == [str(shipped)]
     assert dist.env_vars == {"VINE_REDUCE_TEST_VAR": "xyz"}
+
+
+def test_build_pipelines_priority_orders_by_processor_then_dataset(tmp_path, distributor):
+    """_build_pipelines must give each (processor, dataset) pair its own
+    priority: earlier processors beat later ones, and - within the same
+    processor - earlier datasets beat later ones, while every reduce
+    priority still outranks every process priority (PLAN.md's
+    "Priorities")."""
+    # dict iteration order is insertion order, so this pins down both the
+    # processor order (count, then double_count) and the dataset order
+    # (numbers, then more_numbers, then last_numbers).
+    datasets = {
+        "numbers": {"metadata": {}, "files": {"a.root": 7}},
+        "more_numbers": {"metadata": {}, "files": {"b.root": 3}},
+        "last_numbers": {"metadata": {}, "files": {"c.root": 1}},
+    }
+
+    vr = VineReduce(
+        processors={"count": count_events, "double_count": double_count_events},
+        input="unused",
+        reducer=sum_reducer,
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+    try:
+        pipelines = vr._build_pipelines(
+            datasets,
+            distributor,
+            db,
+            defaults.default_datasets_to_chunks,
+            NullProgressReporter(),
+            FailureLog(str(tmp_path / "failed_files.log")),
+            SizeLog(str(tmp_path / "size.jsonl")),
+        )
+    finally:
+        db.close()
+
+    by_key = {(p.processor_name, p.dataset_name): p for p in pipelines}
+    assert set(by_key) == {
+        ("count", "numbers"),
+        ("count", "more_numbers"),
+        ("count", "last_numbers"),
+        ("double_count", "numbers"),
+        ("double_count", "more_numbers"),
+        ("double_count", "last_numbers"),
+    }
+
+    # 1. Within the same processor, earlier datasets get strictly better
+    # (larger) process_priority than later ones.
+    for proc_name in ("count", "double_count"):
+        priorities = [
+            by_key[(proc_name, ds_name)]._process_priority
+            for ds_name in ("numbers", "more_numbers", "last_numbers")
+        ]
+        assert priorities == sorted(priorities, reverse=True)
+        assert len(set(priorities)) == len(priorities)
+
+    # 2. An earlier processor's pipelines all outrank a later processor's,
+    # regardless of dataset.
+    count_priorities = [
+        by_key[("count", ds_name)]._process_priority
+        for ds_name in ("numbers", "more_numbers", "last_numbers")
+    ]
+    double_count_priorities = [
+        by_key[("double_count", ds_name)]._process_priority
+        for ds_name in ("numbers", "more_numbers", "last_numbers")
+    ]
+    assert min(count_priorities) > max(double_count_priorities)
+
+    # 3. Every reduce_priority exceeds every process_priority, even with
+    # multiple datasets in play.
+    all_process_priorities = [p._process_priority for p in pipelines]
+    all_reduce_priorities = [p._reduce_priority for p in pipelines]
+    assert min(all_reduce_priorities) > max(all_process_priorities)
