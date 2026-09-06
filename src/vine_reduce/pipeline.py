@@ -924,8 +924,18 @@ class Pipeline:
                         traceback=traceback,
                     )
                 )
+        # Only the group's not-yet-checkpointed fallback lineage is ours to
+        # free here - it was never durable, so losing it is fine now that the
+        # group itself is being given up on. A group item that is ITSELF
+        # already a checkpoint still has its own untouched DB row (this
+        # failure never superseded it - only a successful _checkpoint does
+        # that), so _release_covered must not run on it: that call
+        # unconditionally deletes the item's durable file, which would leave
+        # the surviving row pointing at nothing and break adopting it on
+        # restart.
         for item in group:
-            self._release_covered(item)
+            if not item.is_checkpointed:
+                self._release_covered(item)
 
     def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall

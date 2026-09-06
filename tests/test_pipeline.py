@@ -1082,6 +1082,62 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
     db.close()
 
 
+def test_reducer_permanent_failure_keeps_checkpointed_inputs_on_disk(fake_distributor, tmp_path):
+    """A reducer permanent failure must only free the failing group's
+    not-yet-checkpointed fallback lineage. A group item that is itself
+    already a checkpoint still has an untouched DB row (this failure never
+    supersedes it), so its durable file must survive too - otherwise restart
+    would try to adopt a checkpoint whose file is gone."""
+    dataset = {"files": {"a.root": 5, "b.root": 5}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    file_a = checkpoint_dir / "a.pkl.zst"
+    file_b = checkpoint_dir / "b.pkl.zst"
+    serialization.dump(5, str(file_a))
+    serialization.dump(5, str(file_b))
+    for name, path in (("a.root", file_a), ("b.root", file_b)):
+        db.record(
+            processor="proc",
+            dataset="ds",
+            covers_files=[name],
+            num_events=5,
+            wall_time_s=1.0,
+            memory_mb=1.0,
+            is_final=False,
+            path=str(path),
+        )
+
+    def always_fails(a, b):
+        raise ValueError("boom")
+
+    # Both files are already covered by (non-final) checkpoints, so restart
+    # seeds both as already-checkpointed pool items - the only work left is
+    # folding them together, and reduction_size=2 makes that the very first
+    # (and only) reduction attempted.
+    pipeline, _ = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reducer=always_fails,
+        reduction_size=2,
+        attempts=1,
+        db=db,
+    )
+    assert len(pipeline.pool) == 2
+    assert all(item.is_checkpointed for item in pipeline.pool)
+
+    with pytest.raises(VineReduceError, match=r"after 1 attempt \(attempts=1\)"):
+        run_to_completion(pipeline, fake_distributor)
+
+    rows = db.checkpoints_for("proc", "ds")
+    assert len(rows) == 2  # neither row was superseded - the fold never succeeded
+    for row in rows:
+        assert os.path.exists(row.path)
+    db.close()
+
+
 def test_processor_permanent_failure_is_skipped_within_failure_proportion(
     fake_distributor, tmp_path
 ):
