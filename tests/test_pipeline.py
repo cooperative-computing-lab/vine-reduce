@@ -772,11 +772,11 @@ def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor,
     )
     assert pipeline.chunksize == 2
     # not yet split - attempts_used still carried as-is until it actually splits
-    assert pipeline._retry_chunks == [(chunk, 1)]
+    assert pipeline._retry_chunks == [_ChunkTask(chunk, 1)]
 
-    next_chunk = pipeline._next_chunk()
-    assert next_chunk == (Chunk("a.root", 0, 2), 0)  # fresh budget for both halves
-    assert pipeline._retry_chunks == [(Chunk("a.root", 2, 4), 0)]
+    next_task = pipeline._next_chunk()
+    assert next_task == _ChunkTask(Chunk("a.root", 0, 2), 0)  # fresh budget for both halves
+    assert pipeline._retry_chunks == [_ChunkTask(Chunk("a.root", 2, 4), 0)]
     db.close()
 
 
@@ -800,7 +800,7 @@ def test_chunk_resource_exhaustion_above_current_size_repools_without_shrinking(
     )
 
     assert pipeline.chunksize == 2  # not shrunk further
-    assert pipeline._retry_chunks == [(chunk, 0)]  # fresh budget, not resubmitted unchanged
+    assert pipeline._retry_chunks == [_ChunkTask(chunk, 0)]  # fresh budget, not resubmitted unchanged
     db.close()
 
 
@@ -821,7 +821,7 @@ def test_chunk_resource_exhaustion_above_floor_does_not_give_up_early(fake_distr
     )
 
     assert pipeline.chunksize == 1  # unchanged, still the floor
-    assert pipeline._retry_chunks == [(chunk, 0)]  # re-pooled, not given up on
+    assert pipeline._retry_chunks == [_ChunkTask(chunk, 0)]  # re-pooled, not given up on
     db.close()
 
 

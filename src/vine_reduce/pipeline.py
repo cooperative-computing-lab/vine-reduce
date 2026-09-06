@@ -297,7 +297,7 @@ class Pipeline:
         self.pool: list[PoolItem] = []
         self.final_results: list[PoolItem] = []
         self._files_in_progress: dict[str, _FileProgress] = {}
-        self._retry_chunks: list[tuple[Chunk, int]] = []  # (chunk, attempts_used)
+        self._retry_chunks: list[_ChunkTask] = []
         self._in_flight: dict[str, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
@@ -492,30 +492,30 @@ class Pipeline:
 
         submitted = 0
         while submitted < budget:
-            next_chunk = self._next_chunk()
-            if next_chunk is None:
+            next_task = self._next_chunk()
+            if next_task is None:
                 break
-            chunk, attempts_used = next_chunk
-            self._submit_chunk(chunk, attempts_used)
+            self._submit_chunk(next_task)
             submitted += 1
         return submitted
 
-    def _next_chunk(self) -> tuple[Chunk, int] | None:
+    def _next_chunk(self) -> _ChunkTask | None:
         """The next chunk to submit (with the attempts already used against
         it) - retries first, then freshly generated ones - or None when
         there is nothing left to submit right now."""
         if self._retry_chunks:
-            chunk, attempts_used = self._retry_chunks.pop()
+            task = self._retry_chunks.pop()
+            chunk, attempts_used = task.chunk, task.attempts_used
             # A retry chunk may predate the last chunksize halving; re-split it
             # so we actually retry at the smaller size, not the size that just
             # failed. A split is a fresh start for both pieces - see
             # PoolItem.attempts's docstring for the equivalent reduction rule.
             if self.chunksize is not None and chunk.num_events > self.chunksize:
                 split_point = chunk.start + self.chunksize
-                self._retry_chunks.append((Chunk(chunk.url, split_point, chunk.stop), 0))
+                self._retry_chunks.append(_ChunkTask(Chunk(chunk.url, split_point, chunk.stop), 0))
                 chunk = Chunk(chunk.url, chunk.start, split_point)
                 attempts_used = 0
-            return chunk, attempts_used
+            return _ChunkTask(chunk, attempts_used)
 
         if self._generator_exhausted:
             return None
@@ -525,12 +525,13 @@ class Pipeline:
                 self._generator_exhausted = True
                 return None
             if chunk.url not in self._failed_files:
-                return chunk, 0
+                return _ChunkTask(chunk, 0)
             # A file already given up on (see _give_up_on_file) may still
             # have chunks left to yield from the generator's current
             # position - skip them without submitting.
 
-    def _submit_chunk(self, chunk: Chunk, attempts_used: int = 0) -> None:
+    def _submit_chunk(self, task: _ChunkTask) -> None:
+        chunk = task.chunk
         self._files_in_progress.setdefault(
             chunk.url, _FileProgress(num_entries=self._dataset["files"][chunk.url])
         )
@@ -549,7 +550,7 @@ class Pipeline:
             self._chunk_to_args,
             self._executor,
         )
-        self._in_flight[result_id] = _ChunkTask(chunk=chunk, attempts_used=attempts_used)
+        self._in_flight[result_id] = task
         self._proc_tasks_submitted += 1
         self._events_submitted += chunk.num_events
 
@@ -641,81 +642,72 @@ class Pipeline:
             self._handle_reduce_outcome(task, outcome)
         self.refresh_finished()
 
-    def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
+    def _record_chunk_failure(self, chunk: Chunk) -> None:
+        self._proc_tasks_failed += 1
+        self._events_failed += chunk.num_events
+
+    def _handle_chunk_runtime_failure(self, task: _ChunkTask, outcome: RuntimeFailure) -> None:
         chunk = task.chunk
-        self._report_task(
-            "processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome
-        )
-
-        if chunk.url in self._failed_files:
-            # A sibling chunk of this (now abandoned) file already exhausted
-            # its attempts and gave up on the whole file - see
-            # _give_up_on_file. Discard whatever this one produced instead
-            # of staging or retrying it.
-            if isinstance(outcome, Success):
-                self._distributor.release_result(outcome.result_id)
+        attempts_used = task.attempts_used + 1
+        self._record_chunk_failure(chunk)
+        if attempts_used >= self._attempts:
+            self._give_up_on_file(
+                chunk,
+                kind="processor",
+                attempts=attempts_used,
+                resources_measured=outcome.resources,
+                traceback=outcome.traceback,
+                abort_message=(
+                    f"processor {self.processor_name!r} failed on "
+                    f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
+                    f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
+                    f"{outcome.traceback}"
+                ),
+            )
             return
+        self._retry_chunks.append(_ChunkTask(chunk, attempts_used))
 
-        if isinstance(outcome, RuntimeFailure):
-            attempts_used = task.attempts_used + 1
-            self._proc_tasks_failed += 1
-            self._events_failed += chunk.num_events
-            if attempts_used >= self._attempts:
-                self._give_up_on_file(
-                    chunk,
-                    kind="processor",
-                    attempts=attempts_used,
-                    resources_measured=outcome.resources,
-                    traceback=outcome.traceback,
-                    abort_message=(
-                        f"processor {self.processor_name!r} failed on "
-                        f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
-                        f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
-                        f"{outcome.traceback}"
-                    ),
-                )
-                return
-            self._retry_chunks.append((chunk, attempts_used))
+    def _handle_chunk_resource_exhaustion(
+        self, task: _ChunkTask, outcome: ResourceExhaustion
+    ) -> None:
+        chunk = task.chunk
+        self._record_chunk_failure(chunk)
+        current_size = self.chunksize if self.chunksize is not None else chunk.num_events
+        if chunk.num_events > current_size:
+            # A sibling chunk's exhaustion already shrank chunksize
+            # further while this chunk was still in flight, so it was
+            # never actually tried at the current (smaller) size - not
+            # evidence that it's too big. It will be re-split down to the
+            # current chunksize next time it's pulled off the retry
+            # queue - see _next_chunk - and the equivalent reduction rule
+            # in _handle_reduce_resource_exhaustion.
+            self._retry_chunks.append(_ChunkTask(chunk, 0))
             return
-        if isinstance(outcome, ResourceExhaustion):
-            self._proc_tasks_failed += 1
-            self._events_failed += chunk.num_events
-            current_size = self.chunksize if self.chunksize is not None else chunk.num_events
-            if chunk.num_events > current_size:
-                # A sibling chunk's exhaustion already shrank chunksize
-                # further while this chunk was still in flight, so it was
-                # never actually tried at the current (smaller) size - not
-                # evidence that it's too big. It will be re-split down to the
-                # current chunksize next time it's pulled off the retry
-                # queue - see _next_chunk - and the equivalent reduction rule
-                # in _handle_reduce_resource_exhaustion.
-                self._retry_chunks.append((chunk, 0))
-                return
-            new_size = max(chunk.num_events, current_size) // 2
-            if new_size < self._minimum_chunksize:
-                self._give_up_on_file(
-                    chunk,
-                    kind="processor",
-                    attempts=task.attempts_used + 1,
-                    resources_measured=outcome.resources,
-                    traceback=None,
-                    abort_message=(
-                        f"processor {self.processor_name!r} exhausted resources on "
-                        f"{chunk.url}[{chunk.start}:{chunk.stop}] below the minimum chunk "
-                        f"size ({self._minimum_chunksize} events); cannot retry smaller."
-                    ),
-                )
-                return
-            self.chunksize = new_size
-            # attempts_used carries over unchanged here - it is reset to 0 in
-            # _next_chunk once this chunk is actually split at the new,
-            # smaller chunksize (a halving is a fresh start, not a strike
-            # against the budget - see PoolItem.attempts's docstring for the
-            # equivalent reduction rule).
-            self._retry_chunks.append((chunk, task.attempts_used))
+        new_size = max(chunk.num_events, current_size) // 2
+        if new_size < self._minimum_chunksize:
+            self._give_up_on_file(
+                chunk,
+                kind="processor",
+                attempts=task.attempts_used + 1,
+                resources_measured=outcome.resources,
+                traceback=None,
+                abort_message=(
+                    f"processor {self.processor_name!r} exhausted resources on "
+                    f"{chunk.url}[{chunk.start}:{chunk.stop}] below the minimum chunk "
+                    f"size ({self._minimum_chunksize} events); cannot retry smaller."
+                ),
+            )
             return
+        self.chunksize = new_size
+        # attempts_used carries over unchanged here - it is reset to 0 in
+        # _next_chunk once this chunk is actually split at the new,
+        # smaller chunksize (a halving is a fresh start, not a strike
+        # against the budget - see PoolItem.attempts's docstring for the
+        # equivalent reduction rule).
+        self._retry_chunks.append(_ChunkTask(chunk, task.attempts_used))
 
-        assert isinstance(outcome, Success)
+    def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
+        chunk = task.chunk
         self._proc_tasks_completed += 1
         self._events_completed += chunk.num_events
         _update_resource_max(self._processing_max, outcome.resources)
@@ -739,6 +731,31 @@ class Pipeline:
             self.pool.extend(progress.staged_items)
             del self._files_in_progress[chunk.url]
             self._files_concluded += 1
+
+    def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
+        chunk = task.chunk
+        self._report_task(
+            "processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome
+        )
+
+        if chunk.url in self._failed_files:
+            # A sibling chunk of this (now abandoned) file already exhausted
+            # its attempts and gave up on the whole file - see
+            # _give_up_on_file. Discard whatever this one produced instead
+            # of staging or retrying it.
+            if isinstance(outcome, Success):
+                self._distributor.release_result(outcome.result_id)
+            return
+
+        if isinstance(outcome, RuntimeFailure):
+            self._handle_chunk_runtime_failure(task, outcome)
+            return
+        if isinstance(outcome, ResourceExhaustion):
+            self._handle_chunk_resource_exhaustion(task, outcome)
+            return
+
+        assert isinstance(outcome, Success)
+        self._handle_chunk_success(task, outcome)
 
     def _give_up_on_file(
         self,
@@ -781,7 +798,7 @@ class Pipeline:
             for item in progress.staged_items:
                 assert item.handle is not None
                 self._distributor.release_result(item.handle.result_id)
-        self._retry_chunks = [(c, a) for c, a in self._retry_chunks if c.url != url]
+        self._retry_chunks = [t for t in self._retry_chunks if t.chunk.url != url]
 
         ratio = len(self._failed_files) / max(self._files_concluded, 100)
         if ratio > self._failure_proportion:
