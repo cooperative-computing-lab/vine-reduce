@@ -129,11 +129,6 @@ class TaskVineDistributor:
         instead). Workers started with vine.Factory(manager=...) pick this
         up automatically (Factory reads it off the manager); Factory started
         with manager_host_port= instead needs `ssl=True` passed to it too."""
-        # manager lets a caller hand in an already-constructed vine.Manager
-        # (or a subclass, e.g. vine.DaskVine) instead of having this class
-        # build its own - the way to run coffea's own preprocess() and this
-        # distributor's tasks against the same manager/port, sharing workers
-        # between the two. port/name/ssl are ignored when manager is given.
         self._owns_manager = manager is None
         self._manager = (
             manager if manager is not None else vine.Manager(port=port, name=name, ssl=ssl)
