@@ -808,11 +808,15 @@ class Pipeline:
             return
         if isinstance(outcome, ResourceExhaustion):
             self._reduce_tasks_failed += 1
-            if len(group) >= self.reduction_size:
-                # This group was formed at (or, if reduction_size shrank
-                # further while it was in flight, above) the current
-                # reduction_size, so its failure is real evidence that the
-                # current size is too big.
+            if len(group) > self.reduction_size:
+                # normal group whose reduction_size shrank further while it
+                # was in flight. Never actually tried at the current (smaller)
+                # size.
+                for item in group:
+                    item.attempts = 0
+                self.pool[:0] = group
+                return
+            if len(group) == self.reduction_size:
                 if self.reduction_size <= 2:
                     self._give_up_on_reduction(
                         group,
@@ -824,6 +828,7 @@ class Pipeline:
                         f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
                         "resources at the minimum reduction_size (2); cannot retry smaller."
                     )
+
                 self.reduction_size = max(2, self.reduction_size // 2)
                 # A halved reduction_size is a fresh start for these items,
                 # not a strike against the budget - see PoolItem.attempts's
@@ -832,6 +837,7 @@ class Pipeline:
                     item.attempts = 0
                 self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
                 return
+
             # This group is already smaller than the current reduction_size
             # (a final/leftover group, or a group formed before an earlier,
             # unrelated failure shrank reduction_size) - its failure isn't

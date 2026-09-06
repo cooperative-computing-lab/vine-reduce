@@ -956,6 +956,58 @@ def test_reduction_resource_exhaustion_below_current_size_exhausts_attempts_and_
     db.close()
 
 
+def test_reduction_resource_exhaustion_above_current_size_repools_without_shrinking(
+    fake_distributor, tmp_path
+):
+    """A group bigger than the current reduction_size (e.g. the final drain
+    group from maybe_drain_final_group, which folds whatever's left in the
+    pool as one group regardless of size - or a normal group whose
+    reduction_size shrank further while it was in flight) was never actually
+    tried at the current, smaller size. Its failure is therefore not
+    evidence that the current size - even if already the floor of 2 - is too
+    big: it must be re-pooled to be re-split at that size instead of raising
+    immediately."""
+    dataset = {"files": {f"{c}.root": 1 for c in "abcde"}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2, attempts=3)
+
+    items = [
+        PoolItem(
+            handle=ResultHandle(f"r{i}", f"f{i}"),
+            num_events=1,
+            wall_time_s=0.0,
+            memory_mb=0.0,
+            files=frozenset({f"{c}.root"}),
+            since_checkpoint_time=0.0,
+            since_checkpoint_distance=0,
+            attempts=1,
+        )
+        for i, c in enumerate("abcde")  # a group of 5, bigger than reduction_size=2
+    ]
+    pipeline._in_flight["r"] = _ReduceTask(
+        group=items,
+        is_final=True,
+        is_checkpoint=True,
+        force_final=True,
+        num_events=5,
+        total_time=0.0,
+        total_memory=0.0,
+    )
+    assert pipeline._reduce_tasks_submitted == 0
+    pipeline._handle_reduce_outcome(
+        pipeline._in_flight.pop("r"),
+        ResourceExhaustion(result_id="r", resources={}, std_output=None),
+    )
+
+    assert pipeline.reduction_size == 2  # unchanged, not treated as exhausted
+    assert all(item.attempts == 0 for item in items)  # reset, not incremented
+    assert pipeline.pool[:5] == items
+    # Re-pooled, not resubmitted directly - submit_ready_reductions is what
+    # will re-split it into properly-sized groups on the next cycle.
+    assert pipeline._reduce_tasks_submitted == 0
+    assert len(pipeline._in_flight) == 0
+    db.close()
+
+
 def test_processor_permanent_failure_is_skipped_within_failure_proportion(
     fake_distributor, tmp_path
 ):
