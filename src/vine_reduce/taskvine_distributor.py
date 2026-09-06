@@ -150,7 +150,7 @@ class TaskVineDistributor:
             "processor": resources_processor or {},
             "reducer": resources_reducer or {},
         }
-        self._environment = self._manager.declare_poncho(environment) if environment else None
+        self._environment = self._manager.declare_poncho(environment, cache=True) if environment else None
 
         self._checkpoint_dir = checkpoint_dir
         os.makedirs(self._checkpoint_dir, exist_ok=True)
