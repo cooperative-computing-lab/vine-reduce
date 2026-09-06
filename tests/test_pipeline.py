@@ -926,9 +926,6 @@ def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distrib
         group=items,
         is_final=False,
         is_checkpoint=False,
-        num_events=4,
-        total_time=0.0,
-        total_memory=0.0,
     )
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
@@ -971,11 +968,8 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
         group=items,
         is_final=False,
         is_checkpoint=False,
-        num_events=2,
-        total_time=0.0,
-        total_memory=0.0,
     )
-    assert pipeline._reduce_tasks_submitted == 0
+    assert pipeline.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
         ResourceExhaustion(result_id="r", resources={}, std_output=None),
@@ -986,7 +980,7 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
     assert pipeline.pool[:2] == items
     # Re-pooled, not resubmitted directly - submit_ready_reductions is what
     # will re-split it at the new size on the next cycle.
-    assert pipeline._reduce_tasks_submitted == 0
+    assert pipeline.reduce_tasks_submitted == 0
     assert len(pipeline._in_flight) == 0
     db.close()
 
@@ -1017,9 +1011,6 @@ def test_reduction_resource_exhaustion_below_current_size_at_minimum_raises(
         group=items,
         is_final=False,
         is_checkpoint=False,
-        num_events=1,
-        total_time=0.0,
-        total_memory=0.0,
     )
 
     with pytest.raises(VineReduceError, match="minimum reduction_size"):
@@ -1064,11 +1055,8 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
         is_final=True,
         is_checkpoint=True,
         force_final=True,
-        num_events=5,
-        total_time=0.0,
-        total_memory=0.0,
     )
-    assert pipeline._reduce_tasks_submitted == 0
+    assert pipeline.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
         ResourceExhaustion(result_id="r", resources={}, std_output=None),
@@ -1079,7 +1067,7 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
     assert pipeline.pool[:5] == items
     # Re-pooled, not resubmitted directly - submit_ready_reductions is what
     # will re-split it into properly-sized groups on the next cycle.
-    assert pipeline._reduce_tasks_submitted == 0
+    assert pipeline.reduce_tasks_submitted == 0
     assert len(pipeline._in_flight) == 0
     db.close()
 

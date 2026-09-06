@@ -215,9 +215,6 @@ class _ReduceTask:
     group: list[PoolItem]
     is_final: bool
     is_checkpoint: bool
-    num_events: int
-    total_time: float
-    total_memory: float
     force_final: bool = False
 
 
@@ -313,21 +310,20 @@ class Pipeline:
         self._failed_files: set[str] = set()
         self._files_concluded = 0
 
-        # Progress-bar counters (see events_*/proc_tasks_*/reduce_tasks_*
-        # properties below) - cumulative across the whole run, not reset on
-        # retry, so progress.py's totals estimate has a stable ratio to
-        # extrapolate from. events_total is fixed at construction; the dataset
-        # dict is never mutated after this.
+        # Progress-bar counters, read directly by progress.py - cumulative
+        # across the whole run, not reset on retry, so its totals estimate
+        # has a stable ratio to extrapolate from. events_total is fixed at
+        # construction; the dataset dict is never mutated after this.
         self.events_total = sum(dataset["files"].values())
-        self._events_completed = 0
-        self._events_failed = 0
-        self._events_submitted = 0
-        self._proc_tasks_completed = 0
-        self._proc_tasks_failed = 0
-        self._proc_tasks_submitted = 0
-        self._reduce_tasks_completed = 0
-        self._reduce_tasks_failed = 0
-        self._reduce_tasks_submitted = 0
+        self.events_completed = 0
+        self.events_failed = 0
+        self.events_submitted = 0
+        self.proc_tasks_completed = 0
+        self.proc_tasks_failed = 0
+        self.proc_tasks_submitted = 0
+        self.reduce_tasks_completed = 0
+        self.reduce_tasks_failed = 0
+        self.reduce_tasks_submitted = 0
 
         self._seed_from_checkpoints()
         if self.finished:
@@ -385,22 +381,11 @@ class Pipeline:
         return len(self._in_flight)
 
     # -- progress-bar counters -----------------------------------------------
-    # Raw facts only - progress.py owns all bar-rendering and totals-estimate
-    # math, so a pipeline's contribution to a processor's four aggregate bars
-    # (see ProgressReporter) is just these properties summed across every
-    # pipeline sharing that processor_name.
-
-    @property
-    def events_completed(self) -> int:
-        return self._events_completed
-
-    @property
-    def events_failed(self) -> int:
-        return self._events_failed
-
-    @property
-    def events_submitted(self) -> int:
-        return self._events_submitted
+    # events_completed/failed/submitted, proc_tasks_completed/failed/submitted,
+    # and reduce_tasks_completed/failed/submitted are plain public attributes
+    # (see __init__) - progress.py reads them directly and sums them across
+    # every pipeline sharing a processor_name for its four aggregate bars (see
+    # ProgressReporter). Only the derived counts below need actual logic.
 
     @property
     def events_safe(self) -> int:
@@ -413,32 +398,8 @@ class Pipeline:
         )
 
     @property
-    def proc_tasks_completed(self) -> int:
-        return self._proc_tasks_completed
-
-    @property
-    def proc_tasks_failed(self) -> int:
-        return self._proc_tasks_failed
-
-    @property
-    def proc_tasks_submitted(self) -> int:
-        return self._proc_tasks_submitted
-
-    @property
     def proc_tasks_in_flight(self) -> int:
         return sum(1 for task in self._in_flight.values() if isinstance(task, _ChunkTask))
-
-    @property
-    def reduce_tasks_completed(self) -> int:
-        return self._reduce_tasks_completed
-
-    @property
-    def reduce_tasks_failed(self) -> int:
-        return self._reduce_tasks_failed
-
-    @property
-    def reduce_tasks_submitted(self) -> int:
-        return self._reduce_tasks_submitted
 
     @property
     def reduce_tasks_in_flight(self) -> int:
@@ -551,8 +512,8 @@ class Pipeline:
             self._executor,
         )
         self._in_flight[result_id] = task
-        self._proc_tasks_submitted += 1
-        self._events_submitted += chunk.num_events
+        self.proc_tasks_submitted += 1
+        self.events_submitted += chunk.num_events
 
     # -- reduction pool ------------------------------------------------------
 
@@ -605,11 +566,8 @@ class Pipeline:
             is_final=is_final,
             is_checkpoint=is_checkpoint,
             force_final=force_final,
-            num_events=num_events,
-            total_time=total_time,
-            total_memory=total_memory,
         )
-        self._reduce_tasks_submitted += 1
+        self.reduce_tasks_submitted += 1
 
     # -- outcome handling ------------------------------------------------------
 
@@ -643,8 +601,8 @@ class Pipeline:
         self.refresh_finished()
 
     def _record_chunk_failure(self, chunk: Chunk) -> None:
-        self._proc_tasks_failed += 1
-        self._events_failed += chunk.num_events
+        self.proc_tasks_failed += 1
+        self.events_failed += chunk.num_events
 
     def _handle_chunk_runtime_failure(self, task: _ChunkTask, outcome: RuntimeFailure) -> None:
         chunk = task.chunk
@@ -708,8 +666,8 @@ class Pipeline:
 
     def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
         chunk = task.chunk
-        self._proc_tasks_completed += 1
-        self._events_completed += chunk.num_events
+        self.proc_tasks_completed += 1
+        self.events_completed += chunk.num_events
         _update_resource_max(self._processing_max, outcome.resources)
         wall_time_s = outcome.resources.get("wall_time_s", 0.0)
         memory_mb = outcome.resources.get("memory_mb", 0.0)
@@ -808,7 +766,7 @@ class Pipeline:
         self, task: _ReduceTask, outcome: ResourceExhaustion
     ) -> None:
         group = task.group
-        self._reduce_tasks_failed += 1
+        self.reduce_tasks_failed += 1
         if len(group) <= self.reduction_size:
             # This group was formed at (or below) the current reduction_size,
             # so its failure is real evidence that the current size is too
@@ -841,7 +799,7 @@ class Pipeline:
     def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
         group = task.group
         attempts_used = 1 + max((item.attempts for item in group), default=0)
-        self._reduce_tasks_failed += 1
+        self.reduce_tasks_failed += 1
         if attempts_used >= self._attempts:
             self._give_up_on_reduction(
                 group,
@@ -887,7 +845,7 @@ class Pipeline:
             return
 
         assert isinstance(outcome, Success)
-        self._reduce_tasks_completed += 1
+        self.reduce_tasks_completed += 1
         _update_resource_max(self._reduction_max, outcome.resources)
         # group's own handles are deliberately not released here: new_item
         # isn't durable yet, so if it's lost before something checkpoints
@@ -899,9 +857,9 @@ class Pipeline:
         memory_mb = outcome.resources.get("memory_mb", 0.0)
         new_item = PoolItem(
             handle=ResultHandle(outcome.result_id, outcome.file),
-            num_events=task.num_events,
-            wall_time_s=task.total_time + wall_time_s,
-            memory_mb=task.total_memory + memory_mb,
+            num_events=sum(item.num_events for item in group),
+            wall_time_s=sum(item.wall_time_s for item in group) + wall_time_s,
+            memory_mb=sum(item.memory_mb for item in group) + memory_mb,
             files=frozenset().union(*(item.files for item in group)),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
             since_checkpoint_distance=max(item.since_checkpoint_distance for item in group) + 1,
