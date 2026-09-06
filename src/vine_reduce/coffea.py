@@ -22,6 +22,7 @@ from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 
 from coffea.nanoevents import NanoAODSchema
 
+from . import defaults
 from .engine import VineReduce
 from .executor import SimpleExecutor
 from .types import Chunk
@@ -238,7 +239,22 @@ class VineReduceCoffea(VineReduce):
 
     def __post_init__(self) -> None:
         """Builds chunk_to_args/executor from the fields above, the way a
-        user of plain VineReduce would pass them in directly."""
+        user of plain VineReduce would pass them in directly. These two
+        VineReduce fields are computed from this class's own fields (schema,
+        mode, object_path, uproot_options, processor_args), so passing
+        chunk_to_args= or executor= explicitly would silently be discarded -
+        raise instead so the mistake isn't hidden."""
+        if self.chunk_to_args is not defaults.default_chunk_to_args:
+            raise ValueError(
+                "VineReduceCoffea computes chunk_to_args itself from schema/"
+                "mode/uproot_options/object_path; pass those instead of "
+                "chunk_to_args=."
+            )
+        if type(self.executor) is not SimpleExecutor:
+            raise ValueError(
+                "VineReduceCoffea computes executor itself from "
+                "processor_args; pass that instead of executor=."
+            )
         self.chunk_to_args = _make_chunk_to_args(
             self.schema, self.mode, self.uproot_options, self.object_path
         )
