@@ -244,6 +244,7 @@ class Pipeline:
         result_postprocess: Callable | None,
         chunksize: int | None,
         reduction_size: int,
+        minimum_reduction_size: int = 2,
         checkpoint_time: float | None,
         checkpoint_distance: int | None,
         checkpoint_accumulations: bool,
@@ -273,6 +274,7 @@ class Pipeline:
         self._result_postprocess = result_postprocess
         self.chunksize = chunksize
         self.reduction_size = reduction_size
+        self._minimum_reduction_size = minimum_reduction_size
         self._checkpoint_time = checkpoint_time
         self._checkpoint_distance = checkpoint_distance
         self._checkpoint_accumulations = checkpoint_accumulations
@@ -772,95 +774,85 @@ class Pipeline:
         if ratio > self._failure_proportion:
             raise VineReduceError(abort_message)
 
-    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
+    def _handle_reduce_resource_exhaustion(
+        self, task: _ReduceTask, outcome: ResourceExhaustion
+    ) -> None:
         group = task.group
-        description = f"reduction of {len(group)} partial{'s' if len(group) != 1 else ''}"
-        if task.is_final:
-            description += " (final)"
-        if task.force_final:
-            reduce_kind = "final"
-        elif task.is_final:
-            reduce_kind = "result"
-        elif task.is_checkpoint:
-            reduce_kind = "checkpoint"
-        else:
-            reduce_kind = "reducer"
-        self._report_task(reduce_kind, description, outcome)
-
-        if isinstance(outcome, RuntimeFailure):
-            attempts_used = 1 + max((item.attempts for item in group), default=0)
-            self._reduce_tasks_failed += 1
-            if attempts_used >= self._attempts:
+        self._reduce_tasks_failed += 1
+        if len(group) <= self.reduction_size:
+            # This group was formed at (or below) the current reduction_size,
+            # so its failure is real evidence that the current size is too
+            # big - shrink it (or give up if already at the floor). A group
+            # *bigger* than the current size (one formed before an earlier
+            # shrink, or the final drain group, which folds whatever is left
+            # regardless of size) was never tried at the current size, so it
+            # is not such evidence and falls through unshrunk to the re-pool
+            # below.
+            if self.reduction_size <= self._minimum_reduction_size:
                 self._give_up_on_reduction(
                     group,
-                    attempts=attempts_used,
-                    resources_measured=outcome.resources,
-                    traceback=outcome.traceback,
-                )
-                raise VineReduceError(
-                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
-                    f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
-                    f"(attempts={self._attempts}):\n{outcome.traceback}"
-                )
-            for item in group:
-                item.attempts = attempts_used
-            self._submit_reduction(group)  # retry the exact same group unchanged
-            return
-        if isinstance(outcome, ResourceExhaustion):
-            self._reduce_tasks_failed += 1
-            if len(group) > self.reduction_size:
-                # normal group whose reduction_size shrank further while it
-                # was in flight. Never actually tried at the current (smaller)
-                # size.
-                for item in group:
-                    item.attempts = 0
-                self.pool[:0] = group
-                return
-            if len(group) == self.reduction_size:
-                if self.reduction_size <= 2:
-                    self._give_up_on_reduction(
-                        group,
-                        attempts=1 + max((item.attempts for item in group), default=0),
-                        resources_measured=outcome.resources,
-                        traceback=None,
-                    )
-                    raise VineReduceError(
-                        f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                        "resources at the minimum reduction_size (2); cannot retry smaller."
-                    )
-
-                self.reduction_size = max(2, self.reduction_size // 2)
-                # A halved reduction_size is a fresh start for these items,
-                # not a strike against the budget - see PoolItem.attempts's
-                # docstring.
-                for item in group:
-                    item.attempts = 0
-                self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
-                return
-
-            # This group is already smaller than the current reduction_size
-            # (a final/leftover group, or a group formed before an earlier,
-            # unrelated failure shrank reduction_size) - its failure isn't
-            # evidence the current size is too big, so don't shrink further.
-            # Retry it like a RuntimeFailure instead, so a group that keeps
-            # failing for some other reason can't retry forever.
-            attempts_used = 1 + max((item.attempts for item in group), default=0)
-            if attempts_used >= self._attempts:
-                self._give_up_on_reduction(
-                    group,
-                    attempts=attempts_used,
+                    attempts=1 + max((item.attempts for item in group), default=0),
                     resources_measured=outcome.resources,
                     traceback=None,
                 )
                 raise VineReduceError(
-                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
-                    f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
-                    f"(attempts={self._attempts}); its size is already below the current "
-                    "reduction_size so it will not be retried smaller."
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
+                    "resources at the minimum reduction_size "
+                    f"({self._minimum_reduction_size}); cannot retry smaller."
                 )
-            for item in group:
-                item.attempts = attempts_used
-            self._submit_reduction(group)  # retry the exact same group unchanged
+            self.reduction_size = max(self._minimum_reduction_size, self.reduction_size // 2)
+        # Any ResourceExhaustion is a fresh start for these items, not a
+        # strike against the budget - see PoolItem.attempts's docstring.
+        for item in group:
+            item.attempts = 0
+        self.pool[:0] = group  # re-split at the current reduction_size next cycle
+
+    def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
+        group = task.group
+        attempts_used = 1 + max((item.attempts for item in group), default=0)
+        self._reduce_tasks_failed += 1
+        if attempts_used >= self._attempts:
+            self._give_up_on_reduction(
+                group,
+                attempts=attempts_used,
+                resources_measured=outcome.resources,
+                traceback=outcome.traceback,
+            )
+            raise VineReduceError(
+                f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
+                f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
+                f"(attempts={self._attempts}):\n{outcome.traceback}"
+            )
+        for item in group:
+            item.attempts = attempts_used
+        self._submit_reduction(group)  # retry the exact same group unchanged
+
+    def _reduce_task_description(self, task: _ReduceTask) -> tuple[str, str]:
+        """The (kind, description) pair identifying one reduce task, for
+        _report_task - see TaskReport.kind/description."""
+        description = f"reduction of {len(task.group)} partial{'s' if len(task.group) != 1 else ''}"
+        if task.is_final:
+            description += " (final)"
+        if task.force_final:
+            kind = "final"
+        elif task.is_final:
+            kind = "result"
+        elif task.is_checkpoint:
+            kind = "checkpoint"
+        else:
+            kind = "reducer"
+        return kind, description
+
+    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
+        group = task.group
+        kind, description = self._reduce_task_description(task)
+        self._report_task(kind, description, outcome)
+
+        if isinstance(outcome, RuntimeFailure):
+            self._handle_reduce_runtime_failure(task, outcome)
+            return
+        if isinstance(outcome, ResourceExhaustion):
+            self._handle_reduce_resource_exhaustion(task, outcome)
             return
 
         assert isinstance(outcome, Success)

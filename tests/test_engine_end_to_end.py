@@ -7,7 +7,11 @@ import pytest
 
 from vine_reduce import VineReduce, VineReduceError, defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
-from vine_reduce.engine import _resolve_reduction_size, _resolve_sized_config
+from vine_reduce.engine import (
+    _resolve_minimum_reduction_size,
+    _resolve_reduction_size,
+    _resolve_sized_config,
+)
 from vine_reduce.failure_log import FailureLog
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.progress import NullProgressReporter
@@ -73,6 +77,23 @@ def test_resolve_reduction_size_raises_on_too_small_value():
         _resolve_reduction_size(1, "proc", "ds")
     with pytest.raises(VineReduceError):
         _resolve_reduction_size({"default": 1}, "proc", "ds")
+
+
+def test_resolve_minimum_reduction_size_defaults_to_two_when_not_given():
+    assert _resolve_minimum_reduction_size(None, 10) == 2
+
+
+def test_resolve_minimum_reduction_size_raises_values_below_two_to_two():
+    assert _resolve_minimum_reduction_size(0, 10) == 2
+    assert _resolve_minimum_reduction_size(1, 10) == 2
+
+
+def test_resolve_minimum_reduction_size_caps_at_reduction_size():
+    assert _resolve_minimum_reduction_size(20, 10) == 10
+
+
+def test_resolve_minimum_reduction_size_passes_through_valid_value():
+    assert _resolve_minimum_reduction_size(4, 10) == 4
 
 
 def test_reduction_size_dict_missing_default_raises_clearly(tmp_path, dataset_input, distributor):

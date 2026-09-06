@@ -62,6 +62,16 @@ def _resolve_reduction_size(config: int | dict, processor_name: str, dataset_nam
     return resolved
 
 
+def _resolve_minimum_reduction_size(minimum_reduction_size: int | None, reduction_size: int) -> int:
+    """Clamps VineReduce.minimum_reduction_size for one (processor, dataset)
+    pair's already-resolved reduction_size: None defaults to 2, anything
+    below 2 is raised to 2, and anything above reduction_size itself is
+    capped at reduction_size (a floor can never exceed the size it bounds)."""
+    if minimum_reduction_size is None:
+        minimum_reduction_size = 2
+    return min(max(2, minimum_reduction_size), reduction_size)
+
+
 @dataclass
 class VineReduce:
     """Drives a dynamic data reduction computation over one or more datasets: for
@@ -100,8 +110,14 @@ class VineReduce:
         once. Either a plain int, or a dict of shape
         {"default": int, "processors": {name: int}, "datasets": {name: int}}
         for per-processor/per-dataset overrides (most specific wins).
-        Halved automatically (down to a minimum of 2) on resource
+        Halved automatically (down to minimum_reduction_size) on resource
         exhaustion.
+    minimum_reduction_size: the floor reduction_size is halved down to on
+        resource exhaustion, below which a further ResourceExhaustion raises
+        immediately instead of shrinking further (see attempts's docstring).
+        None (the default) means 2. A value below 2 is raised to 2; a value
+        above the (possibly per-processor/per-dataset) resolved
+        reduction_size is capped at that reduction_size.
     is_result: given (num_events, total_wall_time_s, total_memory_mb) for a
         pooled group, returns whether it counts as a final result for that
         (processor, dataset) pair. Defaults to a check that the group covers
@@ -160,7 +176,7 @@ class VineReduce:
         attempts=1 means no retries. A halving of chunksize/reduction_size
         resets the budget for the smaller unit it produces (a fresh start,
         not a strike against it); once a chunk/reduction is already at the
-        minimum size (1 event / reduction_size 2) a further
+        minimum size (1 event / minimum_reduction_size) a further
         ResourceExhaustion raises immediately, since there is no smaller
         size left to retry at. Once the budget for a specific chunk is
         exhausted, the file it belongs to is given up on for good (see
@@ -193,6 +209,7 @@ class VineReduce:
     executor: Executor = field(default_factory=SimpleExecutor)
     reducer: Callable = defaults.default_reducer
     reduction_size: int | dict = 10
+    minimum_reduction_size: int | None = None
     is_result: Callable[[int, float, float], bool] | None = None
     result_postprocess: Callable[[Any], Any] | None = None
     checkpoint_time: float | None = None
@@ -315,6 +332,10 @@ class VineReduce:
                 is_result = self.is_result or defaults.make_default_is_result(
                     sum(dataset["files"].values())
                 )
+                reduction_size = _resolve_reduction_size(self.reduction_size, proc_name, dataset_name)
+                minimum_reduction_size = _resolve_minimum_reduction_size(
+                    self.minimum_reduction_size, reduction_size
+                )
                 pipelines.append(
                     Pipeline(
                         processor_name=proc_name,
@@ -332,9 +353,8 @@ class VineReduce:
                         is_result=is_result,
                         result_postprocess=self.result_postprocess,
                         chunksize=_resolve_sized_config(self.chunksize, proc_name, dataset_name),
-                        reduction_size=_resolve_reduction_size(
-                            self.reduction_size, proc_name, dataset_name
-                        ),
+                        reduction_size=reduction_size,
+                        minimum_reduction_size=minimum_reduction_size,
                         checkpoint_time=self.checkpoint_time,
                         checkpoint_distance=self.checkpoint_distance,
                         checkpoint_accumulations=self.checkpoint_accumulations,

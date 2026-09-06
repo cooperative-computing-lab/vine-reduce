@@ -46,6 +46,7 @@ def make_pipeline(
     processor=count_events,
     reducer=sum_reducer,
     reduction_size=10,
+    minimum_reduction_size=2,
     chunksize=None,
     checkpoint_time=None,
     checkpoint_distance=None,
@@ -78,6 +79,7 @@ def make_pipeline(
             result_postprocess=None,
             chunksize=chunksize,
             reduction_size=reduction_size,
+            minimum_reduction_size=minimum_reduction_size,
             checkpoint_time=checkpoint_time,
             checkpoint_distance=checkpoint_distance,
             checkpoint_accumulations=checkpoint_accumulations,
@@ -826,6 +828,33 @@ def test_reduction_resource_exhaustion_at_minimum_size_raises_immediately(
     db.close()
 
 
+def test_reduction_resource_exhaustion_stops_at_a_custom_minimum_reduction_size(
+    fake_distributor, tmp_path
+):
+    """A custom minimum_reduction_size raises the floor a ResourceExhaustion
+    halves reduction_size down to - it must stop there instead of at the
+    default of 2."""
+
+    def always_exhausts(a, b):
+        raise MemoryError("simulated resource exhaustion")
+
+    dataset = {"files": {f"{c}.root": 1 for c in "abcd"}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reducer=always_exhausts,
+        reduction_size=4,
+        minimum_reduction_size=4,
+        attempts=5,
+    )
+
+    with pytest.raises(VineReduceError, match="minimum reduction_size"):
+        run_to_completion(pipeline, fake_distributor)
+    assert pipeline.reduction_size == 4  # never shrunk below the custom floor
+    db.close()
+
+
 def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distributor, tmp_path):
     """A ResourceExhaustion-driven halving of reduction_size is a fresh
     start for the disbanded items, not a strike against attempts already
@@ -865,14 +894,16 @@ def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distrib
     db.close()
 
 
-def test_reduction_resource_exhaustion_below_current_size_does_not_shrink(
+def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
     fake_distributor, tmp_path
 ):
-    """A group smaller than the current reduction_size (e.g. a final/
-    leftover group, or one formed before an earlier, unrelated failure
-    already shrank reduction_size) failing with ResourceExhaustion is not
-    evidence that reduction_size itself is too big, so it must not be
-    shrunk further - the group is instead retried like a RuntimeFailure."""
+    """A group smaller than the current reduction_size (e.g. a leftover
+    group) failing with ResourceExhaustion is treated exactly like one
+    formed at the current size: it is evidence that the current size is too
+    big, so reduction_size is halved, the items' attempts are reset (a
+    smaller reduction_size is a fresh start - see PoolItem.attempts), and
+    the group goes back to the front of the pool to be re-split next cycle
+    rather than being resubmitted unchanged."""
     dataset = {"files": {f"{c}.root": 1 for c in "abcd"}}
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=4, attempts=3)
 
@@ -885,7 +916,7 @@ def test_reduction_resource_exhaustion_below_current_size_does_not_shrink(
             files=frozenset({f"{c}.root"}),
             since_checkpoint_time=0.0,
             since_checkpoint_distance=0,
-            attempts=0,
+            attempts=1,
         )
         for i, c in enumerate("ab")  # a group of 2, smaller than reduction_size=4
     ]
@@ -903,56 +934,54 @@ def test_reduction_resource_exhaustion_below_current_size_does_not_shrink(
         ResourceExhaustion(result_id="r", resources={}, std_output=None),
     )
 
-    assert pipeline.reduction_size == 4  # unchanged, not halved
-    assert all(item.attempts == 1 for item in items)  # incremented, not reset
-    # The group was resubmitted (like a RuntimeFailure retry) rather than
-    # dropped back into the pool to wait for more items.
-    assert pipeline._reduce_tasks_submitted == 1
-    assert len(pipeline._in_flight) == 1
-    (resubmitted,) = pipeline._in_flight.values()
-    assert resubmitted.group == items
+    assert pipeline.reduction_size == 2  # halved
+    assert all(item.attempts == 0 for item in items)  # reset, not incremented
+    assert pipeline.pool[:2] == items
+    # Re-pooled, not resubmitted directly - submit_ready_reductions is what
+    # will re-split it at the new size on the next cycle.
+    assert pipeline._reduce_tasks_submitted == 0
+    assert len(pipeline._in_flight) == 0
     db.close()
 
 
-def test_reduction_resource_exhaustion_below_current_size_exhausts_attempts_and_raises(
+def test_reduction_resource_exhaustion_below_current_size_at_minimum_raises(
     fake_distributor, tmp_path
 ):
-    """The same below-current-size group, once its attempts budget is used
-    up, must give up and raise rather than retry forever - reduction_size
-    still must not have been shrunk, since its failure was never evidence
-    the current size is too big."""
+    """A group smaller than the current reduction_size failing with
+    ResourceExhaustion when reduction_size is already the floor of 2 cannot
+    be retried any smaller, so it must give up and raise right away
+    regardless of how much of the attempts budget remains."""
     dataset = {"files": {f"{c}.root": 1 for c in "abcd"}}
-    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=4, attempts=2)
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2, attempts=5)
 
     items = [
         PoolItem(
-            handle=ResultHandle(f"r{i}", f"f{i}"),
+            handle=ResultHandle("r0", "f0"),
             num_events=1,
             wall_time_s=0.0,
             memory_mb=0.0,
-            files=frozenset({f"{c}.root"}),
+            files=frozenset({"a.root"}),
             since_checkpoint_time=0.0,
             since_checkpoint_distance=0,
-            attempts=1,  # 1 of 2 already used
+            attempts=0,
         )
-        for i, c in enumerate("ab")
-    ]
+    ]  # a group of 1, smaller than reduction_size=2
     pipeline._in_flight["r"] = _ReduceTask(
         group=items,
         is_final=False,
         is_checkpoint=False,
-        num_events=2,
+        num_events=1,
         total_time=0.0,
         total_memory=0.0,
     )
 
-    with pytest.raises(VineReduceError, match="already below the current reduction_size"):
+    with pytest.raises(VineReduceError, match="minimum reduction_size"):
         pipeline._handle_reduce_outcome(
             pipeline._in_flight.pop("r"),
             ResourceExhaustion(result_id="r", resources={}, std_output=None),
         )
 
-    assert pipeline.reduction_size == 4  # still unchanged
+    assert pipeline.reduction_size == 2  # still at the floor
     db.close()
 
 
