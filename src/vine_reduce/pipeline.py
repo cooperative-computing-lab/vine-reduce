@@ -808,23 +808,53 @@ class Pipeline:
             return
         if isinstance(outcome, ResourceExhaustion):
             self._reduce_tasks_failed += 1
-            if self.reduction_size <= 2:
+            if len(group) >= self.reduction_size:
+                # This group was formed at (or, if reduction_size shrank
+                # further while it was in flight, above) the current
+                # reduction_size, so its failure is real evidence that the
+                # current size is too big.
+                if self.reduction_size <= 2:
+                    self._give_up_on_reduction(
+                        group,
+                        attempts=1 + max((item.attempts for item in group), default=0),
+                        resources_measured=outcome.resources,
+                        traceback=None,
+                    )
+                    raise VineReduceError(
+                        f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
+                        "resources at the minimum reduction_size (2); cannot retry smaller."
+                    )
+                self.reduction_size = max(2, self.reduction_size // 2)
+                # A halved reduction_size is a fresh start for these items,
+                # not a strike against the budget - see PoolItem.attempts's
+                # docstring.
+                for item in group:
+                    item.attempts = 0
+                self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
+                return
+            # This group is already smaller than the current reduction_size
+            # (a final/leftover group, or a group formed before an earlier,
+            # unrelated failure shrank reduction_size) - its failure isn't
+            # evidence the current size is too big, so don't shrink further.
+            # Retry it like a RuntimeFailure instead, so a group that keeps
+            # failing for some other reason can't retry forever.
+            attempts_used = 1 + max((item.attempts for item in group), default=0)
+            if attempts_used >= self._attempts:
                 self._give_up_on_reduction(
                     group,
-                    attempts=1 + max((item.attempts for item in group), default=0),
+                    attempts=attempts_used,
                     resources_measured=outcome.resources,
                     traceback=None,
                 )
                 raise VineReduceError(
-                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                    "resources at the minimum reduction_size (2); cannot retry smaller."
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
+                    f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
+                    f"(attempts={self._attempts}); its size is already below the current "
+                    "reduction_size so it will not be retried smaller."
                 )
-            self.reduction_size = max(2, self.reduction_size // 2)
-            # A halved reduction_size is a fresh start for these items, not a
-            # strike against the budget - see PoolItem.attempts's docstring.
             for item in group:
-                item.attempts = 0
-            self.pool[:0] = group  # retry with a (now smaller) reduction_size next cycle
+                item.attempts = attempts_used
+            self._submit_reduction(group)  # retry the exact same group unchanged
             return
 
         assert isinstance(outcome, Success)
