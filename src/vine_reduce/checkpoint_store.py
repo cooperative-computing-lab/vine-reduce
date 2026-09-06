@@ -98,13 +98,10 @@ class CheckpointStore:
             )
 
     def _count_existing_checkpoints(self) -> int:
-        tables = {
-            row[0]
-            for row in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'"
-            )
-        }
-        if "checkpoints" not in tables:
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'"
+        ).fetchone()
+        if exists is None:
             return 0
         return self._conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
 
@@ -170,8 +167,7 @@ class CheckpointStore:
         supersedes: Sequence[int] = (),
     ) -> int:
         """Insert this checkpoint and delete the rows it supersedes, in ONE
-        transaction. Returns the new row id. This is the only write path for
-        checkpoints - there is no commit= parameter and no public commit()."""
+        transaction. Returns the new row id."""
         covers_files = sorted(covers_files)
         with self._conn:
             cur = self._conn.execute(
