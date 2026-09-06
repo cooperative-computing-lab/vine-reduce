@@ -113,7 +113,9 @@ def _bar(
     return text
 
 
-def _counts_colored(completed: int, failed: int | None, total: int, safe: int | None = None) -> Text:
+def _counts_colored(
+    completed: int, failed: int | None, total: int, safe: int | None = None
+) -> Text:
     """Colored counts text: completed - yellow, or green when `failed` is
     None (the datasets row, which has no failed count) - with, for the
     events row, the safe/checkpointed subset (green) in parentheses right

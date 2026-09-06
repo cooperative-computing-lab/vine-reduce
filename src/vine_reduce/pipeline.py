@@ -527,7 +527,13 @@ class Pipeline:
         """If nothing more can ever arrive in the pool, reduce whatever's left
         as one last group, however small, and make it final unconditionally -
         see _submit_reduction's force_final."""
-        if self.pool and self.chunks_all_done and self.in_flight_count() == 0 and len(self.pool) > 0 and len(self.pool) <= self.reduction_size:
+        if (
+            self.pool
+            and self.chunks_all_done
+            and self.in_flight_count() == 0
+            and len(self.pool) > 0
+            and len(self.pool) <= self.reduction_size
+        ):
             group, self.pool = self.pool, []
             self._submit_reduction(group, force_final=True)
 

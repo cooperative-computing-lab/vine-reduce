@@ -347,7 +347,9 @@ class VineReduce:
                 is_result = self.is_result or defaults.make_default_is_result(
                     sum(dataset["files"].values())
                 )
-                reduction_size = _resolve_reduction_size(self.reduction_size, proc_name, dataset_name)
+                reduction_size = _resolve_reduction_size(
+                    self.reduction_size, proc_name, dataset_name
+                )
                 minimum_reduction_size = _resolve_minimum_reduction_size(
                     self.minimum_reduction_size, reduction_size
                 )
