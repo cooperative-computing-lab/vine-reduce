@@ -4,7 +4,6 @@ import os
 from concurrent.futures.process import BrokenProcessPool
 
 import cloudpickle
-import dask
 import pytest
 
 from vine_reduce.executor import CloudpickleExecutor, DaskExecutor, SimpleExecutor, _num_workers
@@ -116,6 +115,8 @@ def test_cloudpickle_executor_context_manager_shuts_pool_down_on_exit():
 
 
 def test_dask_executor_computes_the_returned_dask_object():
+    dask = pytest.importorskip("dask")
+
     def processor(chunk):
         return dask.delayed(count_events)(chunk)
 

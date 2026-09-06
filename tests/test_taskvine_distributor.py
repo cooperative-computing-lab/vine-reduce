@@ -5,20 +5,27 @@ import shutil
 import time
 from uuid import uuid4
 
-import ndcctools.taskvine as vine
 import pytest
 
-from vine_reduce import VineReduce, serialization
-from vine_reduce.defaults import (
+vine = pytest.importorskip("ndcctools.taskvine")
+
+from vine_reduce import VineReduce, serialization  # noqa: E402
+from vine_reduce.defaults import (  # noqa: E402
     default_chunk_to_args,
     executor_wrapper,
     reducer_wrapper,
 )
-from vine_reduce.executor import SimpleExecutor
-from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token
-from vine_reduce.types import Chunk, RuntimeFailure, Success
+from vine_reduce.executor import SimpleExecutor  # noqa: E402
+from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token  # noqa: E402
+from vine_reduce.types import Chunk, RuntimeFailure, Success  # noqa: E402
 
-from helpers import count_events, failing_processor, read_env_var, read_shipped_file, sum_reducer
+from helpers import (  # noqa: E402
+    count_events,
+    failing_processor,
+    read_env_var,
+    read_shipped_file,
+    sum_reducer,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("vine_factory") is None, reason="vine_factory not on PATH"
