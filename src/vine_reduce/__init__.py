@@ -10,6 +10,7 @@ UnstagedChanges (remote_environment.py), and the Chunk/Outcome family of
 types shared between vine_reduce and a distributor.
 """
 
+import importlib.util
 from typing import TYPE_CHECKING
 
 from .distributor import Distributor
@@ -36,12 +37,14 @@ __all__ = [
     "RuntimeFailure",
     "SimpleExecutor",
     "Success",
-    "TaskVineDistributor",
     "UnstagedChanges",
     "VineReduce",
     "VineReduceError",
     "get_environment",
 ]
+
+if TYPE_CHECKING or importlib.util.find_spec("ndcctools") is not None:
+    __all__.append("TaskVineDistributor")
 
 
 def __getattr__(name: str):
