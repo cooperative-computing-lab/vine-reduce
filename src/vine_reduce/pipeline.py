@@ -676,9 +676,19 @@ class Pipeline:
             self._retry_chunks.append((chunk, attempts_used))
             return
         if isinstance(outcome, ResourceExhaustion):
-            current_size = self.chunksize if self.chunksize is not None else chunk.num_events
             self._proc_tasks_failed += 1
             self._events_failed += chunk.num_events
+            current_size = self.chunksize if self.chunksize is not None else chunk.num_events
+            if chunk.num_events > current_size:
+                # A sibling chunk's exhaustion already shrank chunksize
+                # further while this chunk was still in flight, so it was
+                # never actually tried at the current (smaller) size - not
+                # evidence that it's too big. It will be re-split down to the
+                # current chunksize next time it's pulled off the retry
+                # queue - see _next_chunk - and the equivalent reduction rule
+                # in _handle_reduce_resource_exhaustion.
+                self._retry_chunks.append((chunk, 0))
+                return
             if current_size <= 1:
                 self._give_up_on_file(
                     chunk,

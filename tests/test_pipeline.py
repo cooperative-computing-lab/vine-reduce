@@ -778,6 +778,51 @@ def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor,
     db.close()
 
 
+def test_chunk_resource_exhaustion_above_current_size_repools_without_shrinking(
+    fake_distributor, tmp_path
+):
+    """A chunk larger than the current chunksize (e.g. a sibling chunk's
+    exhaustion already shrank chunksize further while this one was still in
+    flight) was never actually tried at the current, smaller size - so its
+    failure isn't evidence that size is too big. It must be re-pooled
+    unshrunk (to be re-split down to the current size next time it's pulled
+    off the retry queue) instead of halving chunksize again."""
+    dataset = {"files": {"a.root": 8}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=2, attempts=3)
+
+    chunk = Chunk("a.root", 0, 4)  # formed before chunksize shrank from 4 to 2
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=1)
+    pipeline._handle_chunk_outcome(
+        pipeline._in_flight.pop("r1"),
+        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+    )
+
+    assert pipeline.chunksize == 2  # not shrunk further
+    assert pipeline._retry_chunks == [(chunk, 0)]  # fresh budget, not resubmitted unchanged
+    db.close()
+
+
+def test_chunk_resource_exhaustion_above_floor_does_not_give_up_early(fake_distributor, tmp_path):
+    """A sibling chunk's exhaustion may have already shrunk chunksize down to
+    the floor (1) while this chunk - much bigger and never tried at size 1 -
+    was still in flight. Its own exhaustion must not be mistaken for
+    evidence that size-1 chunks can't work; it has to be re-split down
+    first, not aborted immediately."""
+    dataset = {"files": {"a.root": 8}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=1, attempts=3)
+
+    chunk = Chunk("a.root", 0, 4)  # formed before chunksize shrank to the floor
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=0)
+    pipeline._handle_chunk_outcome(
+        pipeline._in_flight.pop("r1"),
+        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+    )
+
+    assert pipeline.chunksize == 1  # unchanged, still the floor
+    assert pipeline._retry_chunks == [(chunk, 0)]  # re-pooled, not given up on
+    db.close()
+
+
 def test_reduction_runtime_failure_retries_within_attempts_then_succeeds(
     fake_distributor, tmp_path
 ):
