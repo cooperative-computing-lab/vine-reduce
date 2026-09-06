@@ -800,7 +800,9 @@ def test_chunk_resource_exhaustion_above_current_size_repools_without_shrinking(
     )
 
     assert pipeline.chunksize == 2  # not shrunk further
-    assert pipeline._retry_chunks == [_ChunkTask(chunk, 0)]  # fresh budget, not resubmitted unchanged
+    assert pipeline._retry_chunks == [
+        _ChunkTask(chunk, 0)
+    ]  # fresh budget, not resubmitted unchanged
     db.close()
 
 
