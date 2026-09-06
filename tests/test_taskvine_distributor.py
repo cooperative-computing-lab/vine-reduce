@@ -328,6 +328,44 @@ def test_constructor_reuses_a_pre_built_manager(monkeypatch, tmp_path):
     assert outcome.result_id == result_id
 
 
+def test_wait_ignores_tasks_submitted_directly_to_a_shared_manager(monkeypatch, tmp_path):
+    # On a caller-supplied manager= (see test_constructor_reuses_a_pre_built_manager),
+    # the caller may submit its own tasks straight to that manager (e.g.
+    # coffea's own dataset_tools.preprocess()). wait() must only ever
+    # surface tasks *this* distributor submitted - via the tag set on every
+    # task in submit() - or a foreign task finishing first would make
+    # wait() pop an unknown taskvine id from _in_flight_by_taskvine_id and
+    # KeyError.
+    monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))
+    manager = vine.Manager(port=0, ssl=True)
+
+    with TaskVineDistributor(
+        manager=manager,
+        resources_processor={"cores": 1},
+        resources_reducer={"cores": 1},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    ) as dist:
+        workers = vine.Factory(manager=manager)
+        workers.cores = 2
+        workers.min_workers = 1
+        workers.max_workers = 1
+        workers.timeout = WAIT_TIMEOUT
+        with workers:
+            foreign_task = vine.PythonTask(count_events, Chunk("a.root", 0, 1))
+            manager.submit(foreign_task)
+
+            result_id = _submit_chunk(dist, 1, Chunk("a.root", 0, 4))
+            outcome = _wait(dist)
+
+            assert isinstance(outcome, Success)
+            assert outcome.result_id == result_id
+
+            # The foreign task is still the caller's to reap - drain it
+            # directly off the manager so the `with workers` block above
+            # doesn't tear down while it's still in flight.
+            manager.wait_for_task_id(foreign_task.id, WAIT_TIMEOUT)
+
+
 def test_add_file_ships_file_to_every_task_sandbox(monkeypatch, tmp_path):
     # add_file places the file under its basename in the task's own sandbox,
     # so the processor must open it by that relative name (see

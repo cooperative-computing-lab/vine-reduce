@@ -140,6 +140,14 @@ class TaskVineDistributor:
         )
         self._manager.enable_monitoring(watchdog=True)
 
+        # Every task this distributor submits is tagged with this unique
+        # value, and wait() only ever waits for that tag (via
+        # Manager.wait_for_tag) rather than Manager.wait()/wait_for_tag(None)
+        # - so on a caller-supplied manager= shared with the caller's own
+        # tasks (see manager= above), wait() can never pick up one of the
+        # caller's tasks and KeyError on _in_flight_by_taskvine_id.
+        self._tag = f"vine_reduce_{uuid4().hex}"
+
         if self._owns_manager:
             self._manager.tune("category-steady-n-tasks", 2)
             self._manager.tune("hungry-minimum", 100)
@@ -212,6 +220,7 @@ class TaskVineDistributor:
         remapped_args, extra_inputs = self._remap_files(args)
 
         task = vine.PythonTask(func, dest_token, *remapped_args)
+        task.set_tag(self._tag)
         task.set_priority(priority)
         task.set_category(category)
         self._configure_category(category, kind)
@@ -304,7 +313,7 @@ class TaskVineDistributor:
             else:
                 vine_timeout = max(0, math.ceil(timeout))
 
-        task = self._manager.wait(vine_timeout)
+        task = self._manager.wait_for_tag(self._tag, vine_timeout)
         if task is None:
             self._task_last_wait = False
             return None
