@@ -299,13 +299,19 @@ class VineReduce:
         size_log: SizeLog,
     ) -> list[Pipeline]:
         num_processors = len(self.processors)
+        num_datasets = len(datasets)
+        total_slots = num_processors * num_datasets
         pipelines: list[Pipeline] = []
-        for index, (proc_name, processor) in enumerate(self.processors.items()):
-            # Earlier processors get better (larger) priority; reductions always
-            # outrank every processing call, at any processor's priority level.
-            process_priority = num_processors - index
-            reduce_priority = process_priority + num_processors
-            for dataset_name, dataset in datasets.items():
+        for proc_index, (proc_name, processor) in enumerate(self.processors.items()):
+            for dataset_index, (dataset_name, dataset) in enumerate(datasets.items()):
+                # Earlier processors get better (larger) priority than later ones;
+                # within the same processor, earlier datasets get better priority
+                # than later ones. Reductions always outrank every processing call,
+                # at any processor/dataset priority level - see PLAN.md's
+                # "Priorities".
+                rank = proc_index * num_datasets + dataset_index
+                process_priority = total_slots - rank
+                reduce_priority = process_priority + total_slots
                 is_result = self.is_result or defaults.make_default_is_result(
                     sum(dataset["files"].values())
                 )

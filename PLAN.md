@@ -303,8 +303,9 @@ inputs List[PoolItem]: the items folded together to produce this one (empty for 
 **Rule**
 
 All processing calls of the same (processor, dataset) share one priority (larger integer runs
-first). A processor declared earlier gets better priority than a later one. Reductions work the
-same way, but always outrank every processing call, at any processor's priority level.
+first). A processor declared earlier gets better priority than a later one; within the same
+processor, a dataset declared earlier gets better priority than a later one. Reductions work the
+same way, but always outrank every processing call, at any processor/dataset priority level.
 
 **Why**
 
