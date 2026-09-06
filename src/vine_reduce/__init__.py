@@ -22,7 +22,7 @@ from .remote_environment import UnstagedChanges, get_environment
 from .types import Chunk, Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
 
 if TYPE_CHECKING:
-    from .taskvine_distributor import TaskVineDistributor
+    from .taskvine_distributor import TaskVineDistributor  # noqa: F401
 
 __all__ = [
     "Chunk",
@@ -53,7 +53,7 @@ def __getattr__(name: str):
     here rather than at module load time - `import vine_reduce` must not
     require ndcctools to be installed."""
     if name == "TaskVineDistributor":
-        from .taskvine_distributor import TaskVineDistributor
+        from .taskvine_distributor import TaskVineDistributor  # noqa: F811
 
         return TaskVineDistributor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
