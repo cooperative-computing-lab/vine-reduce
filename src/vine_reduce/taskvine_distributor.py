@@ -151,8 +151,8 @@ class TaskVineDistributor(Distributor):
             self._manager.tune("temp-replica-count", 3)
 
         self._resources_by_kind: dict[TaskKind, dict[str, int]] = {
-            "processor": resources_processor or {},
-            "reducer": resources_reducer or {},
+            TaskKind.PROCESSOR: resources_processor or {},
+            TaskKind.REDUCER: resources_reducer or {},
         }
         self._environment = (
             self._manager.declare_poncho(environment, cache=True) if environment else None
@@ -322,7 +322,7 @@ class TaskVineDistributor(Distributor):
         self._drain_next_wait = True
 
         entry = self._in_flight_by_taskvine_id.pop(task.id)
-        result_id, kind = entry.result_id, entry.kind
+        result_id = entry.result_id
         allocated = self._allocated_from_task(task)
 
         if task.successful():
@@ -330,8 +330,8 @@ class TaskVineDistributor(Distributor):
             if not isinstance(raw, Outcome):
                 # cloudpickle.load of the task's output failed on the
                 # manager side; PythonTask.output then hands back the
-                # exception object it raised, not an Outcome - task-level
-                # (the wrapper really did run and return something), not a
+                # exception object it raised, not an Outcome - task.successful()
+                # is True here (see the module docstring), so this is not a
                 # reason to let wait() itself raise.
                 self.release_result(result_id)
                 return RuntimeFailure(
@@ -356,8 +356,7 @@ class TaskVineDistributor(Distributor):
                 self.release_result(result_id)
             return outcome
 
-        # A task that didn't run to completion at all (crashed before
-        # returning, or was killed by TaskVine's own resource watchdog) has
+        # task.successful() is False here (see the module docstring) - there's
         # no result to hand back, and vine_reduce only ever calls
         # release_result() for a Success - so drop the file declared for it
         # here, or it would leak for the rest of the run (a resource-

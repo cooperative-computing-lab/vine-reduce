@@ -23,7 +23,7 @@ _SCHEMA_VERSION = 1
 def checksum_dataset(dataset: dict[str, Any]) -> str:
     """A stable hash of a dataset's contents, used to detect when a
     dataset's definition has changed since the last run (see
-    CheckpointStore.dataset_changed)."""
+    CheckpointStore.reset_if_dataset_changed)."""
     encoded = json.dumps(dataset, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -80,7 +80,7 @@ class CheckpointStore:
 
         # Either a brand-new db (nothing to discard, so stay silent) or one
         # written by an incompatible/old schema (discard it and warn - the
-        # same "discard, don't try to reconcile" trade dataset_changed
+        # same "discard, don't try to reconcile" trade reset_if_dataset_changed
         # already makes for a single dataset, extended here to the whole db).
         discarded = self._count_existing_checkpoints()
         self._conn.execute("DROP TABLE IF EXISTS checkpoint_files")
@@ -133,15 +133,14 @@ class CheckpointStore:
             )
             """)
 
-    def dataset_changed(self, dataset: str, checksum: str) -> list[str]:
+    def reset_if_dataset_changed(self, dataset: str, checksum: str) -> list[str]:
         """Compares checksum to what's on record for dataset. If different (or
         not on record yet), records it, discards any checkpoints on file for
         that dataset (they no longer apply), and returns the discarded rows'
-        result file paths - dataset_changed only touches the database, so
-        it's the caller's job to unlink those files (otherwise a changed
-        dataset's old final result sits in results_dir next to the new one
-        forever). Empty (falsy) when the checksum matches and nothing was
-        discarded."""
+        result file paths - this only touches the database, so it's the
+        caller's job to unlink those files (otherwise a changed dataset's old
+        final result sits in results_dir next to the new one forever). Empty
+        (falsy) when the checksum matches and nothing was discarded."""
         row = self._conn.execute(
             "SELECT checksum FROM dataset_checksums WHERE dataset = ?", (dataset,)
         ).fetchone()

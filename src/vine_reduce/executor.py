@@ -77,7 +77,7 @@ class Executor(abc.ABC):
         self.shutdown(wait=True)
 
 
-def _submitted(fn: Callable[..., Any], *args: Any) -> Future:
+def _completed_future(fn: Callable[..., Any], *args: Any) -> Future:
     """Runs fn(*args) inline and wraps its outcome in an already-done
     Future, the way a synchronous Executor.submit reports its result."""
     future: Future = Future()
@@ -101,7 +101,7 @@ class SimpleExecutor(Executor):
         *args: Any,
         metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
-        return _submitted(self._call, fn, *args)
+        return _completed_future(self._call, fn, *args)
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         """Hook for subclasses (see coffea.py's CoffeaExecutor) to change how
@@ -220,6 +220,10 @@ class DaskExecutor(Executor):
             to_maybe_compute = fn(*args)
             num_workers = self.num_workers or _num_workers((metadata or {}).get("distributor"))
             with CloudpickleProcessPoolExecutor(max_workers=num_workers) as pool:
+                # max_height/max_width bound how far dask's optimizer fuses and
+                # repartitions the task graph before scheduling it; subgraphs=False
+                # disables dask's subgraph-callable fusion (each graph node stays
+                # its own pool task instead of being bundled into a callable).
                 return to_maybe_compute.compute(
                     scheduler="processes",
                     pool=pool,
@@ -230,7 +234,7 @@ class DaskExecutor(Executor):
                     subgraphs=False,
                 )
 
-        return _submitted(call)
+        return _completed_future(call)
 
     def shutdown(self, wait: bool = True) -> None:
         pass

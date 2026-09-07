@@ -1,7 +1,7 @@
 """failed_files.log: a durable, human-readable record of every file
 vine_reduce gave up on. Shared across every Pipeline in a run (one
 FailureLog per VineReduce.compute() call) - see Pipeline._give_up_on_file
-and Pipeline._handle_reduce_outcome's failure branches, the only callers.
+and Pipeline._give_up_on_reduction, the only callers.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .distributor import TaskKind
 from .types import ResourceUsage
 
 
@@ -17,7 +18,7 @@ from .types import ResourceUsage
 class FailureRecord:
     """One permanently-failed file, as written to failed_files.log.
 
-    kind: "processor" | "reducer" - which stage gave up on this file.
+    kind: which stage gave up on this file.
     attempts: how many tries were made before giving up.
     resources_allocated / resources_measured: the configured cap
         (Distributor.resources(kind)) and the last attempt's actual usage,
@@ -28,7 +29,7 @@ class FailureRecord:
 
     dataset_name: str
     filename: str
-    kind: str
+    kind: TaskKind
     attempts: int
     resources_allocated: dict[str, Any] | None
     resources_measured: ResourceUsage | None

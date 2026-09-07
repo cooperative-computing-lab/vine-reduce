@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from . import defaults
 from .checkpoint_store import CheckpointRecord, CheckpointStore
-from .distributor import Distributor
+from .distributor import Distributor, TaskKind
 from .executor import Executor
 from .failure_log import FailureLog, FailureRecord
 from .size_log import SizeLog, SizeRecord
@@ -28,9 +28,33 @@ from .types import (
 )
 
 
+# Minimum denominator for the permanently-failed-files/files-concluded ratio
+# (see _give_up_on_file) - so a lone early failure can't spuriously trip a
+# nonzero failure_proportion threshold on a small dataset.
+_FAILURE_PROPORTION_FLOOR = 100
+
+
 class VineReduceError(RuntimeError):
     """Raised when a processing or reduction function fails remotely. Carries
     the remote traceback so the failure can be debugged from the local side."""
+
+
+class ReportKind(enum.StrEnum):
+    """Which stage - or checkpoint/result role - a reported TaskReport
+    belongs to. A superset of TaskKind: also covers reduce tasks that are
+    checkpoints, final results, or the forced-final drain group."""
+
+    PROCESSOR = "processor"
+    REDUCER = "reducer"
+    CHECKPOINT = "checkpoint"
+    RESULT = "result"
+    FINAL = "final"
+
+
+class OutcomeStatus(enum.StrEnum):
+    SUCCESS = "success"
+    RESOURCE_EXHAUSTION = "resource_exhaustion"
+    FAILURE = "failure"
 
 
 @dataclass(frozen=True)
@@ -42,10 +66,10 @@ class TaskReport:
 
     processor_name: str
     dataset_name: str
-    kind: str  # "processor" | "reducer" | "checkpoint" | "result" | "final"
+    kind: ReportKind
     result_id: str
     description: str
-    status: str  # "success" | "resource_exhaustion" | "failure"
+    status: OutcomeStatus
     resources: ResourceUsage
     resources_allocated: dict[str, Any] | None
     std_output: str | None
@@ -69,12 +93,12 @@ def _truncate_name(name: str, width: int = 20) -> str:
     return name if len(name) <= width else "..." + name[-width:]
 
 
-def _status_of(outcome: Outcome) -> str:
+def _status_of(outcome: Outcome) -> OutcomeStatus:
     if isinstance(outcome, Success):
-        return "success"
+        return OutcomeStatus.SUCCESS
     if isinstance(outcome, ResourceExhaustion):
-        return "resource_exhaustion"
-    return "failure"
+        return OutcomeStatus.RESOURCE_EXHAUSTION
+    return OutcomeStatus.FAILURE
 
 
 def _update_resource_max(maxes: dict[str, float], resources: ResourceUsage) -> None:
@@ -429,13 +453,6 @@ class Pipeline:
             handle = ResultHandle(result_id, file)
             self.pool.append(self._seeded_item(row, handle=handle))
 
-    # -- chunk generation ----------------------------------------------------
-
-    def in_flight_count(self) -> int:
-        """How many chunk/reduce tasks this pipeline currently has submitted
-        and not yet resolved."""
-        return len(self._in_flight)
-
     # -- progress-bar counters -----------------------------------------------
     # self.counters (see ProgressCounters) is a plain public attribute -
     # progress.py reads it directly and sums it (via ProgressCounters.summed)
@@ -461,6 +478,12 @@ class Pipeline:
         (see _give_up_on_reduction)."""
         return frozenset(self._failed_files)
 
+    @property
+    def in_flight_count(self) -> int:
+        """How many chunk/reduce tasks this pipeline currently has submitted
+        and not yet resolved."""
+        return len(self._in_flight)
+
     def owns(self, result_id: str) -> bool:
         """Whether result_id was submitted by this pipeline (as opposed to
         another pipeline sharing the same distributor)."""
@@ -474,7 +497,7 @@ class Pipeline:
         file but not yet marked finished at construction."""
         if not self.finished:
             self._check_chunk_coverage()
-            self.finished = self.chunks_all_done and not self.pool and self.in_flight_count() == 0
+            self.finished = self.chunks_all_done and not self.pool and self.in_flight_count == 0
             if self.finished:
                 self._log_size_once()
 
@@ -558,11 +581,11 @@ class Pipeline:
             if chunk is None:
                 self._generator_exhausted = True
                 return None
-            if chunk.url not in self._failed_files:
-                return _ChunkTask(chunk, 0)
             # A file already given up on (see _give_up_on_file) may still
             # have chunks left to yield from the generator's current
             # position - skip them without submitting.
+            if chunk.url not in self._failed_files:
+                return _ChunkTask(chunk, 0)
 
     def _submit_chunk(self, task: _ChunkTask) -> None:
         chunk = task.chunk
@@ -574,13 +597,13 @@ class Pipeline:
             result_id,
             self._process_priority,
             self._process_category,
-            "processor",
+            TaskKind.PROCESSOR,
             defaults.executor_wrapper,
             self._processor,
             chunk,
             {
                 "dataset": self._dataset_metadata,
-                "distributor": self._distributor.resources("processor"),
+                "distributor": self._distributor.resources(TaskKind.PROCESSOR),
                 "executor": None,
             },
             self._chunk_to_args,
@@ -600,25 +623,28 @@ class Pipeline:
 
     def maybe_drain_final_group(self) -> None:
         """If nothing more can ever arrive in the pool, reduce whatever's left
-        as one last group, however small, and make it final unconditionally -
-        see _submit_reduction's force_final."""
+        as one last group, however small, and make it final unconditionally,
+        via _submit_reduction's force_final=True: this skips is_result
+        entirely, since by construction this is the last group this
+        (processor, dataset) pipeline will ever form - nothing else can ever
+        arrive to give is_result a different group to judge, so asking it at
+        all could only either agree (redundant) or deadlock forever
+        resubmitting the same no-op fold."""
         if (
             self.pool
             and self.chunks_all_done
-            and self.in_flight_count() == 0
+            and self.in_flight_count == 0
             and len(self.pool) <= self.reduction_size
         ):
             group, self.pool = self.pool, []
             self._submit_reduction(group, force_final=True)
 
     def _submit_reduction(self, group: list[PoolItem], force_final: bool = False) -> None:
-        """force_final skips is_result entirely and makes this group final
-        regardless of what it returns - only maybe_drain_final_group passes
-        it, since by construction that's the last group this (processor,
-        dataset) pipeline will ever form: nothing else can ever arrive to
-        give is_result a different group to judge, so asking it at all could
-        only either agree (redundant) or deadlock forever resubmitting the
-        same no-op fold - is_result is never consulted here."""
+        """Submit a reduction task folding together the pooled items in
+        group, deciding whether it's final (and so whether to checkpoint it)
+        and tracking it in _in_flight. force_final forces is_final=True and
+        skips consulting is_result altogether - see maybe_drain_final_group,
+        the only place that decides to pass it."""
         num_events = sum(item.num_events for item in group)
         total_time = sum(item.wall_time_s for item in group)
         total_memory = sum(item.memory_mb for item in group)
@@ -633,7 +659,7 @@ class Pipeline:
             result_id,
             self._reduce_priority,
             self._reduce_category,
-            "reducer",
+            TaskKind.REDUCER,
             defaults.reducer_wrapper,
             self._reducer,
             [item.handle.file for item in group],
@@ -651,14 +677,16 @@ class Pipeline:
 
     # -- outcome handling ------------------------------------------------------
 
-    def _report_task(self, kind: str, description: str, outcome: Outcome) -> None:
+    def _report_task(self, kind: ReportKind, description: str, outcome: Outcome) -> None:
         if self._task_reporter is None:
             return
         resources_allocated = outcome.resources_allocated
         if resources_allocated is None:
             # The distributor didn't report a per-call allocation.
             # Fall back to what was requested at submit time.
-            distributor_kind = "processor" if kind == "processor" else "reducer"
+            distributor_kind = (
+                TaskKind.PROCESSOR if kind == ReportKind.PROCESSOR else TaskKind.REDUCER
+            )
             resources_allocated = self._distributor.resources(distributor_kind)
         self._task_reporter.report(
             TaskReport(
@@ -677,9 +705,14 @@ class Pipeline:
     def handle_outcome(self, outcome: Outcome) -> None:
         """React to the Outcome of one of this pipeline's own chunk/reduce
         tasks: pool a chunk's output, fold a reduction's output into
-        final_results or back into the pool, retry on ResourceExhaustion (
-        halving chunksize/reduction_size), or raise VineReduceError on
-        RuntimeFailure. Updates `finished` once nothing is left to do."""
+        final_results or back into the pool, or retry (halving
+        chunksize/reduction_size on ResourceExhaustion). VineReduceError is
+        only raised once retries are exhausted - a chunk's RuntimeFailure or
+        minimum-size ResourceExhaustion raises only if that also trips
+        failure_proportion (see _give_up_on_file); a reduction's always
+        raises once its attempts run out, since a reducer permanent failure
+        always stops the run. Updates `finished` once nothing is left to
+        do."""
         task = self._in_flight.pop(outcome.result_id)
         if isinstance(task, _ChunkTask):
             self._handle_chunk_outcome(task, outcome)
@@ -778,7 +811,9 @@ class Pipeline:
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
         self._report_task(
-            "processor", f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]", outcome
+            ReportKind.PROCESSOR,
+            f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]",
+            outcome,
         )
 
         if chunk.url in self._failed_files:
@@ -823,9 +858,9 @@ class Pipeline:
                 FailureRecord(
                     dataset_name=self.dataset_name,
                     filename=url,
-                    kind="processor",
+                    kind=TaskKind.PROCESSOR,
                     attempts=attempts,
-                    resources_allocated=self._distributor.resources("processor"),
+                    resources_allocated=self._distributor.resources(TaskKind.PROCESSOR),
                     resources_measured=resources_measured,
                     traceback=traceback,
                 )
@@ -841,7 +876,7 @@ class Pipeline:
                 self._distributor.release_result(item.handle.result_id)
         self._retry_chunks = [t for t in self._retry_chunks if t.chunk.url != url]
 
-        ratio = len(self._failed_files) / max(self._files_concluded, 100)
+        ratio = len(self._failed_files) / max(self._files_concluded, _FAILURE_PROPORTION_FLOOR)
         return ratio > self._failure_proportion
 
     def _handle_reduce_resource_exhaustion(
@@ -901,20 +936,20 @@ class Pipeline:
         # eventual success is never recognized as the dataset's final
         self._submit_reduction(group, force_final=task.force_final)
 
-    def _reduce_task_description(self, task: _ReduceTask) -> tuple[str, str]:
+    def _reduce_kind_and_description(self, task: _ReduceTask) -> tuple[ReportKind, str]:
         """The (kind, description) pair identifying one reduce task, for
         _report_task - see TaskReport.kind/description."""
         description = f"reduction of {len(task.group)} partial{'s' if len(task.group) != 1 else ''}"
         if task.is_final:
             description += " (final)"
         if task.force_final:
-            kind = "final"
+            kind = ReportKind.FINAL
         elif task.is_final:
-            kind = "result"
+            kind = ReportKind.RESULT
         elif task.is_checkpoint:
-            kind = "checkpoint"
+            kind = ReportKind.CHECKPOINT
         else:
-            kind = "reducer"
+            kind = ReportKind.REDUCER
         return kind, description
 
     def _handle_reduce_success(self, task: _ReduceTask, outcome: Success) -> None:
@@ -952,7 +987,7 @@ class Pipeline:
             self.pool.append(new_item)
 
     def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
-        kind, description = self._reduce_task_description(task)
+        kind, description = self._reduce_kind_and_description(task)
         self._report_task(kind, description, outcome)
 
         if isinstance(outcome, RuntimeFailure):
@@ -980,14 +1015,14 @@ class Pipeline:
         the caller always aborts the whole run right after this returns, since
         a partially-folded result can't be trusted not to be corrupted."""
         if self._failure_log is not None:
-            allocated = self._distributor.resources("reducer")
+            allocated = self._distributor.resources(TaskKind.REDUCER)
             files = frozenset().union(*(item.files for item in group))
             for url in sorted(files):
                 self._failure_log.log(
                     FailureRecord(
                         dataset_name=self.dataset_name,
                         filename=url,
-                        kind="reducer",
+                        kind=TaskKind.REDUCER,
                         attempts=attempts,
                         resources_allocated=allocated,
                         resources_measured=resources_measured,

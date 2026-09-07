@@ -125,7 +125,7 @@ def test_chunk_to_args_uses_distributor_cores_as_steps_per_file(monkeypatch):
 
 
 def test_vine_reduce_coffea_executor_materializes_result():
-    vr = VineReduceCoffea(processors={"p": lambda events: {"count": len(events)}}, input={})
+    vr = VineReduceCoffea(processors={}, input={})
 
     def processor(events):
         return {"count": len(events)}

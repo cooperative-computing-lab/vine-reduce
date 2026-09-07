@@ -42,7 +42,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
-from .pipeline import ProgressCounters, TaskReport
+from .pipeline import OutcomeStatus, ProgressCounters, TaskReport
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline
@@ -50,7 +50,11 @@ if TYPE_CHECKING:
 __all__ = ["NullProgressReporter", "ProgressReporter"]
 
 _BAR_WIDTH = 30
-_STATUS_STYLE = {"success": "green", "resource_exhaustion": "yellow", "failure": "red"}
+_STATUS_STYLE = {
+    OutcomeStatus.SUCCESS: "green",
+    OutcomeStatus.RESOURCE_EXHAUSTION: "yellow",
+    OutcomeStatus.FAILURE: "red",
+}
 _MIN_REFRESH_INTERVAL_S = 0.2
 
 
@@ -153,9 +157,7 @@ def _proc_tasks_total(events_total: int, events_submitted: int, submitted: int, 
     if events_submitted == 0:
         return 1
     good = submitted - failed
-    if good == 0:
-        return math.ceil((events_total / events_submitted) * submitted)
-    return math.ceil((events_total / events_submitted) * good)
+    return math.ceil((events_total / events_submitted) * (good or submitted))
 
 
 def _reduce_tasks_total(
@@ -217,7 +219,7 @@ class ProgressReporter:
             f"(id={task.result_id[:8]}) "
             f"{resources}"
         )
-        if task.status != "success" and task.std_output:
+        if task.status != OutcomeStatus.SUCCESS and task.std_output:
             self._console.print(task.std_output, style="dim", highlight=False)
 
     def refresh(self, pipelines: list["Pipeline"], force: bool = False) -> None:

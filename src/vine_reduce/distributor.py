@@ -16,11 +16,17 @@ picks the path, it only ever sees it echoed back on `Outcome.file`.
 from __future__ import annotations
 
 import abc
-from typing import Any, Callable, Literal
+import enum
+from typing import Any, Callable
 
 from .types import Outcome
 
-TaskKind = Literal["processor", "reducer"]
+
+class TaskKind(enum.StrEnum):
+    """Which stage a submitted call belongs to."""
+
+    PROCESSOR = "processor"
+    REDUCER = "reducer"
 
 
 class Distributor(abc.ABC):
@@ -51,9 +57,9 @@ class Distributor(abc.ABC):
         independently of whatever produced it - a non-final checkpoint or a
         final result (see PLAN.md's "Temporary Results, Checkpoints, and
         Restart") - so a distributor that distinguishes durable from
-        disposable storage (e.g. TaskVineDistributor's vine_file(cache=True)
-        vs vine_temp()) knows which to use; a distributor with only one kind
-        of storage can ignore it."""
+        disposable storage (e.g. TaskVineDistributor's declare_file(cache=True)
+        vs declare_temp()) knows which to use; a distributor with only one
+        kind of storage can ignore it."""
         ...
 
     @abc.abstractmethod

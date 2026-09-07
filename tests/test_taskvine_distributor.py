@@ -181,7 +181,7 @@ def test_release_result_allows_reuse(dist_with_workers):
 
 def test_ordinary_result_is_not_written_to_checkpoint_dir(dist_with_workers):
     """A result submitted without is_checkpoint=True must be an ordinary
-    vine_temp() - it should never appear under checkpoint_dir, and
+    declare_temp() - it should never appear under checkpoint_dir, and
     checkpoint_path() (only meaningful for is_checkpoint=True results) must
     not know about it."""
     dist = dist_with_workers
@@ -194,7 +194,7 @@ def test_ordinary_result_is_not_written_to_checkpoint_dir(dist_with_workers):
 
 def test_checkpoint_result_is_durably_written_to_checkpoint_dir(dist_with_workers):
     """A result submitted with is_checkpoint=True must be a
-    vine_file(cache=True) written under checkpoint_dir - readable straight
+    declare_file(cache=True) written under checkpoint_dir - readable straight
     off disk via checkpoint_path(), with no retrieve() call needed, since
     TaskVine already wrote it there as part of completing the task (see the
     module docstring)."""

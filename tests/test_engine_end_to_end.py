@@ -221,7 +221,7 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     serialization.dump(999, str(final_file))
 
     db = CheckpointStore(str(db_path))
-    db.dataset_changed("numbers", checksum_dataset(datasets["numbers"]))
+    db.reset_if_dataset_changed("numbers", checksum_dataset(datasets["numbers"]))
     db.record(
         processor="count",
         dataset="numbers",
@@ -252,7 +252,7 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
 
 
 def test_dataset_change_deletes_the_stale_final_result_file(tmp_path, dataset_input, distributor):
-    """dataset_changed() drops the DB row for a changed dataset's old final
+    """reset_if_dataset_changed() drops the DB row for a changed dataset's old final
     result, but that alone leaves the file itself sitting in results_dir
     forever (Correctness #4) - compute() must unlink it too, so a re-run
     after editing a dataset's definition doesn't leave the old final result
@@ -268,7 +268,7 @@ def test_dataset_change_deletes_the_stale_final_result_file(tmp_path, dataset_in
     serialization.dump(999, str(stale_file))
 
     db = CheckpointStore(str(db_path))
-    db.dataset_changed("numbers", checksum_dataset(old_datasets["numbers"]))
+    db.reset_if_dataset_changed("numbers", checksum_dataset(old_datasets["numbers"]))
     db.record(
         processor="count",
         dataset="numbers",

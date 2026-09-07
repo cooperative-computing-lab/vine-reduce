@@ -163,10 +163,10 @@ def _read_preprocess_cache(cache_file: str | Path, checksum: str) -> dict[str, A
     try:
         with open(cache_file) as f:
             header = json.loads(f.readline())
-            if header.get("checksum") != checksum:
+            if not isinstance(header, dict) or header.get("checksum") != checksum:
                 return None
             cached = json.loads(f.readline())
-    except (OSError, json.JSONDecodeError, AttributeError):
+    except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(cached, dict):
         return None

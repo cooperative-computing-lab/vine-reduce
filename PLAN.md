@@ -208,7 +208,7 @@ Store semantics:
   (`with conn:`). There is no `commit=` parameter and no public `commit()` - atomicity is a
   property of the API, not caller discipline. A restart therefore never sees a superseded row
   deleted without its replacement present, or vice versa.
-- `dataset_changed(dataset, checksum)`: a checksum of each dataset's definition (name, metadata,
+- `reset_if_dataset_changed(dataset, checksum)`: a checksum of each dataset's definition (name, metadata,
   files) is stored alongside its checkpoints. If it changes between runs, that dataset's
   checkpoint rows are discarded and it restarts from scratch - there is no way to know existing
   checkpoints still correspond to the new definition.
@@ -219,7 +219,7 @@ Store semantics:
   `checkpoint_files` rows.
 - On open, if `PRAGMA user_version` does not match the current schema version, any existing
   tables are dropped and recreated (a `warning` is logged if checkpoints were discarded) - the
-  same "discard, don't reconcile" trade `dataset_changed` makes for one dataset, extended to the
+  same "discard, don't reconcile" trade `reset_if_dataset_changed` makes for one dataset, extended to the
   whole store when the schema itself changed.
 
 ### Restart

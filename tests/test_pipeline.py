@@ -576,7 +576,7 @@ def test_release_covered_frees_deep_lineage_without_recursion(fake_distributor, 
     dataset = {"files": {"a.root": 1}}
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset)
 
-    released: list[int] = []
+    released: list[str] = []
     fake_distributor.release_result = released.append
 
     depth = 5000  # far beyond Python's default recursion limit

@@ -166,7 +166,7 @@ def _create_env(
 
 def _find_editable_pip_installs() -> dict[str, str]:
     """package name -> local checkout path, for every package currently
-    `pip install -e`d in this Python's environment. """
+    `pip install -e`d in this Python's environment."""
     paths_by_package = {}
     for dist in importlib.metadata.distributions():
         raw_direct_url = dist.read_text("direct_url.json")

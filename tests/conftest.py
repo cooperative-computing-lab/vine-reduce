@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import pytest
 
+from vine_reduce.distributor import TaskKind
 from vine_reduce.types import Outcome, Success
 
 
@@ -32,7 +33,7 @@ class FakeDistributor:
         result_id: str,
         priority: int,
         category: str,
-        kind: str,
+        kind: TaskKind,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
@@ -61,7 +62,7 @@ class FakeDistributor:
         self._files[result_id] = path
         return path
 
-    def resources(self, kind: str) -> dict[str, Any] | None:
+    def resources(self, kind: TaskKind) -> dict[str, Any] | None:
         return None
 
     def capacity(self) -> int:

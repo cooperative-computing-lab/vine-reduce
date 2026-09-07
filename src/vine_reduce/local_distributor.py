@@ -39,7 +39,7 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 from uuid import uuid4
 
-from .distributor import Distributor
+from .distributor import Distributor, TaskKind
 from .executor import CloudpickleProcessPoolExecutor
 from .types import Outcome, ResourceUsage, RuntimeFailure, Success
 
@@ -108,7 +108,7 @@ class LocalDistributor(Distributor):
         result_id: str,
         priority: int,
         category: str,
-        kind: str,
+        kind: TaskKind,
         func: Callable[..., Any],
         *args: Any,
         is_checkpoint: bool = False,
@@ -190,7 +190,7 @@ class LocalDistributor(Distributor):
         self._files[result_id] = path
         return path
 
-    def resources(self, kind: str) -> dict[str, Any] | None:
+    def resources(self, kind: TaskKind) -> dict[str, Any] | None:
         """Always {"cores": 1} - see the Distributor protocol docstring.
         This runs on the same machine as vine_reduce itself (often a shared
         frontend), so a task must not assume it can use every core in the

@@ -212,8 +212,8 @@ class VineReduce:
         max(files_concluded_so_far, 100) > failure_proportion` - the
         100-file floor means a lone early failure can't spuriously trip a
         nonzero threshold on a small dataset. Must be in [0, 1). The
-        default, 0, reproduces the historical behavior: the very first
-        permanent processor failure aborts the run (1/100 = 0.01 > 0).
+        default, 0, means any permanent processor failure aborts the run
+        immediately: with the 100-file floor, 1/100 = 0.01 is already > 0.
         A run that finishes with any file left permanently unprocessed
         prints a warning in red naming failed_files.log.
     """
@@ -272,7 +272,7 @@ class VineReduce:
 
             datasets = input_to_datasets(self.input)
             for name, dataset in datasets.items():
-                discarded_paths = db.dataset_changed(name, checksum_dataset(dataset))
+                discarded_paths = db.reset_if_dataset_changed(name, checksum_dataset(dataset))
                 for path in discarded_paths:
                     if os.path.exists(path):
                         os.remove(path)
@@ -324,7 +324,7 @@ class VineReduce:
         distributor: Distributor,
         db: CheckpointStore,
         datasets_to_chunks: Callable,
-        task_reporter: ProgressReporter | NullProgressReporter,
+        reporter: ProgressReporter | NullProgressReporter,
         failure_log: FailureLog,
         size_log: SizeLog,
     ) -> list[Pipeline]:
@@ -380,7 +380,7 @@ class VineReduce:
                         failure_proportion=self.failure_proportion,
                         failure_log=failure_log,
                         size_log=size_log,
-                        task_reporter=task_reporter,
+                        task_reporter=reporter,
                     )
                 )
         return pipelines
@@ -406,7 +406,7 @@ class VineReduce:
                 reporter.refresh(pipelines, force=True)
                 break
 
-            in_flight_total = sum(p.in_flight_count() for p in pipelines)
+            in_flight_total = sum(p.in_flight_count for p in pipelines)
             budget = max(
                 0,
                 min(
@@ -424,7 +424,7 @@ class VineReduce:
                     break
                 budget -= pipeline.feed(budget)
 
-            if not any(p.in_flight_count() for p in pipelines):
+            if not any(p.in_flight_count for p in pipelines):
                 # Nothing submitted this cycle and nothing pending from before;
                 # waiting now would block forever. Sleep briefly rather than
                 # busy-spinning re-checking distributor.capacity() (e.g. while
@@ -437,4 +437,3 @@ class VineReduce:
                 continue
             pipeline = next(p for p in pipelines if p.owns(outcome.result_id))
             pipeline.handle_outcome(outcome)
-            reporter.refresh(pipelines)
