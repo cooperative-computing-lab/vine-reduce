@@ -1,20 +1,23 @@
 # vine_reduce
 
-This file describes the design of the vine_reduce python module, which generates MapReduce-like
-workflows for High Energy Physics (HEP). vine_reduce does not itself execute the workflows: it
-relies on a **distributor** that manages a distributed high-throughput computation at scale, and on
-an **executor** that runs individual functions on the remote worker nodes. See the README for
-installation and a runnable quick start; this file is the design reference.
+- This file describes the design of the vine_reduce python module, which generates MapReduce-like
+  workflows for High Energy Physics (HEP).
+- vine_reduce does not execute workflows itself.
+- It relies on a **distributor** that manages a distributed high-throughput computation at scale.
+- It relies on an **executor** that runs individual functions on remote worker nodes.
+- See the README for installation and a runnable quick start. This file is the design reference.
 
 ## HEP Workflows
 
-Typical HEP workflows consist of orthogonal processing functions applied to collision events.
-Processing functions and collision events are naturally parallel: one processing function does not
-affect another, nor does the processing of one event affect another. Since processing a single
-event is very fast, events are grouped into sets called chunks, and processing functions are
-applied to chunks. The data is organized into datasets. A dataset consists of a name, metadata,
-and a set of URLs. The URLs identify files that contain the events. Events in a file are numbered
-from [0, num_entries), from which chunks are formed. Chunks never cross file boundaries.
+- Typical HEP workflows apply orthogonal processing functions to collision events.
+- Processing functions and events are naturally parallel: one processing function doesn't affect
+  another, nor does processing one event affect another.
+- Processing a single event is fast, so events are grouped into chunks, and processing functions
+  run on chunks.
+- Data is organized into datasets. A dataset has a name, metadata, and a set of URLs.
+- URLs identify files that contain events.
+- Events in a file are numbered `[0, num_entries)`; chunks are formed from that range.
+- Chunks never cross file boundaries.
 
 ## Reduction and Final Results
 
@@ -36,8 +39,10 @@ from [0, num_entries), from which chunks are formed. Chunks never cross file bou
   judge, so asking it could only agree (redundant) or reject forever, resubmitting the same no-op
   fold as a deadlock.
 - `reduction_size`: per (processor, dataset), default 10, must resolve to an int >= 2 (else
-  `VineReduceError` at config time). Halves (floor 2) on distributor resource exhaustion; the
-  group is requeued at the front of the pool and retried at the smaller size.
+  `VineReduceError` at config time). Halves on distributor resource exhaustion, down to
+  `minimum_reduction_size` (a `VineReduce` field, default 2, and always clamped to no more than the
+  resolved `reduction_size`); the group is requeued at the front of the pool and retried at the
+  smaller size.
 - Reducer contract: associative, distributive, commutative, same output type as the processor.
   Default `f(a, b): a += b; return a` (`default_reducer`, `src/vine_reduce/defaults.py`); the
   wrapper (`reducer_wrapper`, same file) frees each input immediately after folding it in.
@@ -45,39 +50,38 @@ from [0, num_entries), from which chunks are formed. Chunks never cross file bou
 
 **Why**
 
-Reduction is organized around a pool rather than a per-file tree so that a slow or oddly-sized
-file doesn't block progress: outputs join a shared pool the moment they're ready, and any
-`reduction_size` of them can be folded together regardless of which file they came from. The pool
-"always drains" property matters for small or oddly-shaped datasets - a single-chunk dataset must
-still produce a result, not wait forever for siblings that don't exist.
-
-`is_result` is deliberately checked on group totals *before* submission, not on the reduction's
-own output after the fact: the group's inputs already carry everything needed to decide (see
-"Data Flow"), and checking early is what lets a distributor that distinguishes durable from
-disposable storage know whether to declare this call's result as a checkpoint at submit time (see
-"When a checkpoint is taken").
-
-From the distributor's perspective there is a distinction between a workflow result and a function
-outcome. A workflow result is the data the user wants. A function outcome (the `Outcome` union -
-see "Dataclasses") is what vine_reduce actually reacts to; it is measured by
-`executor_wrapper`/`reducer_wrapper` using core python modules where possible (e.g.
-`resource.getrusage`, `time.monotonic`). Workflow results are never read into memory by
-vine_reduce, only remotely by the distributor, because they may be too large in memory or
-deserialization time.
+- Reduction pools rather than using a per-file tree, so a slow or oddly-sized file doesn't block
+  progress: outputs join a shared pool the moment they're ready, and any `reduction_size` of them
+  can be folded together regardless of which file they came from.
+- The pool "always drains" so a small or oddly-shaped dataset still produces a result - a
+  single-chunk dataset must not wait forever for siblings that don't exist.
+- `is_result` is checked on group totals *before* submission, not on the reduction's own output
+  after the fact: the group's inputs already carry everything needed to decide (see "Data Flow").
+- Checking early is what lets a distributor that distinguishes durable from disposable storage know,
+  at submit time, whether to declare this call's result as a checkpoint (see "When a checkpoint is
+  taken").
+- From the distributor's perspective there is a distinction between a workflow result and a
+  function outcome. A workflow result is the data the user wants. A function outcome (the
+  `Outcome` union - see "Dataclasses") is what vine_reduce actually reacts to.
+- A function outcome is measured by `executor_wrapper`/`reducer_wrapper` using core python modules
+  where possible (e.g. `resource.getrusage`, `time.monotonic`).
+- Workflow results are never read into memory by vine_reduce, only remotely by the distributor,
+  because they may be too large in memory or too slow to deserialize.
 
 ## Temporary Results, Checkpoints, and Restart
 
-Any intermediate result - a chunk's output, or a reduction's output that is not a final result -
-is temporary. Checkpoints make selected intermediates durable so an interrupted run can restart
-from them instead of from scratch. vine_reduce does not generate a checkpoint's bytes itself; it
-decides *when* to checkpoint and tells the distributor to make that result durable
-(`submit(..., is_checkpoint=True)`). A final result is a special kind of checkpoint whose events
-are never reduced further.
+- Any intermediate result - a chunk's output, or a reduction's output that is not a final result -
+  is temporary.
+- Checkpoints make selected intermediates durable, so an interrupted run can restart from them
+  instead of from scratch.
+- vine_reduce does not generate a checkpoint's bytes itself; it decides *when* to checkpoint and
+  tells the distributor to make that result durable (`submit(..., is_checkpoint=True)`).
+- A final result is a special kind of checkpoint whose events are never reduced further.
 
 ### Invariants
 
-Three rules govern pooling, durability, and release. The rest of this section, and the pipeline
-implementation, refer back to them by number.
+- Three rules govern pooling, durability, and release. The rest of this section, and the pipeline
+  implementation, refer back to them by number.
 
 **Rule**
 
@@ -129,15 +133,15 @@ threshold left as None disables that trigger):
 
 **Why**
 
-The decision is made *before* the reduction is submitted, not after it returns: at submission
-time the group's inputs already carry their since-checkpoint time (summed across the group) and
-distance (maxed across the group), and those - together with `is_result` - are enough to decide.
-The reduction call's own cost is therefore not part of the go/no-go decision (it is folded into
-the resulting item's counters once the call returns); in practice this shifts a threshold
-crossing by at most one reduction group. Deciding at submit time is required by the `Distributor`
-protocol: `submit(..., is_checkpoint=...)` is when a distributor that distinguishes durable from
-disposable storage (e.g. TaskVineDistributor's `declare_file(cache=True)` vs `declare_temp()`)
-declares the result's file.
+- The decision is made *before* the reduction is submitted, not after it returns: at submission
+  time the group's inputs already carry their since-checkpoint time (summed across the group) and
+  distance (maxed across the group), and those - together with `is_result` - are enough to decide.
+- The reduction call's own cost is therefore not part of the go/no-go decision (it is folded into
+  the resulting item's counters once the call returns); in practice this shifts a threshold
+  crossing by at most one reduction group.
+- Deciding at submit time is required by the `Distributor` protocol: `submit(..., is_checkpoint=...)`
+  is when a distributor that distinguishes durable from disposable storage (e.g.
+  TaskVineDistributor's `declare_file(cache=True)` vs `declare_temp()`) declares the result's file.
 
 ### Where a checkpoint lives
 
@@ -159,15 +163,15 @@ out. What differs is *where* the durable copy lives and how vine_reduce learns i
 
 **Why**
 
-Durability is unconditional (no per-checkpoint or per-distributor opt-out) because an undurable
-checkpoint would be silently unrecoverable after a crash - there would be no way to tell, from the
-checkpoint store alone, that the thing it points at was never actually made durable.
+- Durability is unconditional (no per-checkpoint or per-distributor opt-out) because an undurable
+  checkpoint would be silently unrecoverable after a crash - there would be no way to tell, from
+  the checkpoint store alone, that the thing it points at was never actually made durable.
 
 ### The checkpoint store
 
-Checkpoints are recorded in a sqlite database - the **checkpoint store**
-(`CheckpointStore`, `src/vine_reduce/checkpoint_store.py`; the file defaults to
-`results_dir/vine_reduce.db`).
+- Checkpoints are recorded in a sqlite database - the **checkpoint store**
+  (`CheckpointStore`, `src/vine_reduce/checkpoint_store.py`; the file defaults to
+  `results_dir/vine_reduce.db`).
 
 **Rule** - schema, versioned via `PRAGMA user_version = 1`:
 
@@ -196,10 +200,10 @@ CREATE TABLE dataset_checksums (
 );
 ```
 
-Rows are read back by column name (`sqlite3.Row`) into a frozen `CheckpointRecord` dataclass
-(`id`, `processor`, `dataset`, `covers_files: frozenset[str]`, `num_events`, `wall_time_s`,
-`memory_mb`, `is_final`, `path`), with `covers_files` coming from the `checkpoint_files` join
-table - normalized rather than a JSON blob, so it is schema-enforced and cascade-deleted.
+- Rows are read back by column name (`sqlite3.Row`) into a frozen `CheckpointRecord` dataclass
+  (`id`, `processor`, `dataset`, `covers_files: frozenset[str]`, `num_events`, `wall_time_s`,
+  `memory_mb`, `is_final`, `path`), with `covers_files` coming from the `checkpoint_files` join
+  table - normalized rather than a JSON blob, so it is schema-enforced and cascade-deleted.
 
 Store semantics:
 
@@ -234,17 +238,19 @@ Store semantics:
 
 **Mechanics**
 
-`_seed_from_checkpoints` then executes the plan. Every replayed **partial** row is handed to the
-distributor via `adopt_checkpoint(result_id, row.path)` - `result_id` freshly minted by
-vine_reduce itself, same as for `submit()` - which registers the on-disk file as if it were a
-completed Success result of this run submitted with `is_checkpoint=True` and returns its file
-handle, which vine_reduce wraps into a `ResultHandle`. From then on a restart-seeded pool item is
-indistinguishable from one this run produced itself: the same handle flows into later `submit()`
-args, and the same
-`release_result` releases it - one release channel and one file-cleanup owner (the distributor)
-cover both cases. A replayed **final** row gets no handle: a final result is never resubmitted,
-so it needs no distributor identity. Seeded items start with zeroed since-checkpoint counters -
-the row *is* a checkpoint, so nothing has accumulated on top of it yet.
+- `_seed_from_checkpoints` executes the plan above.
+- Every replayed **partial** row is handed to the distributor via
+  `adopt_checkpoint(result_id, row.path)` - `result_id` freshly minted by vine_reduce itself, same
+  as for `submit()` - which registers the on-disk file as if it were a completed Success result of
+  this run submitted with `is_checkpoint=True`, and returns its file handle, which vine_reduce
+  wraps into a `ResultHandle`.
+- From then on a restart-seeded pool item is indistinguishable from one this run produced itself:
+  the same handle flows into later `submit()` args, and the same `release_result` releases it -
+  one release channel and one file-cleanup owner (the distributor) cover both cases.
+- A replayed **final** row gets no handle: a final result is never resubmitted, so it needs no
+  distributor identity.
+- Seeded items start with zeroed since-checkpoint counters - the row *is* a checkpoint, so nothing
+  has accumulated on top of it yet.
 
 ### Releasing results
 
@@ -262,17 +268,18 @@ because it was folded into a later reduction (invariants 2 and 3). Concretely, w
    stopping at items that are themselves checkpoints. Then clear the new item's `inputs` and
    reset its since-checkpoint counters.
 
-`release_result` is the *only* release channel, and its contract (a hard protocol requirement,
-not an implementation detail) is that it also removes a checkpoint's durable on-disk copy - for a
-this-run checkpoint or an adopted one alike. The distributor is the single owner of non-final
-checkpoint files; `Pipeline` never deletes one itself. Final results in `results_dir` are
-vine_reduce's own and are never deleted.
+- `release_result` is the *only* release channel, and its contract (a hard protocol requirement,
+  not an implementation detail) is that it also removes a checkpoint's durable on-disk copy - for
+  a this-run checkpoint or an adopted one alike.
+- The distributor is the single owner of non-final checkpoint files; `Pipeline` never deletes one
+  itself.
+- Final results in `results_dir` are vine_reduce's own and are never deleted.
 
 **Why**
 
-Ordering matters: the store stops pointing at superseded rows (step 2 commits) *before* their
-files are removed (step 3), so a crash in between can only leave a not-yet-deleted file the
-store no longer references - which restart tolerates - never a referenced-but-deleted file.
+- Ordering matters: the store stops pointing at superseded rows (step 2 commits) *before* their
+  files are removed (step 3), so a crash in between can only leave a not-yet-deleted file the
+  store no longer references - which restart tolerates - never a referenced-but-deleted file.
 
 ### Pipeline state
 
@@ -296,34 +303,47 @@ inputs List[PoolItem]: the items folded together to produce this one (empty for 
                                output). Kept so a lost, not-yet-durable item can be recovered by
                                re-folding its inputs instead of recomputing from scratch;
                                cleared once a checkpoint covers it (invariant 3).
+attempts int: how many failed reduction attempts this item has survived while in its current
+                               grouping, for the `attempts` retry budget (see "Attempts and
+                               Retries"). 0 for a freshly produced item (a raw chunk's output, or a
+                               fresh fold result) - a RuntimeFailure on a reduction this item is
+                               part of raises it towards `attempts`, while a ResourceExhaustion
+                               resets it back to 0 (a smaller reduction_size is a fresh start, not
+                               a strike against the budget).
 ```
 
 ## Priorities
 
 **Rule**
 
-All processing calls of the same (processor, dataset) share one priority (larger integer runs
-first). A processor declared earlier gets better priority than a later one; within the same
-processor, a dataset declared earlier gets better priority than a later one. Reductions work the
-same way, but always outrank every processing call, at any processor/dataset priority level.
+- All processing calls of the same (processor, dataset) share one priority; a larger integer runs
+  first.
+- A processor declared earlier gets better priority than one declared later.
+- Within the same processor, a dataset declared earlier gets better priority than one declared
+  later.
+- Reductions follow the same ranking rule, but always outrank every processing call, at any
+  processor/dataset priority level.
 
 **Why**
 
-The goal is to finish one (processor, dataset) before moving to the next, while still overlapping
-long tails when resources are available - and reductions outrank processing so that durable
-results (and, eventually, freed memory) land as soon as a pool has enough to fold, rather than
-queuing behind a backlog of fresh chunk work.
+- The goal is to finish one (processor, dataset) before moving to the next, while still
+  overlapping long tails when resources are available.
+- Reductions outrank processing so that durable results - and eventually freed memory - land as
+  soon as a pool has enough to fold, rather than queuing behind a backlog of fresh chunk work.
 
 ## Chunksize
 
-Chunksize is managed per (processor, dataset). An initial chunksize can be given globally, per
-processor, or per dataset; when more than one applies, the most specific wins (per-dataset over
-per-processor over the global default). If none is given, all events of a file form one chunk.
-Chunksize is dynamic: when the distributor reports that a processing call exhausted its
-resources, the chunksize is halved (down to a minimum of 1) and the failed chunk is retried -
-re-split first if it predates the halving, so the retry actually runs at the smaller size. See
-"Attempts and Retries" below for how many times this (and a plain runtime failure) can happen
-before vine_reduce gives up.
+- Chunksize is managed per (processor, dataset).
+- An initial chunksize can be given globally, per processor, or per dataset. When more than one
+  applies, the most specific wins (per-dataset over per-processor over the global default).
+- If none is given, all events of a file form one chunk.
+- Chunksize is dynamic: when the distributor reports that a processing call exhausted its
+  resources, the chunksize is halved - down to `minimum_chunksize` (a `VineReduce` field, default
+  1000, and never below 1) - and the failed chunk is retried.
+- A retry chunk is re-split first if it predates the halving, so the retry actually runs at the
+  smaller size.
+- See "Attempts and Retries" below for how many times this (and a plain runtime failure) can
+  happen before vine_reduce gives up.
 
 ## Attempts and Retries
 
@@ -336,30 +356,34 @@ kinds a call can fail with count against that same budget, but are retried diffe
 - **RuntimeFailure** (the call raised an exception): retried unchanged - same chunk range, same
   reduction group, no size change - since a bug in user code is not a sizing problem.
 - **ResourceExhaustion** (the call was killed for exceeding memory/wall time/disk): retried at a
-  halved chunksize/reduction_size, same halving as "Chunksize" above (down to a minimum of 1
-  event / reduction_size 2) - *except* a halving is a fresh start for the smaller chunk/items it
-  produces, not a strike against the attempts already used against the larger one. Once a
-  chunk/reduction is already at that minimum size, a further ResourceExhaustion has nowhere
-  smaller to retry at, so it raises immediately instead of consuming the budget.
+  halved chunksize/reduction_size, same halving as "Chunksize" above - down to `minimum_chunksize`
+  (default 1000) for a chunk, or `minimum_reduction_size` (default 2, always clamped to no more
+  than the resolved `reduction_size`) for a reduction.
+  - A halving is a fresh start for the smaller chunk/items it produces, not a strike against the
+    attempts already used against the larger one.
+  - Once a chunk/reduction is already at its minimum size, a further ResourceExhaustion has
+    nowhere smaller to retry at, so it raises immediately instead of consuming the budget.
 
 `attempts=1` means no retries at all - the first failure of either kind raises right away (this
 was, and remains, the only behavior for a RuntimeFailure prior to this feature).
 
 **Why**
 
-A RuntimeFailure and a ResourceExhaustion call for different responses. Retrying an exception
-verbatim can still help if the failure was transient (a flaky remote read, a worker hiccup)
-rather than a deterministic bug - but retrying an *oversized* call at the same size almost never
-helps, only a smaller size does. Sharing one `attempts` budget between them, while resetting it
-on every halving, keeps both stories straight: a chunk or reduction that keeps failing at a
-*fixed* size - of either failure kind - is bounded by `attempts` and eventually gives up, while
-shrinking to look for a size that works is never penalized for how many sizes it took. The size
-floor closes the one remaining way this could still loop forever: a chunk or reduction stuck at
-the smallest possible size that keeps exhausting resources no matter what - that raises
-immediately rather than retrying the same doomed call forever. See
-`Pipeline._handle_chunk_outcome`/`_handle_reduce_outcome` for where this is decided, and
-`PoolItem.attempts` for how a reduction's budget survives its items being disbanded back into the
-pool on a halving.
+- A RuntimeFailure and a ResourceExhaustion call for different responses.
+- Retrying an exception verbatim can still help if the failure was transient (a flaky remote read,
+  a worker hiccup) rather than a deterministic bug - but retrying an *oversized* call at the same
+  size almost never helps, only a smaller size does.
+- Sharing one `attempts` budget between them, while resetting it on every halving, keeps both
+  stories straight: a chunk or reduction that keeps failing at a *fixed* size - of either failure
+  kind - is bounded by `attempts` and eventually gives up, while shrinking to look for a size that
+  works is never penalized for how many sizes it took.
+- The `minimum_chunksize`/`minimum_reduction_size` floor closes the one remaining way this could
+  still loop forever: a chunk or reduction stuck at the smallest possible size that keeps
+  exhausting resources no matter what - that raises immediately rather than retrying the same
+  doomed call forever.
+- See `Pipeline._handle_chunk_outcome`/`_handle_reduce_outcome` for where this is decided, and
+  `PoolItem.attempts` (see "Pipeline state") for how a reduction's budget survives its items being
+  disbanded back into the pool on a halving.
 
 ## Failure Tolerance
 
@@ -372,23 +396,26 @@ filename, `kind` ("processor"|"reducer"), attempts made, `Distributor.resources(
 allocated cap, the last attempt's measured resource usage, and its traceback, whichever of these
 are available). What happens next depends on which kind of call it was:
 
-- **A processor (chunk) permanent failure** removes just that one dataset file from the
-  `(processor, dataset)` pipeline going forward: it is dropped from `_files_in_progress` (any
-  already-staged sibling chunk results for it are released back to the distributor, never pooled),
-  purged from `_retry_chunks`, and skipped by both `_next_chunk` and any of its own sibling chunks
-  whose outcome arrives after the fact. The run only aborts (`VineReduceError`) once, for some
-  dataset, `permanently_failed_files / max(files_concluded_so_far, 100) > failure_proportion` - the
-  100-file floor means a single early failure can't spuriously trip a nonzero threshold on a small
-  dataset. `failure_proportion` defaults to `0`, which reproduces the historical behavior exactly
-  (the first permanent failure gives a ratio of `1/100 = 0.01`, already `> 0`); it must be in
-  `[0, 1)` - a value `< 1` can never trip the check on its own, since the ratio never exceeds 1.
-- **A reducer (reduction) permanent failure** always aborts the whole run, unconditionally -
-  `failure_proportion` is never consulted for it. A partially-folded reduction result can't be
-  trusted not to be corrupted, so there is no "skip and continue" for this case, same as before
-  this feature. Every file folded into the failing group is logged (there is no attempt to
-  attribute the failure to one specific input with any precision - the run is stopping anyway), and
-  the group's own distributor-held results are released (`Pipeline._release_covered`, the same
-  cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
+- **A processor (chunk) permanent failure**:
+  - Removes just that one dataset file from the `(processor, dataset)` pipeline going forward: it
+    is dropped from `_files_in_progress` (any already-staged sibling chunk results for it are
+    released back to the distributor, never pooled), purged from `_retry_chunks`, and skipped by
+    both `_next_chunk` and any of its own sibling chunks whose outcome arrives after the fact.
+  - The run only aborts (`VineReduceError`) once, for some dataset,
+    `permanently_failed_files / max(files_concluded_so_far, 100) > failure_proportion` - the
+    100-file floor means a single early failure can't spuriously trip a nonzero threshold on a
+    small dataset.
+  - `failure_proportion` defaults to `0`, which reproduces the historical behavior exactly (the
+    first permanent failure gives a ratio of `1/100 = 0.01`, already `> 0`); it must be in
+    `[0, 1)` - a value `< 1` can never trip the check on its own, since the ratio never exceeds 1.
+- **A reducer (reduction) permanent failure**:
+  - Always aborts the whole run, unconditionally - `failure_proportion` is never consulted for it.
+  - A partially-folded reduction result can't be trusted not to be corrupted, so there is no
+    "skip and continue" for this case, same as before this feature.
+  - Every file folded into the failing group is logged (there is no attempt to attribute the
+    failure to one specific input with any precision - the run is stopping anyway), and the
+    group's own distributor-held results are released (`Pipeline._release_covered`, the same
+    cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
 
 If a run finishes with at least one file left permanently unprocessed, a warning is printed in red
 naming `failed_files.log`. The dataset's final result still comes out short of "every event of the
@@ -397,13 +424,14 @@ means this is no longer a deadlock, just a result computed over less data than t
 
 **Mechanics** (`src/vine_reduce/pipeline.py`, `src/vine_reduce/failure_log.py`)
 
-`Pipeline._give_up_on_file` handles the processor case (called from `_handle_chunk_outcome`);
-`Pipeline._give_up_on_reduction` handles the reducer case (called from `_handle_reduce_outcome`,
-immediately before each of its two `raise VineReduceError` sites). `FailureLog` (`failure_log.py`)
-is the shared log writer, one instance per `VineReduce.compute()` call, passed to every `Pipeline`
-alongside `task_reporter`. `Pipeline.failed_files` exposes the set of permanently-failed files for
-this (processor, dataset) pair, read by `VineReduce.compute()` after `_run()` returns to decide
-whether to print the end-of-run warning.
+- `Pipeline._give_up_on_file` handles the processor case (called from `_handle_chunk_outcome`);
+  `Pipeline._give_up_on_reduction` handles the reducer case (called from `_handle_reduce_outcome`,
+  immediately before each of its two `raise VineReduceError` sites).
+- `FailureLog` (`failure_log.py`) is the shared log writer, one instance per `VineReduce.compute()`
+  call, passed to every `Pipeline` alongside `task_reporter`.
+- `Pipeline.failed_files` exposes the set of permanently-failed files for this (processor,
+  dataset) pair, read by `VineReduce.compute()` after `_run()` returns to decide whether to print
+  the end-of-run warning.
 
 ## Data Flow
 
@@ -538,29 +566,34 @@ The pieces, in flow order (each is user-overridable unless noted):
   `report(TaskReport(...))` once per finished processor/reducer task, right when its `Outcome` is
   examined - before the pipeline acts on it (pooling a chunk's output, folding a reduction,
   retrying, or raising).
-- The bars read `Pipeline`'s state through 13 read-only counter properties
-  (`events_completed`/`failed`/`submitted`/`safe`, `proc_tasks_completed`/`failed`/`submitted`/
-  `in_flight`, `reduce_tasks_completed`/`failed`/`submitted`/`in_flight`) - raw facts only;
-  `progress.py` owns all bar-rendering and totals-estimation math (`_proc_tasks_total`/
-  `_reduce_tasks_total`, which extrapolate an estimated total from work done so far, the same
-  approach as dynamic_data_reduction's own `ProcCounts`).
+- The bars read `Pipeline`'s state through:
+  - `Pipeline.counters` (a public `ProgressCounters`, summed across pipelines via
+    `ProgressCounters.summed`): 9 plain int fields -
+    `events_completed`/`failed`/`submitted`, `proc_tasks_completed`/`failed`/`submitted`,
+    `reduce_tasks_completed`/`failed`/`submitted`.
+  - Two read-only properties: `events_safe` (events durably checkpointed right now) and
+    `in_flight_count` (chunk *and* reduce tasks currently submitted-but-unresolved, combined -
+    there is no separate per-kind in-flight split).
+  - All of it is raw facts only; `progress.py` owns all bar-rendering and totals-estimation math
+    (`_proc_tasks_total`/`_reduce_tasks_total`, which extrapolate an estimated total from work
+    done so far, the same approach as dynamic_data_reduction's own `ProcCounts`).
 - `engine.py`'s `_run` calls `reporter.refresh(pipelines)` once per scheduling cycle (and once
   more, forced, right before returning), summing every pipeline sharing a `processor_name` into
   that processor's four bars.
 
 **Why**
 
-`TaskReporter` is defined in `pipeline.py` rather than `progress.py` because `Pipeline` is the
-consumer of the interface, not the producer - the protocol lives next to what needs it, and
-`progress.py` supplies an implementation, so `Pipeline` never imports `progress.py` at all.
-
-The 13-property surface is a deliberate, narrow coupling, not an event bus or a reach into private
-state: nothing in the scheduling loop itself (`engine.py`'s `_run`) reads them, only
-`progress.py` does. The cost is informal rather than enforced: adding a new counter to `Pipeline`
-means remembering to thread it through `progress.py`'s estimators by hand. This was reviewed
-2026-09-03 and judged an acceptable trade-off - the alternative (an event bus, or `progress.py`
-reaching into private state) would be more machinery for the same information, and the existing
-comment in `pipeline.py` already states the contract ("raw facts only").
+- `TaskReporter` is defined in `pipeline.py` rather than `progress.py` because `Pipeline` is the
+  consumer of the interface, not the producer - the protocol lives next to what needs it, and
+  `progress.py` supplies an implementation, so `Pipeline` never imports `progress.py` at all.
+- The counter surface above is a deliberate, narrow coupling, not an event bus or a reach into
+  private state: nothing in the scheduling loop itself (`engine.py`'s `_run`) reads them, only
+  `progress.py` does.
+- The cost is informal rather than enforced: adding a new counter to `Pipeline` means remembering
+  to thread it through `progress.py`'s estimators by hand.
+- This was reviewed 2026-09-03 and judged an acceptable trade-off - the alternative (an event bus,
+  or `progress.py` reaching into private state) would be more machinery for the same information,
+  and the existing comment in `pipeline.py` already states the contract ("raw facts only").
 
 ## API vine_reduce <-> distributor
 
@@ -626,17 +659,18 @@ shutdown(): release whatever resources this distributor owns (worker pools, temp
     ...). Also reachable via `with distributor: ...`.
 ```
 
-`add_file`/`set_env_var` are called once per entry in `VineReduce.extra_files` /
-`environment_variables`, at the very start of `compute()`, before any task is submitted - so a
-caller can hand a processor its supporting files (e.g. a data file read by relative path, an
-auth token/proxy) and env vars (e.g. `X509_USER_PROXY`) without VineReduce knowing anything
-distributor-specific.
+- `add_file`/`set_env_var` are called once per entry in `VineReduce.extra_files` /
+  `environment_variables`, at the very start of `compute()`, before any task is submitted - so a
+  caller can hand a processor its supporting files (e.g. a data file read by relative path, an
+  auth token/proxy) and env vars (e.g. `X509_USER_PROXY`) without VineReduce knowing anything
+  distributor-specific.
 
 ## Dataclasses
 
-`VineReduce` lives in `src/vine_reduce/engine.py`, alongside `compute()` - the orchestration entry
-point and scheduling loop (see "Data Flow" below). Everything else in this section (`Chunk`,
-`Outcome` and its variants, `ResultHandle`) lives in `src/vine_reduce/types.py`.
+- `VineReduce` lives in `src/vine_reduce/engine.py`, alongside `compute()` - the orchestration
+  entry point and scheduling loop (see "Data Flow" below).
+- Everything else in this section (`Chunk`, `Outcome` and its variants, `ResultHandle`) lives in
+  `src/vine_reduce/types.py`.
 
 ```python
 VineReduce:
@@ -651,6 +685,12 @@ reduction_size int | dict = 10: Results to reduce together in a single reduction
                                plain int, or {"default": int, "processors": {name: int},
                                "datasets": {name: int}} for per-processor/per-dataset overrides
                                (most specific wins). Must resolve to an int >= 2.
+minimum_reduction_size int | None = None: The floor reduction_size is halved down to on resource
+                               exhaustion, below which a further ResourceExhaustion raises
+                               immediately instead of shrinking further (see "Attempts and
+                               Retries"). None means 2. A value below 2 is raised to 2; a value
+                               above the (possibly per-processor/per-dataset) resolved
+                               reduction_size is capped at that reduction_size.
 is_result Optional[Callable] = None: is_result(num_events, total_time, total_memory) decides
                                whether the output of a reduction call is a final result or keeps
                                being reduced. Default: True only once all events of the dataset
@@ -676,6 +716,11 @@ distributor Optional[Distributor]: The distributor to use. Defaults to a LocalDi
 chunksize int | dict | None: Target events per chunk, same dict shape as reduction_size. None
                                means one chunk per file. Halved automatically on resource
                                exhaustion, for chunks not yet generated.
+minimum_chunksize int | None = None: The floor chunksize is halved down to on resource
+                               exhaustion, below which a further ResourceExhaustion gives up on
+                               the chunk's file for good instead of shrinking further (see
+                               "Attempts and Retries"). None means 1000. A value below 1 is
+                               raised to 1.
 max_chunks_active int = 1000: Cap on chunks in flight (submitted but not yet finished) across
                                all pipelines at once.
 max_chunks_cycle int = 100: Cap on new chunks submitted per scheduling cycle, across all
@@ -739,22 +784,21 @@ file str: the distributor's opaque handle (an Outcome.file), for use inside a la
           args.
 ```
 
-Worker-side, `executor_wrapper`/`reducer_wrapper` construct the matching `Outcome` subclass
-directly, with `result_id=""` and `std_output=None` - neither is known there. A distributor fills
-those in (and `resources_allocated`, when it has one) via `dataclasses.replace(...)` once it has
-the `result_id` it was given at `submit()` time, to produce the `Outcome` it hands back from
-`wait()`.
+- Worker-side, `executor_wrapper`/`reducer_wrapper` construct the matching `Outcome` subclass
+  directly, with `result_id=""` and `std_output=None` - neither is known there.
+- A distributor fills those in (and `resources_allocated`, when it has one) via
+  `dataclasses.replace(...)` once it has the `result_id` it was given at `submit()` time, to
+  produce the `Outcome` it hands back from `wait()`.
 
 ## Distributors
 
-Two `Distributor` implementations ship with vine_reduce.
+- Two `Distributor` implementations ship with vine_reduce.
 
 ### LocalDistributor (`src/vine_reduce/local_distributor.py`)
 
-The default when `distributor=` is omitted: runs every processor/reducer call in a local
-`CloudpickleProcessPoolExecutor` (see `executor.py`), for development, testing, and as the
-minimal reference implementation of the protocol.
-
+- The default when `distributor=` is omitted: runs every processor/reducer call in a local
+  `CloudpickleProcessPoolExecutor` (see `executor.py`), for development, testing, and as the
+  minimal reference implementation of the protocol.
 - Worker "nodes" are local subprocesses sharing vine_reduce's filesystem, so `retrieve()` is a
   plain file copy and `add_file()` is a no-op. Env vars from `set_env_var` are applied inside
   each worker call, so they take effect regardless of when the pool forked its workers.
@@ -777,6 +821,10 @@ minimal reference implementation of the protocol.
   `CloudpickleProcessPoolExecutor.submit`), so `processor`/`reducer`/etc. may be closures or
   lambdas, not just module-level callables. This also means inheriting that executor's
   `mp_context="fork"`.
+- A worker subprocess that dies outright (segfault, OOM-kill, `os._exit`) breaks the whole
+  `ProcessPoolExecutor`; `wait()` catches `BrokenProcessPool`, turns it into a `RuntimeFailure`
+  for the in-flight call it was waiting on, and rebuilds the pool so later submissions aren't
+  stuck on a dead one.
 - Priority is best-effort only: a pending call waits in a priority queue until a worker slot is
   free, but once dispatched it cannot be preempted by a higher-priority call submitted later.
 - `resources(kind)` always returns `{"cores": 1}`: this runs on the same machine as vine_reduce
@@ -785,8 +833,8 @@ minimal reference implementation of the protocol.
 
 ### TaskVineDistributor (`src/vine_reduce/taskvine_distributor.py`)
 
-Runs vine_reduce across a real cluster of machines via
-[TaskVine](https://cctools.readthedocs.io/en/stable/taskvine), instead of local subprocesses.
+- Runs vine_reduce across a real cluster of machines via
+  [TaskVine](https://cctools.readthedocs.io/en/stable/taskvine), instead of local subprocesses.
 
 - **Manager-only, external workers.** The constructor starts a `vine.Manager` and nothing else;
   `vine_worker` processes, factories, or batch submission are the caller's responsibility, the
@@ -827,7 +875,7 @@ Runs vine_reduce across a real cluster of machines via
   monitor (`enable_monitoring(watchdog=True)`) can kill and report a task that overruns its
   allocation - something a plain `ProcessPoolExecutor` can't detect. `wait()` trusts the
   in-process `Outcome` only when `task.successful()`; otherwise it maps TaskVine's own result
-  string (`"resource exhaustion"`, `"max wall time"`, `"disk alloc full"` ->
+  string (`"resource exhaustion"`, `"max wall time"`, `"sandbox exhaustion"`, `"max end time"` ->
   `ResourceExhaustion`, anything else -> `RuntimeFailure`), so chunksize/reduction_size halving
   is reachable from real cluster failures too.
 - **Resources are per-category, not per-task.** `resources_processor`/`resources_reducer` (each
@@ -839,6 +887,13 @@ Runs vine_reduce across a real cluster of machines via
   as a configured cap - TaskVine's own scheduling algorithm, run manager-side at dispatch time,
   decides the real per-task allocation, which can be less; its worker reports that decision via
   the `CORES` environment variable, which `DaskExecutor` prefers over this cap.
+- **Reducers and processors get different auto-allocation modes.** The first time a category is
+  configured (`_configure_category`), reducer categories are set to TaskVine's `"max"` mode
+  (allocate the largest resource usage measured so far for that category), and processor
+  categories to `"min waste"` mode (adjust allocations to minimize wasted resources across
+  tasks) - a reduction's inputs vary more per call, so `"max"` avoids repeatedly
+  under-allocating and retrying, while processor chunks are more uniform, so `"min waste"`
+  reclaims slack instead.
 - `add_file`/`set_env_var` remember what's been added and attach it
   (`declare_file`/`add_input`, `set_env_var`) to every task submitted from then on. An optional
   poncho `environment` (see "Executors and remote environments") is likewise attached to every
@@ -848,10 +903,10 @@ Runs vine_reduce across a real cluster of machines via
 
 ## VineReduceCoffea
 
-`VineReduceCoffea` (`src/vine_reduce/coffea.py`) is a `VineReduce` specialization for
-[coffea](https://coffeateam.github.io/coffea/)-based workflows over NanoEvents. It only supplies
-the coffea-specific pieces; chunking, checkpointing, and restart are inherited unchanged from
-`VineReduce`:
+- `VineReduceCoffea` (`src/vine_reduce/coffea.py`) is a `VineReduce` specialization for
+  [coffea](https://coffeateam.github.io/coffea/)-based workflows over NanoEvents. It only supplies
+  the coffea-specific pieces; chunking, checkpointing, and restart are inherited unchanged from
+  `VineReduce`:
 
 - `input_to_datasets` defaults to `coffea_input_to_datasets`, which converts the output of
   coffea's own `preprocess()` (files described by `{"num_entries": ..., "steps": ...,
@@ -869,12 +924,12 @@ the coffea-specific pieces; chunking, checkpointing, and restart are inherited u
 
 ## Executors and remote environments
 
-`executor` (`src/vine_reduce/executor.py`) is a second, smaller axis of pluggability, distinct
-from `Distributor`: `Distributor` decides *where* a call runs (which worker); `Executor` decides
-*how* the call runs once it's there. It's an `Executor` protocol instance - `submit`/
-`shutdown`, named after `concurrent.futures.Executor` - configured once in the local process and
-cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
-`with executor: executor.submit(...).result()`.
+- `executor` (`src/vine_reduce/executor.py`) is a second, smaller axis of pluggability, distinct
+  from `Distributor`: `Distributor` decides *where* a call runs (which worker); `Executor` decides
+  *how* the call runs once it's there. It's an `Executor` protocol instance - `submit`/
+  `shutdown`, named after `concurrent.futures.Executor` - configured once in the local process and
+  cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
+  `with executor: executor.submit(...).result()`.
 
 - **Must always pickle cleanly.** Any live resource an implementation holds (e.g. a process pool)
   is created lazily on first `submit` and dropped before pickling (see
@@ -895,17 +950,18 @@ cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
   `distributor_metadata["cores"]`, the distributor's static default (see "API vine_reduce <->
   distributor"); else every core on the machine (`os.process_cpu_count()`).
 
-All three inherit `__enter__`/`__exit__` (defined once, in terms of `shutdown()`) from the
-`Executor` ABC (`src/vine_reduce/executor.py`), so each only implements `submit`/`shutdown`
-itself. See the README's "Executors" section for the full rundown.
+- All three inherit `__enter__`/`__exit__` (defined once, in terms of `shutdown()`) from the
+  `Executor` ABC (`src/vine_reduce/executor.py`), so each only implements `submit`/`shutdown`
+  itself. See the README's "Executors" section for the full rundown.
 
 **Remote environments**
 
-Workers need nothing beyond a distributor pre-installed. `get_environment()`
-(`src/vine_reduce/remote_environment.py`) packs the calling conda environment (`$CONDA_PREFIX`
-by default) into a relocatable [poncho](https://cctools.readthedocs.io/en/stable/poncho) tarball
-via `poncho_package_create`, for `TaskVineDistributor(environment=...)` to ship and activate on
-every worker. Builds are cached on disk and rebuilt automatically whenever a locally-editable
-package (vine_reduce itself, by default, or anything else named via `pip_editable`) has
-uncommitted changes, so a tarball never silently ships stale code. See the README's "Packaging
-an environment for remote workers".
+- Workers need nothing beyond a distributor pre-installed.
+- `get_environment()` (`src/vine_reduce/remote_environment.py`) packs the calling conda
+  environment (`$CONDA_PREFIX` by default) into a relocatable
+  [poncho](https://cctools.readthedocs.io/en/stable/poncho) tarball via `poncho_package_create`,
+  for `TaskVineDistributor(environment=...)` to ship and activate on every worker.
+- Builds are cached on disk and rebuilt automatically whenever a locally-editable package
+  (vine_reduce itself, by default, or anything else named via `pip_editable`) has uncommitted
+  changes, so a tarball never silently ships stale code. See the README's "Packaging an
+  environment for remote workers".
