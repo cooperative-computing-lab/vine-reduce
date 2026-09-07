@@ -921,27 +921,19 @@ class Pipeline:
             kind = "reducer"
         return kind, description
 
-    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
+    def _handle_reduce_success(self, task: _ReduceTask, outcome: Success) -> None:
+        """Fold a completed reduction's group into a new PoolItem.
+
+        group's own handles are deliberately not released here: new_item
+        isn't durable yet, so if it's lost before something checkpoints it,
+        group (kept below as new_item.inputs) is the only way to recover it
+        without recomputing everything from scratch. See _release_covered,
+        invoked from _checkpoint once new_item eventually does become
+        durable.
+        """
         group = task.group
-        kind, description = self._reduce_task_description(task)
-        self._report_task(kind, description, outcome)
-
-        if isinstance(outcome, RuntimeFailure):
-            self._handle_reduce_runtime_failure(task, outcome)
-            return
-        if isinstance(outcome, ResourceExhaustion):
-            self._handle_reduce_resource_exhaustion(task, outcome)
-            return
-
-        assert isinstance(outcome, Success)
         self.counters.reduce_tasks_completed += 1
         _update_resource_max(self._reduction_max, outcome.resources)
-        # group's own handles are deliberately not released here: new_item
-        # isn't durable yet, so if it's lost before something checkpoints
-        # it, group (kept below as new_item.inputs) is the only way to
-        # recover it without recomputing everything from scratch. See
-        # _release_covered, invoked from _checkpoint once new_item
-        # eventually does become durable.
         wall_time_s = outcome.resources.wall_time_s or 0.0
         memory_mb = outcome.resources.memory_mb or 0.0
         new_item = PoolItem(
@@ -962,6 +954,20 @@ class Pipeline:
             self.final_results.append(new_item)
         else:
             self.pool.append(new_item)
+
+    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
+        kind, description = self._reduce_task_description(task)
+        self._report_task(kind, description, outcome)
+
+        if isinstance(outcome, RuntimeFailure):
+            self._handle_reduce_runtime_failure(task, outcome)
+            return
+        if isinstance(outcome, ResourceExhaustion):
+            self._handle_reduce_resource_exhaustion(task, outcome)
+            return
+
+        assert isinstance(outcome, Success)
+        self._handle_reduce_success(task, outcome)
 
     def _give_up_on_reduction(
         self,
