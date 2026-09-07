@@ -276,7 +276,6 @@ class TaskVineDistributor(Distributor):
         limits = ResourceUsage(
             cores=caps.get("cores"), memory_mb=caps.get("memory_mb"), disk_mb=caps.get("disk_mb")
         ).to_rmsummary()
-        self._manager.set_category_resources_max(category, limits)
 
         if kind == TaskKind.REDUCER:
             self._manager.set_category_mode(category, "max")
@@ -284,6 +283,8 @@ class TaskVineDistributor(Distributor):
             self._manager.set_category_mode(category, "min waste")
         else:
             raise ValueError(f"unreachable: unknown TaskKind {kind!r}")
+
+        self._manager.set_category_resources_max(category, limits)
 
         self._categories_configured.add(category)
 
