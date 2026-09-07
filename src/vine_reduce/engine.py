@@ -15,11 +15,14 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from rich.console import Console
+
 from . import defaults
 from .checkpoint_store import CheckpointStore, checksum_dataset
 from .distributor import Distributor
 from .executor import Executor, SimpleExecutor
 from .failure_log import FailureLog
+from .local_distributor import LocalDistributor
 from .pipeline import Pipeline, VineReduceError
 from .progress import NullProgressReporter, ProgressReporter
 from .size_log import SizeLog
@@ -253,27 +256,7 @@ class VineReduce:
                 f"failure_proportion must be in [0, 1); got {self.failure_proportion!r}"
             )
         with ExitStack() as stack:
-            if self.distributor is not None:
-                distributor = self.distributor
-            else:
-                from .local_distributor import LocalDistributor
-
-                # Entered into the stack (unlike a caller-supplied one) so it
-                # is shut down again on the way out, however this returns.
-                # checkpoint_dir defaults alongside db_path, under results_dir,
-                # rather than LocalDistributor's own bare "checkpoints" default
-                # - so a checkpoint written by this run is found again next to
-                # the checkpoint db that points at it, not wherever the
-                # process happened to be started from.
-                distributor = stack.enter_context(
-                    LocalDistributor(checkpoint_dir=os.path.join(self.results_dir, "checkpoints"))
-                )
-
-            # Communicated to the distributor once, up front, so every
-            # processor/reducer call it submits from here on has these files and
-            # environment variables available - see Distributor.add_file/
-            # set_env_var (distributor.py) for what each implementation does
-            # with them.
+            distributor = self._enter_distributor(stack)
             for path in self.extra_files:
                 distributor.add_file(path)
             for name, value in self.environment_variables.items():
@@ -291,42 +274,49 @@ class VineReduce:
             for name, dataset in datasets.items():
                 discarded_paths = db.dataset_changed(name, checksum_dataset(dataset))
                 for path in discarded_paths:
-                    # The dataset's definition changed, so these checkpoints
-                    # (including any prior final result) no longer apply -
-                    # dataset_changed only drops the DB rows, so the orphaned
-                    # files are removed here or they'd sit in results_dir
-                    # forever next to the result this run produces.
                     if os.path.exists(path):
                         os.remove(path)
 
             reporter: ProgressReporter | NullProgressReporter = stack.enter_context(
                 ProgressReporter() if self.progress else NullProgressReporter()
             )
-            # failed_files.log lives at the directory the run was started
-            # from, shared across every (processor, dataset) pipeline of
-            # this run, and appended to immediately as each permanent
-            # processor/reducer failure is found - see failure_log.py and
-            # failure_proportion's docstring above.
             failure_log_path = os.path.join(os.getcwd(), "failed_files.log")
             failure_log = FailureLog(failure_log_path)
-            # size.jsonl lives at the top of results_dir, shared across every
-            # (processor, dataset) pipeline of this run - see size_log.py and
-            # Pipeline._log_size_once, the only place it's written to.
             size_log = SizeLog(os.path.join(self.results_dir, "size.jsonl"))
             pipelines = self._build_pipelines(
                 datasets, distributor, db, datasets_to_chunks, reporter, failure_log, size_log
             )
             self._run(pipelines, distributor, reporter)
+            self._warn_unprocessed(pipelines, failure_log_path)
 
-            unprocessed = sum(len(p.failed_files) for p in pipelines)
-            if unprocessed:
-                from rich.console import Console
+    def _enter_distributor(self, stack: ExitStack) -> Distributor:
+        """Return `distributor` if the caller supplied one (left running
+        afterward for the caller to shut down), otherwise create a
+        LocalDistributor and enter it into `stack` so it is shut down again
+        on the way out, however compute() returns. The created
+        LocalDistributor's checkpoint_dir defaults alongside db_path, under
+        results_dir, rather than LocalDistributor's own bare "checkpoints"
+        default - so a checkpoint written by this run is found again next to
+        the checkpoint db that points at it, not wherever the process
+        happened to be started from."""
+        if self.distributor is not None:
+            return self.distributor
+        return stack.enter_context(
+            LocalDistributor(checkpoint_dir=os.path.join(self.results_dir, "checkpoints"))
+        )
 
-                Console().print(
-                    f"WARNING: {unprocessed} file(s) were permanently skipped and left "
-                    f"unprocessed; see {failure_log_path}",
-                    style="bold red",
-                )
+    @staticmethod
+    def _warn_unprocessed(pipelines: list[Pipeline], failure_log_path: str) -> None:
+        """Print a red warning naming `failure_log_path` if any pipeline
+        ended this run with files permanently skipped (see
+        failure_proportion's docstring above)."""
+        unprocessed = sum(len(p.failed_files) for p in pipelines)
+        if unprocessed:
+            Console().print(
+                f"WARNING: {unprocessed} file(s) were permanently skipped and left "
+                f"unprocessed; see {failure_log_path}",
+                style="bold red",
+            )
 
     def _build_pipelines(
         self,
