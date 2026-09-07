@@ -119,6 +119,37 @@ def final_value(pipeline):
     return serialization.load(pipeline.final_results[0].checkpoint.path)
 
 
+def spy(distributor, method):
+    """Monkey-patches distributor.<method> to record every call's first
+    argument (the result_id, for the methods this is used with) into a
+    returned list, while still calling through to the real implementation.
+    Used to assert on which result_ids a Pipeline released/retrieved/etc,
+    without losing the actual behavior those methods have."""
+    calls: list = []
+    original = getattr(distributor, method)
+
+    def _spy(*args, **kwargs):
+        calls.append(args[0] if args else None)
+        original(*args, **kwargs)
+
+    setattr(distributor, method, _spy)
+    return calls
+
+
+def _pool_item(*, handle=None, files=frozenset(), attempts=0, **overrides):
+    return PoolItem(
+        handle=handle,
+        num_events=1,
+        wall_time_s=0.0,
+        memory_mb=0.0,
+        files=files,
+        since_checkpoint_time=0.0,
+        since_checkpoint_distance=0,
+        attempts=attempts,
+        **overrides,
+    )
+
+
 def test_under_covering_chunker_raises_instead_of_hanging(fake_distributor, tmp_path):
     def under_covering_datasets_to_chunks(dataset, current_chunksize, skip_files=None):
         # Yields a chunk covering only 3 of a.root's 5 declared events,
@@ -293,23 +324,8 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
         fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_accumulations=True
     )
 
-    released: list[int] = []
-    original_release = fake_distributor.release_result
-
-    def spy_release(result_id):
-        released.append(result_id)
-        original_release(result_id)
-
-    fake_distributor.release_result = spy_release
-
-    retrieved: list[int] = []
-    original_retrieve = fake_distributor.retrieve
-
-    def spy_retrieve(result_id, dest_path):
-        retrieved.append(result_id)
-        original_retrieve(result_id, dest_path)
-
-    fake_distributor.retrieve = spy_retrieve
+    released = spy(fake_distributor, "release_result")
+    retrieved = spy(fake_distributor, "retrieve")
 
     intermediate_items = []
     original_checkpoint = pipeline._checkpoint
@@ -375,14 +391,7 @@ def test_uncheckpointed_fold_keeps_every_ancestor_until_a_later_checkpoint_cover
     dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2)
 
-    released: list[int] = []
-    original_release = fake_distributor.release_result
-
-    def spy_release(result_id):
-        released.append(result_id)
-        original_release(result_id)
-
-    fake_distributor.release_result = spy_release
+    released = spy(fake_distributor, "release_result")
 
     def count_lineage(item):
         return len(item.inputs) + sum(count_lineage(child) for child in item.inputs)
@@ -463,14 +472,7 @@ def test_restart_seeded_checkpoint_is_adopted_used_and_released_when_superseded(
     assert seeded_item.checkpoint.path == str(seeded_file)
     adopted_result_id = seeded_item.handle.result_id
 
-    released: list[int] = []
-    original_release = fake_distributor.release_result
-
-    def spy_release(result_id):
-        released.append(result_id)
-        original_release(result_id)
-
-    fake_distributor.release_result = spy_release
+    released = spy(fake_distributor, "release_result")
 
     run_to_completion(pipeline, fake_distributor)
 
@@ -807,13 +809,13 @@ def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor,
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=4, attempts=2)
 
     chunk = Chunk("a.root", 0, 4)
-    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=1)  # 1 of 2 already used
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=1)  # 1 of 2 already used
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
         ResourceExhaustion(result_id="r1", resources={}, std_output=None),
     )
     assert pipeline.chunksize == 2
-    # not yet split - attempts_used still carried as-is until it actually splits
+    # not yet split - attempts still carried as-is until it actually splits
     assert pipeline._retry_chunks == [_ChunkTask(chunk, 1)]
 
     next_task = pipeline._next_chunk()
@@ -835,7 +837,7 @@ def test_chunk_resource_exhaustion_above_current_size_repools_without_shrinking(
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=2, attempts=3)
 
     chunk = Chunk("a.root", 0, 4)  # formed before chunksize shrank from 4 to 2
-    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=1)
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=1)
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
         ResourceExhaustion(result_id="r1", resources={}, std_output=None),
@@ -858,7 +860,7 @@ def test_chunk_resource_exhaustion_above_floor_does_not_give_up_early(fake_distr
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, chunksize=1, attempts=3)
 
     chunk = Chunk("a.root", 0, 4)  # formed before chunksize shrank to the floor
-    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts_used=0)
+    pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=0)
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
         ResourceExhaustion(result_id="r1", resources={}, std_output=None),
@@ -897,16 +899,7 @@ def test_reduction_runtime_failure_retry_preserves_force_final(fake_distributor,
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=10)
 
     items = [
-        PoolItem(
-            handle=ResultHandle(f"r{i}", f"f{i}"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            files=frozenset({f"{c}.root"}),
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            attempts=0,
-        )
+        _pool_item(handle=ResultHandle(f"r{i}", f"f{i}"), files=frozenset({f"{c}.root"}))
         for i, c in enumerate("ab")
     ]
     task = _ReduceTask(group=items, is_final=True, is_checkpoint=True, force_final=True)
@@ -1019,15 +1012,9 @@ def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distrib
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=4, attempts=2)
 
     items = [
-        PoolItem(
-            handle=ResultHandle(f"r{i}", f"f{i}"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            files=frozenset({f"{c}.root"}),
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            attempts=1,  # 1 of 2 already used
+        # 1 of 2 already used
+        _pool_item(
+            handle=ResultHandle(f"r{i}", f"f{i}"), files=frozenset({f"{c}.root"}), attempts=1
         )
         for i, c in enumerate("abcd")
     ]
@@ -1061,15 +1048,8 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=4, attempts=3)
 
     items = [
-        PoolItem(
-            handle=ResultHandle(f"r{i}", f"f{i}"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            files=frozenset({f"{c}.root"}),
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            attempts=1,
+        _pool_item(
+            handle=ResultHandle(f"r{i}", f"f{i}"), files=frozenset({f"{c}.root"}), attempts=1
         )
         for i, c in enumerate("ab")  # a group of 2, smaller than reduction_size=4
     ]
@@ -1105,16 +1085,7 @@ def test_reduction_resource_exhaustion_below_current_size_at_minimum_raises(
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2, attempts=5)
 
     items = [
-        PoolItem(
-            handle=ResultHandle("r0", "f0"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            files=frozenset({"a.root"}),
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            attempts=0,
-        )
+        _pool_item(handle=ResultHandle("r0", "f0"), files=frozenset({"a.root"}))
     ]  # a group of 1, smaller than reduction_size=2
     pipeline._in_flight["r"] = _ReduceTask(
         group=items,
@@ -1147,15 +1118,8 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2, attempts=3)
 
     items = [
-        PoolItem(
-            handle=ResultHandle(f"r{i}", f"f{i}"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            files=frozenset({f"{c}.root"}),
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            attempts=1,
+        _pool_item(
+            handle=ResultHandle(f"r{i}", f"f{i}"), files=frozenset({f"{c}.root"}), attempts=1
         )
         for i, c in enumerate("abcde")  # a group of 5, bigger than reduction_size=2
     ]
@@ -1237,7 +1201,9 @@ def test_reducer_permanent_failure_keeps_checkpointed_inputs_on_disk(fake_distri
     db.close()
 
 
-def test_reducer_permanent_failure_keeps_deep_checkpointed_lineage_on_disk(fake_distributor, tmp_path):
+def test_reducer_permanent_failure_keeps_deep_checkpointed_lineage_on_disk(
+    fake_distributor, tmp_path
+):
     """Same guarantee as the test above, but for a checkpoint reached
     through a non-checkpointed intermediate reduction rather than sitting
     directly in the failing group: a.root restarts as an already-

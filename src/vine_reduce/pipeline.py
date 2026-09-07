@@ -5,9 +5,10 @@ PLAN.md for the pooling and checkpointing rules this implements.
 
 from __future__ import annotations
 
+import enum
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Literal, Protocol
+from typing import Any, Callable, Iterator, Protocol
 from uuid import uuid4
 
 from . import defaults
@@ -86,6 +87,33 @@ def _update_resource_max(maxes: dict[str, float], resources: dict[str, Any]) -> 
         if value is None:
             continue
         maxes[output_key] = max(maxes.get(output_key, value), value)
+
+
+class _ShrinkDecision(enum.Enum):
+    REPOOL = "repool"
+    SHRINK = "shrink"
+    GIVE_UP = "give_up"
+
+
+def _shrink_decision(unit_size: int, current_size: int, floor: int) -> _ShrinkDecision:
+    """The shared exhaustion-retry rule for both chunk and reduce tasks:
+    unit_size is the size this task was actually tried at (chunk.num_events,
+    or len(group) for a reduction); current_size is the pipeline's live
+    chunksize/reduction_size.
+      - unit_size > current_size: a sibling's exhaustion already shrank
+        current_size further while this task was still in flight, so it was
+        never actually tried at current_size - not evidence it's too big.
+        REPOOL: re-pool unshrunk, to be re-split down to current_size next
+        time it's retried.
+      - current_size <= floor: already at the minimum size and still
+        exhausted - GIVE_UP.
+      - otherwise: SHRINK - current_size should be halved (clamped to
+        floor)."""
+    if unit_size > current_size:
+        return _ShrinkDecision.REPOOL
+    if current_size <= floor:
+        return _ShrinkDecision.GIVE_UP
+    return _ShrinkDecision.SHRINK
 
 
 @dataclass(frozen=True)
@@ -673,21 +701,18 @@ class Pipeline:
         chunk = task.chunk
         self._record_chunk_failure(chunk)
         current_size = self.chunksize if self.chunksize is not None else chunk.num_events
-        if chunk.num_events > current_size:
-            # A sibling chunk's exhaustion already shrank chunksize
-            # further while this chunk was still in flight, so it was
-            # never actually tried at the current (smaller) size - not
-            # evidence that it's too big. It will be re-split down to the
-            # current chunksize next time it's pulled off the retry
-            # queue - see _next_chunk - and the equivalent reduction rule
-            # in _handle_reduce_resource_exhaustion.
+        decision = _shrink_decision(task.size, current_size, self._minimum_chunksize)
+        if decision is _ShrinkDecision.REPOOL:
+            # See _shrink_decision - not evidence this chunk is too big. It
+            # will be re-split down to the current chunksize next time it's
+            # pulled off the retry queue - see _next_chunk.
             self._retry_chunks.append(_ChunkTask(chunk, 0))
             return
-        if current_size <= self._minimum_chunksize:
+        if decision is _ShrinkDecision.GIVE_UP:
             if self._give_up_on_file(
                 chunk,
                 kind="processor",
-                attempts=task.attempts_used + 1,
+                attempts=task.attempts + 1,
                 resources_measured=outcome.resources,
                 traceback=None,
             ):
@@ -697,17 +722,17 @@ class Pipeline:
                     f"size ({self._minimum_chunksize} events); cannot retry smaller."
                 )
             return
-        # Clamp to the floor rather than halving straight past it - a
-        # chunksize of 1500 with minimum_chunksize=1000 must still try 1000
-        # before giving up, not jump straight from 1500 to 750
-        # (Correctness #6).
+        # decision is SHRINK. Clamp to the floor rather than halving
+        # straight past it - a chunksize of 1500 with minimum_chunksize=1000
+        # must still try 1000 before giving up, not jump straight from 1500
+        # to 750 (Correctness #6).
         self.chunksize = max(current_size // 2, self._minimum_chunksize)
-        # attempts_used carries over unchanged here - it is reset to 0 in
+        # attempts carries over unchanged here - it is reset to 0 in
         # _next_chunk once this chunk is actually split at the new,
         # smaller chunksize (a halving is a fresh start, not a strike
         # against the budget - see PoolItem.attempts's docstring for the
         # equivalent reduction rule).
-        self._retry_chunks.append(_ChunkTask(chunk, task.attempts_used))
+        self._retry_chunks.append(_ChunkTask(chunk, task.attempts))
 
     def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
         chunk = task.chunk
@@ -810,31 +835,27 @@ class Pipeline:
     ) -> None:
         group = task.group
         self.reduce_tasks_failed += 1
-        if len(group) <= self.reduction_size:
-            # This group was formed at (or below) the current reduction_size,
-            # so its failure is real evidence that the current size is too
-            # big - shrink it (or give up if already at the floor). A group
-            # *bigger* than the current size (one formed before an earlier
-            # shrink, or the final drain group, which folds whatever is left
-            # regardless of size) was never tried at the current size, so it
-            # is not such evidence and falls through unshrunk to the re-pool
-            # below.
-            if self.reduction_size <= self._minimum_reduction_size:
-                self._give_up_on_reduction(
-                    group,
-                    attempts=1 + max((item.attempts for item in group), default=0),
-                    resources_measured=outcome.resources,
-                    traceback=None,
-                )
-                raise VineReduceError(
-                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                    "resources at the minimum reduction_size "
-                    f"({self._minimum_reduction_size}); cannot retry smaller."
-                )
+        decision = _shrink_decision(task.size, self.reduction_size, self._minimum_reduction_size)
+        if decision is _ShrinkDecision.GIVE_UP:
+            self._give_up_on_reduction(
+                group,
+                attempts=task.attempts + 1,
+                resources_measured=outcome.resources,
+                traceback=None,
+            )
+            raise VineReduceError(
+                f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
+                "resources at the minimum reduction_size "
+                f"({self._minimum_reduction_size}); cannot retry smaller."
+            )
+        if decision is _ShrinkDecision.SHRINK:
             # Clamp to the floor rather than halving straight past it - a
             # reduction_size of 3 with minimum_reduction_size=2 must still
-            # try 2 before giving up, not jump straight from 3 to 1
+            # try 2 before giving up, not jump straight from 3 to 1.
             self.reduction_size = max(self.reduction_size // 2, self._minimum_reduction_size)
+        # decision is REPOOL: group was never actually tried at the
+        # current reduction_size (see _shrink_decision) - falls straight
+        # through unshrunk.
         # Any ResourceExhaustion is a fresh start for these items, not a
         # strike against the budget - see PoolItem.attempts's docstring.
         for item in group:
