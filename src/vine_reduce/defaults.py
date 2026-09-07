@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 
 from . import serialization
 from .executor import Executor
-from .types import Chunk, RawOutcome
+from .types import Chunk, Outcome, ResourceExhaustion, RuntimeFailure, Success
 
 
 def default_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]:
@@ -83,34 +83,41 @@ def _measure(fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
 
 def _unmeasured_resources() -> dict[str, Any]:
     """Placeholder usage for a call that failed before _measure could report
-    anything real. A fresh dict each time, since it ends up on a RawOutcome."""
+    anything real. A fresh dict each time, since it ends up on an Outcome."""
     return {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
 
 
-def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> RawOutcome:
+def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> Outcome:
     """Runs `run`, measuring resources, and serializes its result to dest_file
     on success. Shared tail for executor_wrapper and reducer_wrapper.
+
+    Returns an Outcome directly, with result_id="" and std_output=None - both
+    unknown here, and filled in by the distributor (via dataclasses.replace)
+    once it has them at wait() time.
 
     dest_file is written unconditionally, even on failure/exhaustion: a
     distributor may declare it as a required task output before this
     function ever runs (see TaskVineDistributor.submit), so leaving it
     missing would make the *transport* report the failure instead of this
-    function's own RawOutcome, discarding the real status and traceback."""
+    function's own Outcome, discarding the real status and traceback."""
     try:
         result, resources = _measure(run)
         serialization.dump(result, dest_file)
     except MemoryError:
         serialization.dump(None, dest_file)
-        return RawOutcome(status="exhausted", resources=_unmeasured_resources())
+        return ResourceExhaustion(
+            result_id="", resources=_unmeasured_resources(), std_output=None
+        )
     except Exception:
         serialization.dump(None, dest_file)
-        return RawOutcome(
-            status="failure",
+        return RuntimeFailure(
+            result_id="",
             resources=_unmeasured_resources(),
+            std_output=None,
             traceback=traceback_module.format_exc(),
         )
 
-    return RawOutcome(status="success", resources=resources, file=dest_file)
+    return Success(result_id="", resources=resources, std_output=None, file=dest_file)
 
 
 def executor_wrapper(
@@ -122,7 +129,7 @@ def executor_wrapper(
     executor_metadata: dict[str, Any] | None,
     chunk_to_args: Callable[..., Any],
     executor: Executor,
-) -> RawOutcome:
+) -> Outcome:
     """Runs remotely. Calls chunk_to_args then executor.submit, measures
     resources, and serializes the processing result to dest_file on
     success. executor is a fresh, just-deserialized copy for this call
@@ -156,7 +163,7 @@ def reducer_wrapper(
     input_files: list[str],
     is_final: bool,
     result_postprocess: Callable[[Any], Any] | None,
-) -> RawOutcome:
+) -> Outcome:
     """Runs remotely. Folds input_files (each a serialized result) together
     with reducer, applies result_postprocess if this is a final result, and
     serializes the outcome to dest_file on success."""

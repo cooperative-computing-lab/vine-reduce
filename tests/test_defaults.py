@@ -10,7 +10,7 @@ from vine_reduce.defaults import (
     reducer_wrapper,
 )
 from vine_reduce.executor import SimpleExecutor
-from vine_reduce.types import Chunk
+from vine_reduce.types import Chunk, ResourceExhaustion, RuntimeFailure, Success
 
 from helpers import (
     count_events,
@@ -77,7 +77,7 @@ def test_executor_wrapper_success(tmp_path):
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
-    assert outcome.status == "success"
+    assert isinstance(outcome, Success)
     assert outcome.file == dest
     assert serialization.load(dest) == 5
     assert outcome.resources["wall_time_s"] >= 0
@@ -96,12 +96,12 @@ def test_executor_wrapper_failure_captures_traceback(tmp_path):
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
-    assert outcome.status == "failure"
+    assert isinstance(outcome, RuntimeFailure)
     assert "ValueError: boom" in outcome.traceback
     # dest_file must still be written on failure: a distributor (e.g.
     # TaskVineDistributor) may have already declared it as a required task
     # output, so leaving it missing would make the transport itself report
-    # the failure and discard this RawOutcome (see taskvine_distributor.py).
+    # the failure and discard this Outcome (see taskvine_distributor.py).
     assert os.path.exists(dest)
 
 
@@ -118,7 +118,7 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
-    assert outcome.status == "exhausted"
+    assert isinstance(outcome, ResourceExhaustion)
     assert os.path.exists(dest)
 
 
@@ -138,7 +138,7 @@ def test_executor_wrapper_unpicklable_result_becomes_failure(tmp_path):
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
-    assert outcome.status == "failure"
+    assert isinstance(outcome, RuntimeFailure)
     assert outcome.traceback is not None
     assert os.path.exists(dest)
 
@@ -152,7 +152,7 @@ def test_reducer_wrapper_folds_inputs(tmp_path):
 
     dest = str(tmp_path / "out.pkl.zst")
     outcome = reducer_wrapper(dest, sum_reducer, inputs, False, None)
-    assert outcome.status == "success"
+    assert isinstance(outcome, Success)
     assert serialization.load(dest) == 6
 
 
@@ -165,7 +165,7 @@ def test_reducer_wrapper_applies_postprocess_only_when_final(tmp_path):
 
     dest = str(tmp_path / "out.pkl.zst")
     outcome = reducer_wrapper(dest, sum_reducer, inputs, True, double_postprocess)
-    assert outcome.status == "success"
+    assert isinstance(outcome, Success)
     assert serialization.load(dest) == 6  # (1+2) * 2
 
 

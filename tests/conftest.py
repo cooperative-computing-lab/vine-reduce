@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import heapq
 import itertools
 import json
@@ -9,7 +10,7 @@ from typing import Any, Callable
 
 import pytest
 
-from vine_reduce.types import RawOutcome
+from vine_reduce.types import Outcome, Success
 
 
 class FakeDistributor:
@@ -23,7 +24,7 @@ class FakeDistributor:
         self._work_dir = work_dir
         self._capacity_amount = capacity_amount
         self._seq = itertools.count()
-        self._ready: list[tuple[int, int, str, RawOutcome]] = []
+        self._ready: list[tuple[int, int, str, Outcome]] = []
         self._files: dict[str, str] = {}
 
     def submit(
@@ -37,16 +38,16 @@ class FakeDistributor:
         is_checkpoint: bool = False,
     ) -> None:
         dest_file = os.path.join(self._work_dir, f"{result_id}.pkl.zst")
-        raw: RawOutcome = func(dest_file, *args)
+        raw: Outcome = func(dest_file, *args)
         heapq.heappush(self._ready, (-priority, next(self._seq), result_id, raw))
 
     def wait(self, timeout: float | None = None):
         if not self._ready:
             return None
         _, _, result_id, raw = heapq.heappop(self._ready)
-        if raw.status == "success":
+        if isinstance(raw, Success):
             self._files[result_id] = raw.file
-        return raw.to_outcome(result_id)
+        return dataclasses.replace(raw, result_id=result_id)
 
     def release_result(self, result_id: str) -> None:
         path = self._files.pop(result_id, None)

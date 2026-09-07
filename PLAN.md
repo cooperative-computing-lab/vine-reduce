@@ -638,7 +638,7 @@ distributor-specific.
 
 `VineReduce` lives in `src/vine_reduce/engine.py`, alongside `compute()` - the orchestration entry
 point and scheduling loop (see "Data Flow" below). Everything else in this section (`Chunk`,
-`Outcome` and its variants, `ResultHandle`, `RawOutcome`) lives in `src/vine_reduce/types.py`.
+`Outcome` and its variants, `ResultHandle`) lives in `src/vine_reduce/types.py`.
 
 ```python
 VineReduce:
@@ -741,10 +741,11 @@ file str: the distributor's opaque handle (an Outcome.file), for use inside a la
           args.
 ```
 
-Worker-side, `executor_wrapper`/`reducer_wrapper` actually return a `RawOutcome` (`status`,
-`resources`, `file | traceback`) - the distributor-agnostic value produced before a `result_id`
-is attached. A distributor attaches the `result_id` it was given at `submit()` time via
-`RawOutcome.to_outcome(result_id)` to produce the `Outcome` it hands back from `wait()`.
+Worker-side, `executor_wrapper`/`reducer_wrapper` construct the matching `Outcome` subclass
+directly, with `result_id=""` and `std_output=None` - neither is known there. A distributor fills
+those in (and `resources_allocated`, when it has one) via `dataclasses.replace(...)` once it has
+the `result_id` it was given at `submit()` time, to produce the `Outcome` it hands back from
+`wait()`.
 
 ## Distributors
 
@@ -825,7 +826,7 @@ Runs vine_reduce across a real cluster of machines via
 - **Infra-level resource exhaustion is mapped, not just Python-level.** TaskVine's resource
   monitor (`enable_monitoring(watchdog=True)`) can kill and report a task that overruns its
   allocation - something a plain `ProcessPoolExecutor` can't detect. `wait()` trusts the
-  in-process `RawOutcome` only when `task.successful()`; otherwise it maps TaskVine's own result
+  in-process `Outcome` only when `task.successful()`; otherwise it maps TaskVine's own result
   string (`"resource exhaustion"`, `"max wall time"`, `"disk alloc full"` ->
   `ResourceExhaustion`, anything else -> `RuntimeFailure`), so chunksize/reduction_size halving
   is reachable from real cluster failures too.

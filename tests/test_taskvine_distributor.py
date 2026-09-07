@@ -129,11 +129,11 @@ def test_wait_returns_none_when_nothing_pending(monkeypatch, tmp_path):
 
 
 def test_wait_survives_a_corrupted_task_output(monkeypatch, tmp_path):
-    """PythonTask.output hands back the exception object itself, not a
-    RawOutcome, if cloudpickle.load of the task's output fails on the
+    """PythonTask.output hands back the exception object itself, not an
+    Outcome, if cloudpickle.load of the task's output fails on the
     manager side (verified in cctools' task.py) - wait() must turn that
-    into a RuntimeFailure rather than let raw.to_outcome(...) raise
-    AttributeError (Correctness #3). A stub task via a monkeypatched
+    into a RuntimeFailure rather than let dataclasses.replace(raw, ...) raise
+    TypeError. A stub task via a monkeypatched
     wait_for_tag, no real worker needed - see test_wait_returns_none_when_
     nothing_pending for why that's safe here."""
     monkeypatch.setenv("PYTHONPATH", os.path.dirname(__file__))

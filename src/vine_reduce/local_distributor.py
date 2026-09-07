@@ -24,6 +24,7 @@ do. It is intentionally simple, not production-grade:
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import heapq
 import itertools
 import os
@@ -37,7 +38,7 @@ from uuid import uuid4
 
 import cloudpickle
 
-from .types import Outcome, RawOutcome, RuntimeFailure
+from .types import Outcome, RuntimeFailure, Success
 
 # Placeholder usage for a call whose outcome had to be synthesized rather
 # than measured (see wait()'s BrokenProcessPool handling) - mirrors
@@ -150,7 +151,7 @@ class LocalDistributor:
         result_id, dest_file = self._running.pop(future)
 
         try:
-            raw: RawOutcome = future.result()
+            raw: Outcome = future.result()
         except BrokenProcessPool:
             self._pool.shutdown(wait=False)
             self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
@@ -165,11 +166,11 @@ class LocalDistributor:
             self._dispatch()
             return outcome
 
-        if raw.status == "success":
+        if isinstance(raw, Success):
             self._files[result_id] = raw.file
         elif os.path.exists(dest_file):
             os.remove(dest_file)
-        outcome = raw.to_outcome(result_id)
+        outcome = dataclasses.replace(raw, result_id=result_id)
 
         self._dispatch()
         return outcome

@@ -39,22 +39,23 @@ remapping, release, retrieve - with no special-casing.
 Resource exhaustion: monitoring is enabled with watchdog=True, so TaskVine
 itself can kill and report a task that overruns its resource allocation -
 something a plain ProcessPoolExecutor (see local_distributor.py) can't do.
-wait() checks task.successful() first and only trusts the RawOutcome
-returned by executor_wrapper/reducer_wrapper (a Python-level exception
-caught inside the wrapper) when that's True; otherwise it translates
-TaskVine's own result string into ResourceExhaustion or RuntimeFailure.
-task.successful() means "the wrapper ran to completion and returned a
-RawOutcome", not "that RawOutcome was a success" - a Python-level failure
-or caught MemoryError still returns normally, and dest_file is always
-written (see defaults.py's _run_and_wrap) precisely so TaskVine's own
-missing-output check can't itself mark such a task unsuccessful and
-discard the real RawOutcome. task.successful() is False only when the
-wrapper never returned at all: it crashed outright (unhandled exception,
-bug) or the worker process was killed by TaskVine's resource watchdog.
+wait() checks task.successful() first and only trusts the Outcome returned
+by executor_wrapper/reducer_wrapper (a Python-level exception caught inside
+the wrapper) when that's True; otherwise it translates TaskVine's own result
+string into ResourceExhaustion or RuntimeFailure. task.successful() means
+"the wrapper ran to completion and returned an Outcome", not "that Outcome
+was a Success" - a Python-level failure or caught MemoryError still returns
+normally, and dest_file is always written (see defaults.py's _run_and_wrap)
+precisely so TaskVine's own missing-output check can't itself mark such a
+task unsuccessful and discard the real Outcome. task.successful() is False
+only when the wrapper never returned at all: it crashed outright (unhandled
+exception, bug) or the worker process was killed by TaskVine's resource
+watchdog.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ from uuid import uuid4
 import ndcctools.taskvine as vine
 
 from .distributor import TaskKind
-from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Outcome, ResourceExhaustion, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
@@ -329,10 +330,10 @@ class TaskVineDistributor:
 
         if task.successful():
             raw = task.output
-            if not isinstance(raw, RawOutcome):
+            if not isinstance(raw, Outcome):
                 # cloudpickle.load of the task's output failed on the
                 # manager side; PythonTask.output then hands back the
-                # exception object it raised, not a RawOutcome - task-level
+                # exception object it raised, not an Outcome - task-level
                 # (the wrapper really did run and return something), not a
                 # reason to let wait() itself raise.
                 self.release_result(result_id)
@@ -343,8 +344,8 @@ class TaskVineDistributor:
                     std_output=task.std_output,
                     traceback=f"failed to load task output: {raw!r}",
                 )
-            outcome = raw.to_outcome(
-                result_id, std_output=task.std_output, resources_allocated=allocated
+            outcome = dataclasses.replace(
+                raw, result_id=result_id, std_output=task.std_output, resources_allocated=allocated
             )
             if not isinstance(outcome, Success):
                 # The wrapper ran to completion but reported a Python-level

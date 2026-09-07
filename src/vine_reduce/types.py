@@ -1,11 +1,12 @@
 """Shared data types passed between vine_reduce and a distributor.
 
 See PLAN.md for the full design. `Outcome` and its variants are the public,
-distributor-facing result of a submitted call. `RawOutcome` is the internal,
-distributor-agnostic value returned by executor_wrapper/reducer_wrapper on
-the worker side; a distributor is responsible for attaching the result_id the
-caller gave it at submit() time to produce a proper Outcome (see
-distributor.py).
+distributor-facing result of a submitted call. executor_wrapper/reducer_wrapper
+construct these directly on the worker side, with result_id="" and
+std_output=None (neither is known there); a distributor is responsible for
+filling in the result_id it gave the call at submit() time (and std_output/
+resources_allocated, when it has them) via dataclasses.replace() before
+handing the Outcome back from wait() (see distributor.py).
 """
 
 from __future__ import annotations
@@ -94,48 +95,3 @@ class ResultHandle:
 
     result_id: str
     file: str
-
-
-@dataclass(frozen=True)
-class RawOutcome:
-    """What executor_wrapper/reducer_wrapper return on the worker side, before a
-    distributor attaches the result_id and turns it into a proper Outcome."""
-
-    status: str  # "success" | "failure" | "exhausted"
-    resources: dict[str, Any]
-    file: str | None = None
-    traceback: str | None = None
-
-    def to_outcome(
-        self,
-        result_id: str,
-        std_output: str | None = None,
-        resources_allocated: dict[str, Any] | None = None,
-    ) -> Outcome:
-        """Attach result_id (and std_output/resources_allocated, when the
-        distributor has them - see Outcome) and convert to the matching
-        Outcome subclass."""
-        if self.status == "success":
-            return Success(
-                result_id=result_id,
-                resources=self.resources,
-                resources_allocated=resources_allocated,
-                std_output=std_output,
-                file=self.file,
-            )
-        if self.status == "failure":
-            return RuntimeFailure(
-                result_id=result_id,
-                resources=self.resources,
-                resources_allocated=resources_allocated,
-                std_output=std_output,
-                traceback=self.traceback,
-            )
-        if self.status == "exhausted":
-            return ResourceExhaustion(
-                result_id=result_id,
-                resources=self.resources,
-                resources_allocated=resources_allocated,
-                std_output=std_output,
-            )
-        raise ValueError(f"unknown RawOutcome status: {self.status!r}")

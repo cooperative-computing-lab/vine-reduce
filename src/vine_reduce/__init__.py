@@ -19,7 +19,7 @@ from .executor import CloudpickleExecutor, DaskExecutor, Executor, SimpleExecuto
 from .local_distributor import LocalDistributor
 from .pipeline import VineReduceError
 from .remote_environment import UnstagedChanges, get_environment
-from .types import Chunk, Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Chunk, Outcome, ResourceExhaustion, RuntimeFailure, Success
 
 if TYPE_CHECKING:
     from .taskvine_distributor import TaskVineDistributor  # noqa: F401
@@ -32,7 +32,6 @@ __all__ = [
     "Executor",
     "LocalDistributor",
     "Outcome",
-    "RawOutcome",
     "ResourceExhaustion",
     "RuntimeFailure",
     "SimpleExecutor",
