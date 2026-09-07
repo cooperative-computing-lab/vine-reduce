@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
 from uuid import uuid4
 
+from . import defaults
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor
 from .executor import Executor
@@ -235,9 +236,7 @@ class Pipeline:
         datasets_to_chunks: Callable[[dict, Callable[[], int | None], set[str]], Iterator[Chunk]],
         chunk_to_args: Callable,
         executor: Executor,
-        executor_wrapper: Callable,
         reducer: Callable,
-        reducer_wrapper: Callable,
         is_result: Callable[[int, float, float], bool],
         result_postprocess: Callable | None,
         chunksize: int | None,
@@ -266,9 +265,7 @@ class Pipeline:
         self._datasets_to_chunks = datasets_to_chunks
         self._chunk_to_args = chunk_to_args
         self._executor = executor
-        self._executor_wrapper = executor_wrapper
         self._reducer = reducer
-        self._reducer_wrapper = reducer_wrapper
         self._is_result = is_result
         self._result_postprocess = result_postprocess
         self.chunksize = chunksize
@@ -528,7 +525,7 @@ class Pipeline:
             self._process_priority,
             self._process_category,
             "processor",
-            self._executor_wrapper,
+            defaults.executor_wrapper,
             self._processor,
             chunk,
             self._dataset_metadata,
@@ -586,7 +583,7 @@ class Pipeline:
             self._reduce_priority,
             self._reduce_category,
             "reducer",
-            self._reducer_wrapper,
+            defaults.reducer_wrapper,
             self._reducer,
             [item.handle.file for item in group],
             is_final,
