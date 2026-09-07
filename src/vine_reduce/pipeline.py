@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Literal, Protocol
 from uuid import uuid4
 
 from . import defaults
@@ -209,7 +209,11 @@ class _FileProgress:
 @dataclass
 class _ChunkTask:
     chunk: Chunk
-    attempts_used: int = 0
+    attempts: int = 0
+
+    @property
+    def size(self) -> int:
+        return self.chunk.num_events
 
 
 @dataclass
@@ -218,6 +222,14 @@ class _ReduceTask:
     is_final: bool
     is_checkpoint: bool
     force_final: bool = False
+
+    @property
+    def size(self) -> int:
+        return len(self.group)
+
+    @property
+    def attempts(self) -> int:
+        return max((item.attempts for item in self.group), default=0)
 
 
 class Pipeline:
@@ -481,7 +493,7 @@ class Pipeline:
         there is nothing left to submit right now."""
         if self._retry_chunks:
             task = self._retry_chunks.pop()
-            chunk, attempts_used = task.chunk, task.attempts_used
+            chunk, attempts_used = task.chunk, task.attempts
             # A retry chunk may predate the last chunksize halving; re-split it
             # so we actually retry at the smaller size, not the size that just
             # failed. A split is a fresh start for both pieces - see
@@ -636,7 +648,7 @@ class Pipeline:
 
     def _handle_chunk_runtime_failure(self, task: _ChunkTask, outcome: RuntimeFailure) -> None:
         chunk = task.chunk
-        attempts_used = task.attempts_used + 1
+        attempts_used = task.attempts + 1
         self._record_chunk_failure(chunk)
         if attempts_used >= self._attempts:
             if self._give_up_on_file(
@@ -831,7 +843,7 @@ class Pipeline:
 
     def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
         group = task.group
-        attempts_used = 1 + max((item.attempts for item in group), default=0)
+        attempts_used = task.attempts + 1
         self.reduce_tasks_failed += 1
         if attempts_used >= self._attempts:
             self._give_up_on_reduction(
