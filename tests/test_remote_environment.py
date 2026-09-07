@@ -10,6 +10,7 @@ import pytest
 
 from vine_reduce import remote_environment as re_mod
 from vine_reduce.remote_environment import (
+    _DIRTY,
     UnstagedChanges,
     _check_pack_dependencies,
     _combined_commit_key,
@@ -72,8 +73,8 @@ def test_combined_commit_key_with_no_editable_packages_is_fixed():
     assert _combined_commit_key({}) == "fixed"
 
 
-def test_combined_commit_key_is_head_if_any_package_is_head():
-    assert _combined_commit_key({"a": "abc123", "b": "HEAD"}) == "HEAD"
+def test_combined_commit_key_is_dirty_if_any_package_is_dirty():
+    assert _combined_commit_key({"a": "abc123", "b": _DIRTY}) == _DIRTY
 
 
 def test_combined_commit_key_is_deterministic_hash_of_clean_commits():
@@ -81,7 +82,7 @@ def test_combined_commit_key_is_deterministic_hash_of_clean_commits():
     first = _combined_commit_key(commits)
     second = _combined_commit_key(commits)
     assert first == second
-    assert first != "HEAD" and first != "fixed"
+    assert first != _DIRTY and first != "fixed"
 
 
 def _git(path, *args):
@@ -111,10 +112,10 @@ def test_local_pip_commits_reports_commit_for_clean_checkout(git_repo):
     assert commits["pkg"] == expected
 
 
-def test_local_pip_commits_reports_head_for_unstaged_watched_change(git_repo):
+def test_local_pip_commits_reports_dirty_for_unstaged_watched_change(git_repo):
     (git_repo / "src" / "pkg.py").write_text("x = 2\n")
     commits = _local_pip_commits({"pkg": str(git_repo)}, {"pkg": ["src", "pyproject.toml"]})
-    assert commits["pkg"] == "HEAD"
+    assert commits["pkg"] == _DIRTY
 
 
 def test_local_pip_commits_ignores_unwatched_paths(git_repo):
@@ -151,7 +152,7 @@ def test_trim_cache_never_removes_the_kept_paths(tmp_path):
 def test_get_environment_reuses_cache_without_rebuilding(tmp_path, monkeypatch):
     build_calls = []
 
-    def fake_create(env_path, conda_env_path, editable, force=False):
+    def fake_create(env_path, conda_env_path, paths_by_package, force=False):
         build_calls.append(env_path)
         with open(env_path, "wb"):
             pass
@@ -175,7 +176,7 @@ def test_get_environment_unstaged_fail_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(
         re_mod, "_find_editable_pip_installs", lambda: {"vine_reduce": "/some/path"}
     )
-    monkeypatch.setattr(re_mod, "_local_pip_commits", lambda paths, watch: {"vine_reduce": "HEAD"})
+    monkeypatch.setattr(re_mod, "_local_pip_commits", lambda paths, watch: {"vine_reduce": _DIRTY})
     monkeypatch.setattr(re_mod, "_environment_state_hash", lambda conda_env_path: "abc123")
 
     with pytest.raises(UnstagedChanges) as exc_info:
@@ -187,7 +188,7 @@ def test_get_environment_unstaged_fail_raises(tmp_path, monkeypatch):
 def test_get_environment_unstaged_rebuild_forces_create_env(tmp_path, monkeypatch):
     seen_force = []
 
-    def fake_create(env_path, conda_env_path, editable, force=False):
+    def fake_create(env_path, conda_env_path, paths_by_package, force=False):
         seen_force.append(force)
         with open(env_path, "wb"):
             pass
@@ -196,7 +197,7 @@ def test_get_environment_unstaged_rebuild_forces_create_env(tmp_path, monkeypatc
     monkeypatch.setattr(
         re_mod, "_find_editable_pip_installs", lambda: {"vine_reduce": "/some/path"}
     )
-    monkeypatch.setattr(re_mod, "_local_pip_commits", lambda paths, watch: {"vine_reduce": "HEAD"})
+    monkeypatch.setattr(re_mod, "_local_pip_commits", lambda paths, watch: {"vine_reduce": _DIRTY})
     monkeypatch.setattr(re_mod, "_environment_state_hash", lambda conda_env_path: "abc123")
     monkeypatch.setattr(re_mod, "_create_env", fake_create)
 

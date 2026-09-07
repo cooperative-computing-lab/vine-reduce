@@ -63,6 +63,12 @@ _DEFAULT_CACHE_DIR = Path.cwd() / "vine_reduce-envs"
 # "changed" for the cache key - see _local_pip_commits.
 _DEFAULT_PIP_EDITABLE: dict[str, list[str]] = {"vine_reduce": ["src", "pyproject.toml"]}
 
+# Sentinel commit value meaning "treat as dirty, always rebuild" - used both
+# when a watched package has uncommitted changes and when its commit can't be
+# determined at all (e.g. not a git checkout). Deliberately not a real commit
+# hash so it can never collide with one.
+_DIRTY = "dirty"
+
 
 class UnstagedChanges(Exception):
     """Raised by get_environment(unstaged="fail") when a watched, locally-
@@ -111,7 +117,7 @@ def _check_pack_dependencies() -> None:
 
 
 def _create_env(
-    env_path: str, conda_env_path: str, editable: dict[str, str], force: bool = False
+    env_path: str, conda_env_path: str, paths_by_package: dict[str, str], force: bool = False
 ) -> str:
     if force:
         logger.info("Forcing rebuild of %s", env_path)
@@ -122,7 +128,7 @@ def _create_env(
 
     _check_pack_dependencies()
 
-    for package, path in editable.items():
+    for package, path in paths_by_package.items():
         logger.info("Reinstalling %s non-editable for packing", package)
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", path],
@@ -139,7 +145,7 @@ def _create_env(
         logger.error(e.output.decode())
         raise
     finally:
-        for package, path in editable.items():
+        for package, path in paths_by_package.items():
             logger.info("Reinstalling %s editable", package)
             subprocess.check_call(
                 [
@@ -174,11 +180,42 @@ def _find_editable_pip_installs() -> dict[str, str]:
     return paths_by_package
 
 
+def _git_head(path: str) -> str:
+    """The current commit hash of the git checkout at path."""
+    return (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=path, stdin=subprocess.DEVNULL)
+        .decode()
+        .rstrip()
+    )
+
+
+def _git_dirty(path: str, pathspecs: list[str]) -> str:
+    """`git status --porcelain` output for path, restricted to pathspecs -
+    empty means clean. Falls back to an unrestricted status check if the
+    pathspecs themselves are rejected by git (e.g. an unsupported magic)."""
+    status_cmd = ["git", "status", "--porcelain", "--untracked-files=no"]
+    try:
+        return (
+            subprocess.check_output(status_cmd + pathspecs, cwd=path, stdin=subprocess.DEVNULL)
+            .decode()
+            .rstrip()
+        )
+    except subprocess.CalledProcessError:
+        logger.warning(
+            "Could not apply git paths-to-watch filters for %s; trying without them", path
+        )
+        return (
+            subprocess.check_output(status_cmd, cwd=path, stdin=subprocess.DEVNULL)
+            .decode()
+            .rstrip()
+        )
+
+
 def _local_pip_commits(
     paths_by_package: dict[str, str], pip_editable: dict[str, list[str]]
 ) -> dict[str, str]:
     """For each editable package, the git commit of its checkout, or the
-    sentinel "HEAD" if the watched paths have uncommitted changes (or the
+    sentinel _DIRTY if the watched paths have uncommitted changes (or the
     checkout isn't a git repo at all - safest default is to always rebuild)."""
     commits: dict[str, str] = {}
     for package, path in paths_by_package.items():
@@ -186,54 +223,30 @@ def _local_pip_commits(
             watch_paths = pip_editable.get(package)
             pathspecs = [f":(top){p}" for p in watch_paths] if watch_paths else []
 
-            commit = (
-                subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=path, stdin=subprocess.DEVNULL
-                )
-                .decode()
-                .rstrip()
-            )
-
-            status_cmd = ["git", "status", "--porcelain", "--untracked-files=no"]
-            try:
-                changed = (
-                    subprocess.check_output(
-                        status_cmd + pathspecs, cwd=path, stdin=subprocess.DEVNULL
-                    )
-                    .decode()
-                    .rstrip()
-                )
-            except subprocess.CalledProcessError:
-                logger.warning(
-                    "Could not apply git paths-to-watch filters for %s; trying without them", path
-                )
-                changed = (
-                    subprocess.check_output(status_cmd, cwd=path, stdin=subprocess.DEVNULL)
-                    .decode()
-                    .rstrip()
-                )
+            commit = _git_head(path)
+            changed = _git_dirty(path, pathspecs)
 
             if changed:
                 logger.warning("Found unstaged changes in %s:\n%s", path, changed)
-                commits[package] = "HEAD"
+                commits[package] = _DIRTY
             else:
                 commits[package] = commit
         except Exception as e:
             logger.warning("Could not get current commit of %r: %s", path, e)
-            commits[package] = "HEAD"
+            commits[package] = _DIRTY
     return commits
 
 
 def _combined_commit_key(commits: dict[str, str]) -> str:
     """The editable-installs half of the cache key: one hash over every
-    editable package's commit, or the "HEAD" sentinel if any of them has
+    editable package's commit, or the _DIRTY sentinel if any of them has
     uncommitted changes (see _local_pip_commits)."""
     if not commits:
         return "fixed"
     values = list(commits.values())
-    if "HEAD" in values:
+    if _DIRTY in values:
         # always rebuild rather than trust a cache entry that might be stale
-        return "HEAD"
+        return _DIRTY
     return hashlib.sha256("".join(values).encode()).hexdigest()[:8]
 
 
@@ -304,8 +317,8 @@ def get_environment(
     env_path = str(cache_dir / f"env_{env_hash}_edit_{pip_check}.tar.gz")
     _trim_cache(cache_dir, cache_size, env_path)
 
-    if pip_check == "HEAD":
-        changed = [p for p, c in commits.items() if c == "HEAD"]
+    if pip_check == _DIRTY:
+        changed = [p for p, c in commits.items() if c == _DIRTY]
         if unstaged == "fail":
             raise UnstagedChanges(changed)
         force = True
