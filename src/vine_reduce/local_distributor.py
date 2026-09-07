@@ -228,8 +228,10 @@ class LocalDistributor:
     def shutdown(self) -> None:
         """Shut down the process pool and, if this distributor created its
         own work_dir, remove it. checkpoint_dir is never removed here -
-        see the module docstring."""
-        self._pool.shutdown(wait=True)
+        see the module docstring. cancel_futures drops any submitted-but-
+        not-yet-started calls so an abort doesn't block waiting for work
+        that no longer matters."""
+        self._pool.shutdown(wait=True, cancel_futures=True)
         if self._owns_work_dir:
             shutil.rmtree(self._work_dir, ignore_errors=True)
 
