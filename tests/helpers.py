@@ -25,6 +25,26 @@ def count_events(chunk):
     return chunk.stop - chunk.start
 
 
+def submit_chunk(distributor, priority, chunk, is_checkpoint=False):
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
+        priority,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        count_events,
+        chunk,
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        SimpleExecutor(),
+        is_checkpoint=is_checkpoint,
+    )
+    return result_id
+
+
 def sum_reducer(a, b):
     return a + b
 

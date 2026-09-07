@@ -11,7 +11,13 @@ from vine_reduce.executor import SimpleExecutor
 from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.types import Chunk, RuntimeFailure, Success
 
-from helpers import count_events, crashing_processor, failing_processor, read_env_var
+from helpers import (
+    count_events,
+    crashing_processor,
+    failing_processor,
+    read_env_var,
+    submit_chunk,
+)
 
 
 @pytest.fixture
@@ -25,27 +31,8 @@ def distributor(tmp_path):
     dist.shutdown()
 
 
-def _submit_chunk(distributor, priority, chunk):
-    result_id = uuid4().hex
-    distributor.submit(
-        result_id,
-        priority,
-        "test:process",
-        "processor",
-        executor_wrapper,
-        count_events,
-        chunk,
-        {},
-        None,
-        None,
-        default_chunk_to_args,
-        SimpleExecutor(),
-    )
-    return result_id
-
-
 def test_submit_and_wait_round_trip(distributor):
-    result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+    result_id = submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
 
     outcome = distributor.wait(timeout=30)
 
@@ -86,14 +73,14 @@ def test_wait_survives_a_dead_worker_subprocess(distributor):
     assert outcome.result_id == result_id
 
     # The pool must have been rebuilt: a normal call still works afterward.
-    follow_up = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+    follow_up = submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
     follow_up_outcome = distributor.wait(timeout=30)
     assert isinstance(follow_up_outcome, Success)
     assert follow_up_outcome.result_id == follow_up
 
 
 def test_retrieve_copies_file(distributor, tmp_path):
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
+    submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
     outcome = distributor.wait(timeout=30)
 
     dest = tmp_path / "copy.pkl.zst"
@@ -103,7 +90,7 @@ def test_retrieve_copies_file(distributor, tmp_path):
 
 
 def test_release_result_removes_file(distributor):
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
+    submit_chunk(distributor, 1, Chunk("a.root", 0, 3))
     outcome = distributor.wait(timeout=30)
 
     distributor.release_result(outcome.result_id)
@@ -114,7 +101,7 @@ def test_release_result_removes_file(distributor):
 def test_capacity_reports_available_capacity(distributor):
     # 2 workers -> target queue depth of 4, nothing in flight yet
     assert distributor.capacity() == 4
-    _submit_chunk(distributor, 1, Chunk("a.root", 0, 100000))
+    submit_chunk(distributor, 1, Chunk("a.root", 0, 100000))
     assert distributor.capacity() == 3
 
 
@@ -127,7 +114,7 @@ def test_add_file_is_a_no_op_that_does_not_raise(distributor, tmp_path):
 
 
 def test_checkpoint_result_is_written_to_checkpoint_dir_not_work_dir(distributor, tmp_path):
-    result_id = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+    result_id = submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
     checkpoint_id = uuid4().hex
     distributor.submit(
         checkpoint_id,
@@ -215,7 +202,7 @@ def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
 def test_shutdown_removes_owned_work_dir(tmp_path):
     dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
     work_dir = dist._work_dir
-    _submit_chunk(dist, 1, Chunk("a.root", 0, 5))
+    submit_chunk(dist, 1, Chunk("a.root", 0, 5))
     dist.wait(timeout=30)
 
     dist.shutdown()
