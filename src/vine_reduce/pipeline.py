@@ -425,9 +425,34 @@ class Pipeline:
         e.g. an empty dataset, or one covered by seeded checkpoints for every
         file but not yet marked finished at construction."""
         if not self.finished:
+            self._check_chunk_coverage()
             self.finished = self.chunks_all_done and not self.pool and self.in_flight_count() == 0
             if self.finished:
                 self._log_size_once()
+
+    def _check_chunk_coverage(self) -> None:
+        """Once chunk generation is exhausted and no chunk task (fresh or
+        retry) is pending or in flight, every file must be gone from
+        _files_in_progress - a file only leaves it once covered_events
+        reaches num_entries (see _handle_chunk_success). A custom
+        datasets_to_chunks that under-covers a file (or omits it entirely)
+        would otherwise leave it there forever: chunks_all_done never
+        becomes True and the run hangs with no diagnostic (Correctness
+        #11)."""
+        if (
+            self._generator_exhausted
+            and not self._retry_chunks
+            and not any(isinstance(t, _ChunkTask) for t in self._in_flight.values())
+            and self._files_in_progress
+        ):
+            under_covered = ", ".join(
+                f"{url!r} ({progress.covered_events}/{progress.num_entries} events)"
+                for url, progress in sorted(self._files_in_progress.items())
+            )
+            raise VineReduceError(
+                f"datasets_to_chunks for processor {self.processor_name!r}, "
+                f"dataset {self.dataset_name!r} exhausted without covering: {under_covered}"
+            )
 
     @property
     def chunks_all_done(self) -> bool:

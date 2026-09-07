@@ -59,6 +59,7 @@ def make_pipeline(
     failure_proportion=0.0,
     failure_log=None,
     size_log=None,
+    datasets_to_chunks=None,
 ):
     db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
     total_events = sum(dataset["files"].values())
@@ -70,7 +71,7 @@ def make_pipeline(
             dataset=dataset,
             distributor=fake_distributor,
             db=db,
-            datasets_to_chunks=defaults.default_datasets_to_chunks,
+            datasets_to_chunks=datasets_to_chunks or defaults.default_datasets_to_chunks,
             chunk_to_args=defaults.default_chunk_to_args,
             executor=SimpleExecutor(),
             executor_wrapper=defaults.executor_wrapper,
@@ -118,6 +119,25 @@ def final_value(pipeline):
     # its distributor handle is gone by then (see Pipeline._checkpoint).
     assert len(pipeline.final_results) == 1
     return serialization.load(pipeline.final_results[0].checkpoint.path)
+
+
+def test_under_covering_chunker_raises_instead_of_hanging(fake_distributor, tmp_path):
+    def under_covering_datasets_to_chunks(dataset, current_chunksize, skip_files=None):
+        # Yields a chunk covering only 3 of a.root's 5 declared events,
+        # mimicking a buggy custom datasets_to_chunks (Correctness #11).
+        yield Chunk("a.root", 0, 3)
+
+    dataset = {"files": {"a.root": 5}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        datasets_to_chunks=under_covering_datasets_to_chunks,
+    )
+
+    with pytest.raises(VineReduceError, match="a.root"):
+        run_to_completion(pipeline, fake_distributor)
+    db.close()
 
 
 def test_pools_across_files_and_produces_one_final_result(fake_distributor, tmp_path):
