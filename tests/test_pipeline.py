@@ -1065,7 +1065,7 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
         is_final=False,
         is_checkpoint=False,
     )
-    assert pipeline.reduce_tasks_submitted == 0
+    assert pipeline.counters.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
         ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
@@ -1076,7 +1076,7 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
     assert pipeline.pool[:2] == items
     # Re-pooled, not resubmitted directly - submit_ready_reductions is what
     # will re-split it at the new size on the next cycle.
-    assert pipeline.reduce_tasks_submitted == 0
+    assert pipeline.counters.reduce_tasks_submitted == 0
     assert len(pipeline._in_flight) == 0
     db.close()
 
@@ -1136,7 +1136,7 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
         is_checkpoint=True,
         force_final=True,
     )
-    assert pipeline.reduce_tasks_submitted == 0
+    assert pipeline.counters.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
         ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
@@ -1147,7 +1147,7 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
     assert pipeline.pool[:5] == items
     # Re-pooled, not resubmitted directly - submit_ready_reductions is what
     # will re-split it into properly-sized groups on the next cycle.
-    assert pipeline.reduce_tasks_submitted == 0
+    assert pipeline.counters.reduce_tasks_submitted == 0
     assert len(pipeline._in_flight) == 0
     db.close()
 

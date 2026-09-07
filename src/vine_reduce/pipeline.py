@@ -258,6 +258,35 @@ class _ReduceTask:
         return max((item.attempts for item in self.group), default=0)
 
 
+@dataclass
+class ProgressCounters:
+    """Progress-bar counters for one pipeline, read directly by progress.py -
+    cumulative across the whole run, not reset on retry, so its totals
+    estimate has a stable ratio to extrapolate from."""
+
+    events_completed: int = 0
+    events_failed: int = 0
+    events_submitted: int = 0
+    proc_tasks_completed: int = 0
+    proc_tasks_failed: int = 0
+    proc_tasks_submitted: int = 0
+    reduce_tasks_completed: int = 0
+    reduce_tasks_failed: int = 0
+    reduce_tasks_submitted: int = 0
+
+    @classmethod
+    def summed(cls, pipelines: "list[Pipeline]") -> "ProgressCounters":
+        total = cls()
+        for pipeline in pipelines:
+            for field_name in total.__dataclass_fields__:
+                setattr(
+                    total,
+                    field_name,
+                    getattr(total, field_name) + getattr(pipeline.counters, field_name),
+                )
+        return total
+
+
 class Pipeline:
     """Drives one (processor, dataset) pair from chunk generation through to
     its final result(s), including checkpointing and restart."""
@@ -346,20 +375,11 @@ class Pipeline:
         self._failed_files: set[str] = set()
         self._files_concluded = 0
 
-        # Progress-bar counters, read directly by progress.py - cumulative
-        # across the whole run, not reset on retry, so its totals estimate
-        # has a stable ratio to extrapolate from. events_total is fixed at
-        # construction; the dataset dict is never mutated after this.
+        # events_total is fixed at construction; the dataset dict is never
+        # mutated after this. The rest of the progress-bar counters live on
+        # self.counters (see ProgressCounters), read directly by progress.py.
         self.events_total = sum(dataset["files"].values())
-        self.events_completed = 0
-        self.events_failed = 0
-        self.events_submitted = 0
-        self.proc_tasks_completed = 0
-        self.proc_tasks_failed = 0
-        self.proc_tasks_submitted = 0
-        self.reduce_tasks_completed = 0
-        self.reduce_tasks_failed = 0
-        self.reduce_tasks_submitted = 0
+        self.counters = ProgressCounters()
 
         self._seed_from_checkpoints()
         if self.finished:
@@ -417,11 +437,11 @@ class Pipeline:
         return len(self._in_flight)
 
     # -- progress-bar counters -----------------------------------------------
-    # events_completed/failed/submitted, proc_tasks_completed/failed/submitted,
-    # and reduce_tasks_completed/failed/submitted are plain public attributes
-    # (see __init__) - progress.py reads them directly and sums them across
-    # every pipeline sharing a processor_name for its four aggregate bars (see
-    # ProgressReporter). Only the derived counts below need actual logic.
+    # self.counters (see ProgressCounters) is a plain public attribute -
+    # progress.py reads it directly and sums it (via ProgressCounters.summed)
+    # across every pipeline sharing a processor_name for its four aggregate
+    # bars (see ProgressReporter). Only the derived counts below need actual
+    # logic.
 
     @property
     def events_safe(self) -> int:
@@ -567,8 +587,8 @@ class Pipeline:
             self._executor,
         )
         self._in_flight[result_id] = task
-        self.proc_tasks_submitted += 1
-        self.events_submitted += chunk.num_events
+        self.counters.proc_tasks_submitted += 1
+        self.counters.events_submitted += chunk.num_events
 
     # -- reduction pool ------------------------------------------------------
 
@@ -628,7 +648,7 @@ class Pipeline:
             is_checkpoint=is_checkpoint,
             force_final=force_final,
         )
-        self.reduce_tasks_submitted += 1
+        self.counters.reduce_tasks_submitted += 1
 
     # -- outcome handling ------------------------------------------------------
 
@@ -669,8 +689,8 @@ class Pipeline:
         self.refresh_finished()
 
     def _record_chunk_failure(self, chunk: Chunk) -> None:
-        self.proc_tasks_failed += 1
-        self.events_failed += chunk.num_events
+        self.counters.proc_tasks_failed += 1
+        self.counters.events_failed += chunk.num_events
 
     def _handle_chunk_runtime_failure(self, task: _ChunkTask, outcome: RuntimeFailure) -> None:
         chunk = task.chunk
@@ -734,8 +754,8 @@ class Pipeline:
 
     def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
         chunk = task.chunk
-        self.proc_tasks_completed += 1
-        self.events_completed += chunk.num_events
+        self.counters.proc_tasks_completed += 1
+        self.counters.events_completed += chunk.num_events
         _update_resource_max(self._processing_max, outcome.resources)
         wall_time_s = outcome.resources.wall_time_s or 0.0
         memory_mb = outcome.resources.memory_mb or 0.0
@@ -832,7 +852,7 @@ class Pipeline:
         self, task: _ReduceTask, outcome: ResourceExhaustion
     ) -> None:
         group = task.group
-        self.reduce_tasks_failed += 1
+        self.counters.reduce_tasks_failed += 1
         decision = _shrink_decision(task.size, self.reduction_size, self._minimum_reduction_size)
         if decision is _ShrinkDecision.GIVE_UP:
             self._give_up_on_reduction(
@@ -863,7 +883,7 @@ class Pipeline:
     def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
         group = task.group
         attempts_used = task.attempts + 1
-        self.reduce_tasks_failed += 1
+        self.counters.reduce_tasks_failed += 1
         if attempts_used >= self._attempts:
             self._give_up_on_reduction(
                 group,
@@ -914,7 +934,7 @@ class Pipeline:
             return
 
         assert isinstance(outcome, Success)
-        self.reduce_tasks_completed += 1
+        self.counters.reduce_tasks_completed += 1
         _update_resource_max(self._reduction_max, outcome.resources)
         # group's own handles are deliberately not released here: new_item
         # isn't durable yet, so if it's lost before something checkpoints

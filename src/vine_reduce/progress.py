@@ -42,7 +42,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
-from .pipeline import TaskReport
+from .pipeline import ProgressCounters, TaskReport
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline
@@ -244,35 +244,30 @@ class ProgressReporter:
         return table
 
     def _add_processor_rows(self, table: Table, name: str, procs: list["Pipeline"]) -> None:
-        events_completed = sum(p.events_completed for p in procs)
-        events_failed = sum(p.events_failed for p in procs)
+        counters = ProgressCounters.summed(procs)
         events_safe = sum(p.events_safe for p in procs)
         events_total = sum(p.events_total for p in procs)
 
-        proc_completed = sum(p.proc_tasks_completed for p in procs)
-        proc_failed = sum(p.proc_tasks_failed for p in procs)
         proc_total = _proc_tasks_total(
             events_total=events_total,
-            events_submitted=sum(p.events_submitted for p in procs),
-            submitted=sum(p.proc_tasks_submitted for p in procs),
-            failed=proc_failed,
+            events_submitted=counters.events_submitted,
+            submitted=counters.proc_tasks_submitted,
+            failed=counters.proc_tasks_failed,
         )
-        proc = (proc_completed, proc_failed, proc_total)
+        proc = (counters.proc_tasks_completed, counters.proc_tasks_failed, proc_total)
 
-        reduce_completed = sum(p.reduce_tasks_completed for p in procs)
-        reduce_failed = sum(p.reduce_tasks_failed for p in procs)
         reduce_total = _reduce_tasks_total(
             proc_total=proc_total,
-            proc_completed=proc_completed,
-            reduce_submitted=sum(p.reduce_tasks_submitted for p in procs),
-            reduce_failed=reduce_failed,
-            reduce_completed=reduce_completed,
+            proc_completed=counters.proc_tasks_completed,
+            reduce_submitted=counters.reduce_tasks_submitted,
+            reduce_failed=counters.reduce_tasks_failed,
+            reduce_completed=counters.reduce_tasks_completed,
             # reduction_size can diverge across a processor's pipelines (each
             # halves independently on resource exhaustion) - the smallest
             # current value gives the most folds, the safer (larger) estimate.
             fold_size=min(p.reduction_size for p in procs),
         )
-        reduce_ = (reduce_completed, reduce_failed, reduce_total)
+        reduce_ = (counters.reduce_tasks_completed, counters.reduce_tasks_failed, reduce_total)
 
         datasets_total = len(procs)
         datasets_completed = sum(1 for p in procs if p.finished)
@@ -281,8 +276,10 @@ class ProgressReporter:
         table.add_row("reductions", _bar(*reduce_), _counts_colored(*reduce_))
         table.add_row(
             "events",
-            _bar(events_completed, events_failed, events_total),
-            _counts_colored(events_completed, events_failed, events_total, safe=events_safe),
+            _bar(counters.events_completed, counters.events_failed, events_total),
+            _counts_colored(
+                counters.events_completed, counters.events_failed, events_total, safe=events_safe
+            ),
         )
         table.add_row(
             "datasets",
