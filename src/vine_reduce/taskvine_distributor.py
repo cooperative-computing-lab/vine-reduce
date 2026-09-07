@@ -396,10 +396,22 @@ class TaskVineDistributor(Distributor):
         - may differ from the category's static resources_processor/
         resources_reducer cap once automatic resource allocation ("max"
         mode - see _configure_category) starts adapting per task from
-        measured history. None if TaskVine has no allocation info for it,
-        so the caller falls back to that static cap (see Pipeline.
-        _report_task) instead of a misleading zero."""
-        return self._rmsummary_to_dict(task.resources_allocated)
+        measured history. None if TaskVine has no allocation info for it
+        at all, so the caller falls back to that static cap (see Pipeline.
+        _report_task). Individual fields with no known allocation (e.g.
+        wall_time_s, which isn't a cap TaskVine tracks) are simply omitted
+        rather than reported as a misleading zero."""
+        summary = task.resources_allocated
+        if summary is None:
+            return None
+        allocated: dict[str, Any] = {}
+        if summary.cores:
+            allocated["cores"] = summary.cores
+        if summary.memory:
+            allocated["memory_mb"] = summary.memory
+        if summary.wall_time:
+            allocated["wall_time_s"] = summary.wall_time / 1e6
+        return allocated
 
     @staticmethod
     def _rmsummary_to_dict(summary: Any) -> dict[str, Any] | None:
