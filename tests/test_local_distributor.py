@@ -9,9 +9,9 @@ from vine_reduce import serialization
 from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
 from vine_reduce.executor import SimpleExecutor
 from vine_reduce.local_distributor import LocalDistributor
-from vine_reduce.types import Chunk, Success
+from vine_reduce.types import Chunk, RuntimeFailure, Success
 
-from helpers import count_events, read_env_var
+from helpers import count_events, crashing_processor, failing_processor, read_env_var
 
 
 @pytest.fixture
@@ -56,6 +56,40 @@ def test_submit_and_wait_round_trip(distributor):
 
 def test_wait_returns_none_when_nothing_pending(distributor):
     assert distributor.wait(timeout=0.1) is None
+
+
+def test_wait_survives_a_dead_worker_subprocess(distributor):
+    """A worker subprocess that dies outright (os._exit, segfault, OOM-kill)
+    breaks the whole ProcessPoolExecutor - future.result() would normally
+    raise BrokenProcessPool, but wait() must turn that into a RuntimeFailure
+    like any other failed call (Correctness #3), and rebuild the pool so a
+    later submission still works."""
+    result_id = uuid4().hex
+    distributor.submit(
+        result_id,
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        crashing_processor,
+        Chunk("a.root", 0, 5),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        SimpleExecutor(),
+    )
+
+    outcome = distributor.wait(timeout=30)
+
+    assert isinstance(outcome, RuntimeFailure)
+    assert outcome.result_id == result_id
+
+    # The pool must have been rebuilt: a normal call still works afterward.
+    follow_up = _submit_chunk(distributor, 1, Chunk("a.root", 0, 5))
+    follow_up_outcome = distributor.wait(timeout=30)
+    assert isinstance(follow_up_outcome, Success)
+    assert follow_up_outcome.result_id == follow_up
 
 
 def test_retrieve_copies_file(distributor, tmp_path):

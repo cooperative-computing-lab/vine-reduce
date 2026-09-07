@@ -18,7 +18,7 @@ from vine_reduce.pipeline import (
     plan_restart,
 )
 from vine_reduce.size_log import SizeLog
-from vine_reduce.types import Chunk, ResourceExhaustion, ResultHandle
+from vine_reduce.types import Chunk, ResourceExhaustion, ResultHandle, RuntimeFailure
 
 from helpers import (
     count_events,

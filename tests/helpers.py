@@ -37,6 +37,10 @@ def exhausting_processor(chunk):
     raise MemoryError("simulated resource exhaustion")
 
 
+def crashing_processor(chunk):
+    os._exit(1)  # simulates a segfault/OOM-kill: no exception, no return
+
+
 def make_flaky_n_times(n):
     """Returns a processor that raises ValueError on its first `n` calls
     (across all chunks - a single shared counter), then succeeds like

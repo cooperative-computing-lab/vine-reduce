@@ -29,13 +29,20 @@ import itertools
 import os
 import shutil
 import tempfile
+import traceback as traceback_module
 from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 from uuid import uuid4
 
 import cloudpickle
 
-from .types import Outcome, RawOutcome
+from .types import Outcome, RawOutcome, RuntimeFailure
+
+# Placeholder usage for a call whose outcome had to be synthesized rather
+# than measured (see wait()'s BrokenProcessPool handling) - mirrors
+# defaults.py's _unmeasured_resources.
+_UNMEASURED_RESOURCES = {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
 
 
 def _run_cloudpickled(payload: bytes) -> Any:
@@ -85,7 +92,13 @@ class LocalDistributor:
         # priority so the largest one pops first, seq to break ties in
         # submission order.
         self._pending: list[tuple[int, int, str, Callable, tuple, bool]] = []
-        self._running: dict[Future, str] = {}  # future -> result_id, while dispatched
+        # future -> (result_id, dest_file), while dispatched - dest_file is
+        # needed on completion regardless of outcome: _run_and_wrap always
+        # writes it (even on failure/exhaustion, as a placeholder - see its
+        # docstring), and wait() must remove that placeholder on anything
+        # but Success or it accumulates forever, notably under
+        # checkpoint_dir, which shutdown() never touches (Correctness #7).
+        self._running: dict[Future, tuple[str, str]] = {}
         self._files: dict[str, str] = {}  # result_id -> file, for completed Successes
         self._env_vars: dict[str, str] = {}
 
@@ -114,11 +127,17 @@ class LocalDistributor:
             base_dir = self._checkpoint_dir if is_checkpoint else self._work_dir
             dest_file = os.path.join(base_dir, f"{uuid4().hex}.pkl.zst")
             payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
-            self._running[self._pool.submit(_run_cloudpickled, payload)] = result_id
+            self._running[self._pool.submit(_run_cloudpickled, payload)] = (result_id, dest_file)
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
         """Block until a queued call finishes, returning its Outcome, or
-        None if timeout elapses (or nothing is running) first."""
+        None if timeout elapses (or nothing is running) first. Never raises
+        for a task-level fault: a worker subprocess that dies outright
+        (os._exit, segfault, OOM-kill) breaks the whole pool, so
+        future.result() would otherwise raise BrokenProcessPool here - that
+        is caught and turned into a RuntimeFailure like any other failed
+        call, and the pool is rebuilt so later submissions aren't stuck on
+        a dead one."""
         if not self._running:
             return None
         done, _ = concurrent.futures.wait(
@@ -128,11 +147,28 @@ class LocalDistributor:
             return None
 
         future = next(iter(done))
-        result_id = self._running.pop(future)
+        result_id, dest_file = self._running.pop(future)
 
-        raw: RawOutcome = future.result()
+        try:
+            raw: RawOutcome = future.result()
+        except BrokenProcessPool:
+            self._pool.shutdown(wait=False)
+            self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
+            if os.path.exists(dest_file):
+                os.remove(dest_file)
+            outcome: Outcome = RuntimeFailure(
+                result_id=result_id,
+                resources=_UNMEASURED_RESOURCES,
+                std_output=None,
+                traceback=traceback_module.format_exc(),
+            )
+            self._dispatch()
+            return outcome
+
         if raw.status == "success":
             self._files[result_id] = raw.file
+        elif os.path.exists(dest_file):
+            os.remove(dest_file)
         outcome = raw.to_outcome(result_id)
 
         self._dispatch()

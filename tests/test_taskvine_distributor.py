@@ -16,7 +16,11 @@ from vine_reduce.defaults import (  # noqa: E402
     reducer_wrapper,
 )
 from vine_reduce.executor import SimpleExecutor  # noqa: E402
-from vine_reduce.taskvine_distributor import TaskVineDistributor, _result_token  # noqa: E402
+from vine_reduce.taskvine_distributor import (  # noqa: E402
+    TaskVineDistributor,
+    _InFlight,
+    _result_token,
+)
 from vine_reduce.types import Chunk, RuntimeFailure, Success  # noqa: E402
 
 from helpers import (  # noqa: E402

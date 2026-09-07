@@ -326,7 +326,20 @@ class TaskVineDistributor:
         result_id, kind = entry.result_id, entry.kind
 
         if task.successful():
-            raw: RawOutcome = task.output
+            raw = task.output
+            if not isinstance(raw, RawOutcome):
+                # cloudpickle.load of the task's output failed on the
+                # manager side; PythonTask.output then hands back the
+                # exception object it raised, not a RawOutcome - task-level
+                # (the wrapper really did run and return something), not a
+                # reason to let wait() itself raise.
+                self.release_result(result_id)
+                return RuntimeFailure(
+                    result_id=result_id,
+                    resources=self._resources_from_task(task, kind),
+                    std_output=task.std_output,
+                    traceback=f"failed to load task output: {raw!r}",
+                )
             outcome = raw.to_outcome(result_id, std_output=task.std_output)
             if not isinstance(outcome, Success):
                 # The wrapper ran to completion but reported a Python-level
