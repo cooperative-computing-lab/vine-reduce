@@ -39,6 +39,7 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 from uuid import uuid4
 
+from .distributor import Distributor
 from .executor import CloudpickleProcessPoolExecutor
 from .types import Outcome, RuntimeFailure, Success
 
@@ -58,7 +59,7 @@ def _run_with_env(func: Callable[..., Any], args: tuple, env_vars: dict[str, str
     return func(*args)
 
 
-class LocalDistributor:
+class LocalDistributor(Distributor):
     """A Distributor that runs every processor/reducer call in a local
     ProcessPoolExecutor - the default when VineReduce is constructed without
     a `distributor=`. See the module docstring for what it is and isn't good
@@ -234,9 +235,3 @@ class LocalDistributor:
         self._pool.shutdown(wait=True, cancel_futures=True)
         if self._owns_work_dir:
             shutil.rmtree(self._work_dir, ignore_errors=True)
-
-    def __enter__(self) -> "LocalDistributor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown()

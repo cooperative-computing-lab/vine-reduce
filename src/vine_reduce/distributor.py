@@ -15,18 +15,20 @@ picks the path, it only ever sees it echoed back on `Outcome.file`.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Literal, Protocol
+import abc
+from typing import Any, Callable, Literal
 
 from .types import Outcome
 
 TaskKind = Literal["processor", "reducer"]
 
 
-class Distributor(Protocol):
+class Distributor(abc.ABC):
     """The interface VineReduce needs from a distributor. Implement this
     protocol (see LocalDistributor and TaskVineDistributor for two examples)
     to run vine_reduce against a different backend."""
 
+    @abc.abstractmethod
     def submit(
         self,
         result_id: str,
@@ -54,11 +56,13 @@ class Distributor(Protocol):
         of storage can ignore it."""
         ...
 
+    @abc.abstractmethod
     def wait(self, timeout: float | None = None) -> Outcome | None:
         """Block until a submitted call finishes, returning its Outcome, or
         return None if timeout elapses first."""
         ...
 
+    @abc.abstractmethod
     def release_result(self, result_id: str) -> None:
         """Release any resources (e.g. worker-local files) held for
         result_id. This is a hard requirement, not just cleanup: for a
@@ -70,6 +74,7 @@ class Distributor(Protocol):
         rather than deleting checkpoint files itself."""
         ...
 
+    @abc.abstractmethod
     def adopt_checkpoint(self, result_id: str, path: str) -> str:
         """Register `path` - an existing durable checkpoint file written by
         a previous run and recorded in the checkpoint store - under
@@ -81,6 +86,7 @@ class Distributor(Protocol):
         ResultHandle for use inside a later submit()'s args."""
         ...
 
+    @abc.abstractmethod
     def resources(self, kind: TaskKind) -> dict[str, Any] | None:
         """A default resource dict (e.g. {"cores": ...}) for calls of this
         kind, or None if this distributor has no meaningful default. This is
@@ -94,10 +100,12 @@ class Distributor(Protocol):
         this cap - see DaskExecutor's _num_workers)."""
         ...
 
+    @abc.abstractmethod
     def capacity(self) -> int:
         """How many more chunks the distributor could usefully accept right now."""
         ...
 
+    @abc.abstractmethod
     def retrieve(self, result_id: str, dest_path: str) -> None:
         """Copy the file for a completed (Success) result_id to dest_path, a
         path local to the vine_reduce process. Used for final results, whose
@@ -105,6 +113,7 @@ class Distributor(Protocol):
         independent of the distributor."""
         ...
 
+    @abc.abstractmethod
     def checkpoint_path(self, result_id: str) -> str:
         """Local, durable on-disk path for a completed (Success) result_id
         that was submitted with is_checkpoint=True. Unlike retrieve(), the
@@ -114,6 +123,7 @@ class Distributor(Protocol):
         submitted with is_checkpoint=True."""
         ...
 
+    @abc.abstractmethod
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """Make local_path (readable from the vine_reduce process) available,
         under remote_path (defaulting to local_path's basename), wherever
@@ -122,11 +132,13 @@ class Distributor(Protocol):
         this can be a no-op."""
         ...
 
+    @abc.abstractmethod
     def set_env_var(self, name: str, value: str) -> None:
         """Set an environment variable for every processor/reducer call
         submitted after this point."""
         ...
 
+    @abc.abstractmethod
     def shutdown(self) -> None:
         """Release whatever resources this distributor owns (worker pools,
         temp directories, ...). Also reachable via `with distributor: ...`,

@@ -64,7 +64,7 @@ from uuid import uuid4
 
 import ndcctools.taskvine as vine
 
-from .distributor import TaskKind
+from .distributor import Distributor, TaskKind
 from .types import Outcome, ResourceExhaustion, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
@@ -94,7 +94,7 @@ class _InFlight:
     kind: TaskKind
 
 
-class TaskVineDistributor:
+class TaskVineDistributor(Distributor):
     """A Distributor backed by ndcctools.taskvine, running vine_reduce
     across a cluster of TaskVine workers instead of local subprocesses. See
     the module docstring for how it bridges the Distributor protocol onto
@@ -485,9 +485,3 @@ class TaskVineDistributor:
         caller-supplied manager is left alone - it is the caller's to close."""
         if self._owns_manager:
             self._manager = None
-
-    def __enter__(self) -> "TaskVineDistributor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown()

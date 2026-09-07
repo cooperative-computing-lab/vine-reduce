@@ -895,9 +895,9 @@ cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
   `distributor_metadata["cores"]`, the distributor's static default (see "API vine_reduce <->
   distributor"); else every core on the machine (`os.process_cpu_count()`).
 
-All three inherit `__enter__`/`__exit__` (defined once, in terms of `shutdown()`) from a private
-`_ExecutorBase`, so each only implements `submit`/`shutdown` itself. See the README's
-"Executors" section for the full rundown.
+All three inherit `__enter__`/`__exit__` (defined once, in terms of `shutdown()`) from the
+`Executor` ABC (`src/vine_reduce/executor.py`), so each only implements `submit`/`shutdown`
+itself. See the README's "Executors" section for the full rundown.
 
 **Remote environments**
 
