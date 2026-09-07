@@ -637,19 +637,19 @@ class Pipeline:
         attempts_used = task.attempts_used + 1
         self._record_chunk_failure(chunk)
         if attempts_used >= self._attempts:
-            self._give_up_on_file(
+            if self._give_up_on_file(
                 chunk,
                 kind="processor",
                 attempts=attempts_used,
                 resources_measured=outcome.resources,
                 traceback=outcome.traceback,
-                abort_message=(
+            ):
+                raise VineReduceError(
                     f"processor {self.processor_name!r} failed on "
                     f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
                     f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
                     f"{outcome.traceback}"
-                ),
-            )
+                )
             return
         self._retry_chunks.append(_ChunkTask(chunk, attempts_used))
 
@@ -670,18 +670,18 @@ class Pipeline:
             self._retry_chunks.append(_ChunkTask(chunk, 0))
             return
         if current_size <= self._minimum_chunksize:
-            self._give_up_on_file(
+            if self._give_up_on_file(
                 chunk,
                 kind="processor",
                 attempts=task.attempts_used + 1,
                 resources_measured=outcome.resources,
                 traceback=None,
-                abort_message=(
+            ):
+                raise VineReduceError(
                     f"processor {self.processor_name!r} exhausted resources on "
                     f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk "
                     f"size ({self._minimum_chunksize} events); cannot retry smaller."
-                ),
-            )
+                )
             return
         # Clamp to the floor rather than halving straight past it - a
         # chunksize of 1500 with minimum_chunksize=1000 must still try 1000
@@ -754,14 +754,13 @@ class Pipeline:
         attempts: int,
         resources_measured: dict[str, Any] | None,
         traceback: str | None,
-        abort_message: str,
-    ) -> None:
+    ) -> bool:
         """A processor permanent failure: log it, drop the file from the
-        pool for good (it is never retried or staged), and either continue
-        (most of the dataset's other files are unaffected) or abort the
-        whole run, per failure_proportion - see PLAN.md's "Attempts and
-        Retries". Unlike a reducer permanent failure (_give_up_on_reduction),
-        this does NOT unconditionally abort."""
+        pool for good (it is never retried or staged), and return whether
+        the whole run should abort, per failure_proportion.
+        Unlike a reducer permanent failure
+        (_give_up_on_reduction), this does NOT unconditionally signal
+        abort - the caller raises only when this returns True."""
         url = chunk.url
         self._failed_files.add(url)
         self._files_concluded += 1
@@ -790,8 +789,7 @@ class Pipeline:
         self._retry_chunks = [t for t in self._retry_chunks if t.chunk.url != url]
 
         ratio = len(self._failed_files) / max(self._files_concluded, 100)
-        if ratio > self._failure_proportion:
-            raise VineReduceError(abort_message)
+        return ratio > self._failure_proportion
 
     def _handle_reduce_resource_exhaustion(
         self, task: _ReduceTask, outcome: ResourceExhaustion
