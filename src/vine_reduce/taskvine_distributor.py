@@ -266,7 +266,10 @@ class TaskVineDistributor(Distributor):
         """Apply resources_processor/resources_reducer to `category` in
         TaskVine, once, the first time that category is submitted to -
         category is a resource-allocation grouping in TaskVine, not a
-        per-task setting."""
+        per-task setting. Also sets TaskVine's automatic allocation mode for
+        the category, differently per kind: reducers use "max" (allocate the
+        largest resource usage measured so far), processors use "min waste"
+        (adjust allocations to minimize wasted resources across tasks)."""
         if category in self._categories_configured:
             return
         caps = self._resources_by_kind[kind]
@@ -274,7 +277,14 @@ class TaskVineDistributor(Distributor):
             cores=caps.get("cores"), memory_mb=caps.get("memory_mb"), disk_mb=caps.get("disk_mb")
         ).to_rmsummary()
         self._manager.set_category_resources_max(category, limits)
-        self._manager.set_category_mode(category, "max")
+
+        if kind == TaskKind.REDUCER:
+            self._manager.set_category_mode(category, "max")
+        elif kind == TaskKind.PROCESSOR:
+            self._manager.set_category_mode(category, "min waste")
+        else:
+            raise ValueError(f"unreachable: unknown TaskKind {kind!r}")
+
         self._categories_configured.add(category)
 
     def _remap_files(self, args: tuple[Any, ...]) -> tuple[list[Any], list[tuple[str, vine.File]]]:
