@@ -2,11 +2,11 @@
 executor_wrapper (see defaults.py) calls to actually run processor(args).
 All of these run remotely, at the execution site chosen by the distributor.
 
-An executor implements the Executor protocol below - submit/map/shutdown,
-named after concurrent.futures.Executor. It is configured once, in the
+An executor implements the Executor protocol below - submit/shutdown, named
+after concurrent.futures.Executor. It is configured once, in the
 vine_reduce process, and cloudpickled into every remote call, so an executor
 must always be picklable: any live resource (e.g. a process pool) is created
-lazily on first submit/map and dropped before pickling (see
+lazily on first submit and dropped before pickling (see
 CloudpickleExecutor.__getstate__).
 
 SimpleExecutor is the default: it just calls processor(args) directly, in
@@ -29,7 +29,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 from concurrent.futures import Future, ProcessPoolExecutor
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Protocol
 
 import cloudpickle
 
@@ -40,7 +40,7 @@ class Executor(Protocol):
     configured once, in the vine_reduce process, and cloudpickled into every
     remote call (as part of executor_wrapper's arguments), so implementations
     must be picklable at all times - any live resource (e.g. a process pool)
-    must be created lazily at submit/map time and dropped before pickling.
+    must be created lazily at submit time and dropped before pickling.
     executor_wrapper uses the fresh deserialized copy for exactly one call:
     `with executor: executor.submit(...).result()`."""
 
@@ -59,20 +59,6 @@ class Executor(Protocol):
         "cores"), and free-form executor config."""
         ...
 
-    def map(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *iterables: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[Any]:
-        """Equivalent to submitting fn(*items) for each items in
-        zip(*iterables) and yielding each result in order (stopping at the
-        shortest iterable, like zip/concurrent.futures.Executor.map)."""
-        ...
-
     def shutdown(self, wait: bool = True) -> None:
         """Release whatever resources this executor owns (e.g. a process
         pool). Also reachable via `with executor: ...`, which calls this on
@@ -87,31 +73,9 @@ class Executor(Protocol):
 
 
 class _ExecutorBase:
-    """Shared map()/__enter__/__exit__ for every Executor implementation below.
-    map() is defined once, in terms of submit(), and __enter__/__exit__ once,
-    in terms of shutdown() - so a concrete implementation only needs to
-    provide submit() and shutdown()."""
-
-    def map(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *iterables: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[Any]:
-        futures = [
-            self.submit(
-                fn,
-                *items,
-                dataset_metadata=dataset_metadata,
-                distributor_metadata=distributor_metadata,
-                executor_metadata=executor_metadata,
-            )
-            for items in zip(*iterables)
-        ]
-        return (future.result() for future in futures)
+    """Shared __enter__/__exit__ for every Executor implementation below,
+    defined once, in terms of shutdown() - so a concrete implementation only
+    needs to provide submit() and shutdown()."""
 
     def __enter__(self) -> "_ExecutorBase":
         return self
@@ -186,11 +150,13 @@ class CloudpickleExecutor(_ExecutorBase):
     """Runs each fn(*args) in its own subprocess (via
     CloudpickleProcessPoolExecutor), isolating a crash or memory leak in fn
     from the worker task running executor_wrapper. fn may be a closure or
-    lambda. The pool is created lazily on first submit/map and dropped
+    lambda. The pool is created lazily on first submit and dropped
     before pickling (see __getstate__), so a configured (even
     previously-used) instance always pickles cleanly; shutdown() tears the
     pool down. max_workers=1 (default) runs one call at a time; a larger
-    value lets map() run items in parallel."""
+    value only matters if something submits more than once to the same
+    instance before shutdown - executor_wrapper itself never does, so within
+    VineReduce max_workers>1 has no effect."""
 
     def __init__(self, max_workers: int = 1) -> None:
         self.max_workers = max_workers

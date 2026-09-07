@@ -499,7 +499,7 @@ The pieces, in flow order (each is user-overridable unless noted):
   environment variable to whatever its own scheduling algorithm actually handed this task, which
   can be less than the configured cap) - see `DaskExecutor`'s `_num_workers` in "Executors and
   remote environments", which prefers that over `distributor_metadata`.
-- **executor** (remote object): an `Executor` protocol instance (`submit`/`map`/`shutdown`, named
+- **executor** (remote object): an `Executor` protocol instance (`submit`/`shutdown`, named
   after `concurrent.futures.Executor`) that calls the processor on `chunk_to_args`' output.
   `executor_wrapper` calls `executor.submit(processor, args, dataset_metadata=...,
   distributor_metadata=..., executor_metadata=...).result()`, then shuts the (freshly
@@ -873,13 +873,13 @@ the coffea-specific pieces; chunking, checkpointing, and restart are inherited u
 
 `executor` (`src/vine_reduce/executor.py`) is a second, smaller axis of pluggability, distinct
 from `Distributor`: `Distributor` decides *where* a call runs (which worker); `Executor` decides
-*how* the call runs once it's there. It's an `Executor` protocol instance - `submit`/`map`/
+*how* the call runs once it's there. It's an `Executor` protocol instance - `submit`/
 `shutdown`, named after `concurrent.futures.Executor` - configured once in the local process and
 cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
 `with executor: executor.submit(...).result()`.
 
 - **Must always pickle cleanly.** Any live resource an implementation holds (e.g. a process pool)
-  is created lazily on first `submit`/`map` and dropped before pickling (see
+  is created lazily on first `submit` and dropped before pickling (see
   `CloudpickleExecutor.__getstate__`), so a configured - even previously-used - instance always
   pickles cleanly.
 - **`SimpleExecutor()`** (default): calls `processor(args)` directly, in the same process running
@@ -897,9 +897,9 @@ cloudpickled fresh into every remote call, where `executor_wrapper` uses it as
   `distributor_metadata["cores"]`, the distributor's static default (see "API vine_reduce <->
   distributor"); else every core on the machine (`os.process_cpu_count()`).
 
-All three inherit `map()` (defined once, in terms of `submit()`) and `__enter__`/`__exit__`
-(defined once, in terms of `shutdown()`) from a private `_ExecutorBase`, so each only implements
-`submit`/`shutdown` itself. See the README's "Executors" section for the full rundown.
+All three inherit `__enter__`/`__exit__` (defined once, in terms of `shutdown()`) from a private
+`_ExecutorBase`, so each only implements `submit`/`shutdown` itself. See the README's
+"Executors" section for the full rundown.
 
 **Remote environments**
 

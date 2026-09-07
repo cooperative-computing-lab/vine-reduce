@@ -33,11 +33,6 @@ def test_simple_executor_submit_does_not_raise_but_result_does():
         future.result()
 
 
-def test_simple_executor_map_preserves_order_and_stops_at_shortest():
-    result = list(SimpleExecutor().map(lambda a, b: a + b, [1, 2, 3], [10, 20]))
-    assert result == [11, 22]
-
-
 def test_simple_executor_pickles_and_still_works():
     copy = cloudpickle.loads(cloudpickle.dumps(SimpleExecutor()))
     assert copy.submit(count_events, type("Chunk", (), {"start": 0, "stop": 5})()).result() == 5
@@ -76,13 +71,6 @@ def test_cloudpickle_executor_isolates_a_crash_from_the_caller():
     future = executor.submit(_crash, chunk)
     with pytest.raises(BrokenProcessPool):
         future.result()
-    executor.shutdown()
-
-
-def test_cloudpickle_executor_map_preserves_order():
-    executor = CloudpickleExecutor(max_workers=2)
-    result = list(executor.map(lambda a, b: a + b, [1, 2, 3], [10, 20, 30]))
-    assert result == [11, 22, 33]
     executor.shutdown()
 
 

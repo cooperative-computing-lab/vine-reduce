@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import os
 import threading
+from uuid import uuid4
+
+from vine_reduce.defaults import default_chunk_to_args, executor_wrapper
+from vine_reduce.executor import SimpleExecutor
 
 
 def read_env_var(chunk):

@@ -87,16 +87,17 @@ executor.submit(
 ).result()
 ```
 
-`Executor` follows `concurrent.futures.Executor`'s `submit`/`map`/`shutdown`
-shape (and is usable as a context manager), though `submit`/`map` take the
+`Executor` follows `concurrent.futures.Executor`'s `submit`/`shutdown`
+shape (and is usable as a context manager), though `submit` takes the
 three metadata dicts above as extra keyword arguments.
 
 - `SimpleExecutor()` (default) — calls `processor(args)` directly.
 - `CloudpickleExecutor(max_workers=1)` — runs `processor(args)` in its own
   subprocess, so a crash or memory leak in `processor` doesn't take down the
   worker task itself. Supports closures and lambdas as `processor`, unlike
-  the stdlib `pickle` a plain `ProcessPoolExecutor` would require. A
-  `max_workers` above 1 lets `map()` run items in parallel.
+  the stdlib `pickle` a plain `ProcessPoolExecutor` would require.
+  `max_workers` above 1 has no effect within `vine_reduce` itself, since
+  `executor_wrapper` only ever calls `submit` once per task.
 - `DaskExecutor(num_workers=None)` — for a `processor` that returns a
   dask-delayed object (or dask array/dataframe) rather than a plain value;
   computes it at the execution site using `num_workers` subprocesses, or (if
