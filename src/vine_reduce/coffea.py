@@ -38,11 +38,11 @@ class Addable(Protocol):
 
 
 Accumulatable = Addable | MutableSet | MutableMapping
-"""A value default_reducer knows how to merge: an Addable, a mutable set
+"""A value coffea_reducer knows how to merge: an Addable, a mutable set
 (merged via union), or a mutable mapping (merged key-by-key, recursively)."""
 
 
-def default_reducer(a: Accumulatable, b: Accumulatable) -> Accumulatable:
+def coffea_reducer(a: Accumulatable, b: Accumulatable) -> Accumulatable:
     """Add two accumulatables together, assuming the first is mutable.
     Handles plain addables (histograms, numbers), sets, and nested mappings -
     the shapes coffea processors typically return. Lifted from coffea's own
@@ -60,7 +60,7 @@ def default_reducer(a: Accumulatable, b: Accumulatable) -> Accumulatable:
         # Snapshot both key sets up front, since the loops below mutate `a`.
         a_keys, b_keys = set(a), set(b)
         for key in a_keys & b_keys:
-            a[key] = default_reducer(a[key], b[key])
+            a[key] = coffea_reducer(a[key], b[key])
         for key in b_keys - a_keys:
             a[key] = copy.deepcopy(b[key])
         return a
@@ -195,7 +195,7 @@ class VineReduceCoffea(VineReduce):
     (executor), and coffea-style accumulator merging (reducer), while
     chunking, checkpointing, and restart are inherited unchanged from
     VineReduce. `processors` values here take one `events` NanoEvents array
-    and return any picklable, accumulatable result (see default_reducer).
+    and return any picklable, accumulatable result (see coffea_reducer).
     See the README's "HEP / coffea workflows" section and PLAN.md.
 
     schema: the coffea NanoEvents schema class used to interpret each ROOT
@@ -210,7 +210,7 @@ class VineReduceCoffea(VineReduce):
     processor_args: extra keyword arguments passed to every processor call,
         in addition to its `events` argument.
     reducer: overrides VineReduce's default_reducer with this module's
-        coffea-aware default_reducer, which also merges sets and mappings
+        coffea-aware coffea_reducer, which also merges sets and mappings
         (dicts of histograms, as coffea processors commonly return).
     input_to_datasets: overrides VineReduce's default with
         coffea_input_to_datasets, which reads coffea's own preprocess()
@@ -223,7 +223,7 @@ class VineReduceCoffea(VineReduce):
     object_path: str = "Events"
     uproot_options: Mapping[str, Any] | None = None
     processor_args: Mapping[str, Any] | None = None
-    reducer: Callable[[Any, Any], Any] = default_reducer
+    reducer: Callable[[Any, Any], Any] = coffea_reducer
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] = coffea_input_to_datasets
 
     def __post_init__(self) -> None:

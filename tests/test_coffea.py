@@ -9,37 +9,37 @@ from vine_reduce.coffea import (
     CoffeaExecutor,
     VineReduceCoffea,
     coffea_input_to_datasets,
-    default_reducer,
+    coffea_reducer,
 )
 from vine_reduce.types import Chunk
 
 
-def test_default_reducer_adds_plain_addables():
-    assert default_reducer(1, 2) == 3
+def test_coffea_reducer_adds_plain_addables():
+    assert coffea_reducer(1, 2) == 3
 
 
-def test_default_reducer_merges_mappings_recursively():
+def test_coffea_reducer_merges_mappings_recursively():
     a = {"x": 1, "shared": {"a": 1}}
     b = {"y": 2, "shared": {"b": 2}}
-    result = default_reducer(a, b)
+    result = coffea_reducer(a, b)
     assert result == {"x": 1, "y": 2, "shared": {"a": 1, "b": 2}}
 
 
-def test_default_reducer_unions_sets():
-    assert default_reducer({1, 2}, {2, 3}) == {1, 2, 3}
+def test_coffea_reducer_unions_sets():
+    assert coffea_reducer({1, 2}, {2, 3}) == {1, 2, 3}
 
 
-def test_default_reducer_rejects_incompatible_mapping_types():
+def test_coffea_reducer_rejects_incompatible_mapping_types():
     class OtherDict(dict):
         pass
 
     with pytest.raises(ValueError):
-        default_reducer(OtherDict(), {})
+        coffea_reducer(OtherDict(), {})
 
 
-def test_default_reducer_rejects_incompatible_types():
+def test_coffea_reducer_rejects_incompatible_types():
     with pytest.raises(ValueError):
-        default_reducer(1, {"a": 1})
+        coffea_reducer(1, {"a": 1})
 
 
 def test_coffea_input_to_datasets_converts_file_specs():
@@ -78,7 +78,7 @@ def test_vine_reduce_coffea_wires_chunk_to_args_and_executor():
     # so they must be present and distinct from the base VineReduce defaults.
     assert vr.chunk_to_args is not None
     assert isinstance(vr.executor, CoffeaExecutor)
-    assert vr.reducer is default_reducer
+    assert vr.reducer is coffea_reducer
     assert vr.input_to_datasets is coffea_input_to_datasets
 
 
