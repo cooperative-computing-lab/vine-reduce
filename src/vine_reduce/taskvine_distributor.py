@@ -273,6 +273,7 @@ class TaskVineDistributor:
             if key in _RESOURCE_KEY_TO_RMSUMMARY
         }
         self._manager.set_category_resources_max(category, limits)
+        self._manager.set_category_mode(category, "max")
         self._categories_configured.add(category)
 
     def _remap_files(self, args: tuple[Any, ...]) -> tuple[list[Any], list[tuple[str, vine.File]]]:
