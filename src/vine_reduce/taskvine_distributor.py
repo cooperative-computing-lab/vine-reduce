@@ -174,9 +174,11 @@ class TaskVineDistributor(Distributor):
         self._extra_files: list[tuple[str, vine.File]] = []
         self._extra_env: dict[str, str] = {}
 
-        # Whether last wait received a task. If yes, we set timeout to 0
-        # to try to receive as many tasks as possible.
-        self._task_last_wait = False
+        # Set once wait() returns a task, so the next call drains with
+        # timeout 0 instead of waiting again - lets a burst of already-
+        # finished tasks be picked up back-to-back before falling back to a
+        # real wait.
+        self._drain_next_wait = False
 
     @property
     def port(self) -> int:
@@ -299,24 +301,25 @@ class TaskVineDistributor(Distributor):
         (Success/RuntimeFailure/ResourceExhaustion, translated from
         TaskVine's own result string when the task didn't run its Python
         function to completion), or None if timeout elapses first.
-        If timeout is None, a default of 5 seconds is used."""
-        # TaskVine's C API only accepts an integer number of seconds; round
-        # up so a small positive float still waits at least that long
-        # instead of truncating to 0 ("return immediately").
-        if self._task_last_wait is True:
+        If timeout is None, a default of 5 seconds is used - except right
+        after a previous wait() returned a task, when timeout is forced to 0
+        to drain any other already-finished tasks before waiting again."""
+        if self._drain_next_wait:
             vine_timeout = 0
+        elif timeout is None:
+            vine_timeout = 5
         else:
-            if timeout is None:
-                vine_timeout = 5
-            else:
-                vine_timeout = max(0, math.ceil(timeout))
+            # TaskVine's C API only accepts an integer number of seconds;
+            # round up so a small positive float still waits at least that
+            # long instead of truncating to 0 ("return immediately").
+            vine_timeout = max(0, math.ceil(timeout))
 
         task = self._manager.wait_for_tag(self._tag, vine_timeout)
         if task is None:
-            self._task_last_wait = False
+            self._drain_next_wait = False
             return None
 
-        self._task_last_wait = True
+        self._drain_next_wait = True
 
         entry = self._in_flight_by_taskvine_id.pop(task.id)
         result_id, kind = entry.result_id, entry.kind
