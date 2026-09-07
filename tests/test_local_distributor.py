@@ -233,16 +233,16 @@ def test_adopt_checkpoint_release_result_removes_the_adopted_file(distributor, t
 
 
 def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp_path):
-    """§2.7: the on-disk filename for a non-final checkpoint must be unique
-    for the lifetime of checkpoint_dir, not just for this process's
-    result_id counter - otherwise a fresh distributor's counter restarting
-    at 1 could mint a filename that collides with (and silently overwrites)
-    a still-live checkpoint from an earlier run at that same path."""
+    """The on-disk filename for a non-final checkpoint must be unique for
+    the lifetime of checkpoint_dir, not just for this process's result_id
+    counter - otherwise a fresh distributor's counter restarting at 1 could
+    mint a filename that collides with (and silently overwrites) a
+    still-live checkpoint from an earlier run at that same path."""
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
-    # A pre-fix, result_id-based naming scheme would have named the first
-    # checkpoint of a fresh process "1.pkl.zst" - plant exactly that,
-    # holding content distinguishable from anything this test submits.
+    # A naive, result_id-based naming scheme would name the first checkpoint
+    # of a fresh process "1.pkl.zst" - plant exactly that, holding content
+    # distinguishable from anything this test submits.
     leftover_path = checkpoint_dir / "1.pkl.zst"
     serialization.dump("leftover-from-a-prior-run", str(leftover_path))
 

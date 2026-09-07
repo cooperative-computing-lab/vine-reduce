@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
@@ -57,6 +58,22 @@ def _wait(distributor, timeout=WAIT_TIMEOUT):
     return None
 
 
+@contextmanager
+def local_worker(manager):
+    """A single local vine_factory worker (cores=2) against `manager`, for a
+    test that needs to actually run tasks - started on entry, stopped on
+    exit. Factored out of dist_with_workers so a test that can't use that
+    fixture (e.g. it needs a caller-supplied or per-iteration manager) can
+    still get one without repeating the vine.Factory boilerplate."""
+    workers = vine.Factory(manager=manager)
+    workers.cores = 2
+    workers.min_workers = 1
+    workers.max_workers = 1
+    workers.timeout = WAIT_TIMEOUT
+    with workers:
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _pythonpath(monkeypatch):
     """cloudpickle pickles tests/helpers.py's functions by reference, so a
@@ -86,12 +103,7 @@ def dist_with_workers(dist):
     """`dist`, plus one running vine_factory worker (cores=2) - for tests
     that actually submit and run a task, rather than just exercising
     dist's own bookkeeping."""
-    workers = vine.Factory(manager=dist._manager)
-    workers.cores = 2
-    workers.min_workers = 1
-    workers.max_workers = 1
-    workers.timeout = WAIT_TIMEOUT
-    with workers:
+    with local_worker(dist._manager):
         yield dist
 
 
@@ -272,12 +284,7 @@ def test_constructor_reuses_a_pre_built_manager(tmp_path):
     ) as dist:
         assert dist._manager is manager
 
-        workers = vine.Factory(manager=manager)
-        workers.cores = 2
-        workers.min_workers = 1
-        workers.max_workers = 1
-        workers.timeout = WAIT_TIMEOUT
-        with workers:
+        with local_worker(manager):
             result_id = submit_chunk(dist, 1, Chunk("a.root", 0, 4))
             outcome = _wait(dist)
 
@@ -301,12 +308,7 @@ def test_wait_ignores_tasks_submitted_directly_to_a_shared_manager(tmp_path):
         resources_reducer={"cores": 1},
         checkpoint_dir=str(tmp_path / "checkpoints"),
     ) as dist:
-        workers = vine.Factory(manager=manager)
-        workers.cores = 2
-        workers.min_workers = 1
-        workers.max_workers = 1
-        workers.timeout = WAIT_TIMEOUT
-        with workers:
+        with local_worker(manager):
             foreign_task = vine.PythonTask(count_events, Chunk("a.root", 0, 1))
             manager.submit(foreign_task)
 
@@ -458,9 +460,9 @@ def test_adopt_checkpoint_flows_through_remap_release_and_retrieve(dist_with_wor
 
 
 def test_checkpoint_filenames_never_collide_across_restarts(tmp_path):
-    """§2.7: a fresh distributor instance must not be able to mint an
-    on-disk checkpoint filename that collides with one still-live from an
-    earlier instance/run against the same checkpoint_dir."""
+    """A fresh distributor instance must not be able to mint an on-disk
+    checkpoint filename that collides with one still-live from an earlier
+    instance/run against the same checkpoint_dir."""
     checkpoint_dir = str(tmp_path / "checkpoints")
 
     def _write_one_checkpoint():
@@ -469,12 +471,7 @@ def test_checkpoint_filenames_never_collide_across_restarts(tmp_path):
             resources_processor={"cores": 1},
             checkpoint_dir=checkpoint_dir,
         ) as dist:
-            workers = vine.Factory(manager=dist._manager)
-            workers.cores = 2
-            workers.min_workers = 1
-            workers.max_workers = 1
-            workers.timeout = WAIT_TIMEOUT
-            with workers:
+            with local_worker(dist._manager):
                 submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
                 outcome = _wait(dist)
                 path = dist.checkpoint_path(outcome.result_id)

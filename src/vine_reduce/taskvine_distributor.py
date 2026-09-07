@@ -108,28 +108,32 @@ class TaskVineDistributor(Distributor):
         ssl: bool = True,
     ):
         """port: port (or [min, max] range) the manager listens on, or 0 to
-        pick one automatically - see `port` below. name: the manager's
-        TaskVine project name, for workers to find it by name instead of
-        host:port. resources_processor/resources_reducer: per-category
-        resource caps (e.g. {"cores": 1, "memory_mb": 2000, "disk_mb": 4000})
-        applied to every processor/reducer call respectively, via
-        Manager.set_category_resources_max. environment: path to a packed
-        poncho package tarball (see get_environment() in
-        remote_environment.py) to ship and activate on every worker task;
-        None runs tasks in whatever Python environment the worker itself was
-        started with. manager: an already-constructed vine.Manager (or
-        subclass, e.g. vine.DaskVine) to use instead of building one from
-        port/name - lets vine_reduce's tasks and a caller's own tasks share
-        one manager/port and worker pool. checkpoint_dir: local directory
-        (on this process's filesystem, i.e. wherever the manager runs) this
-        distributor writes a result's file to when submit() is called with
-        is_checkpoint=True - see the module docstring and checkpoint_path().
+            pick one automatically - see `port` below.
+        name: the manager's TaskVine project name, for workers to find it by
+            name instead of host:port.
+        resources_processor/resources_reducer: per-category resource caps
+            (e.g. {"cores": 1, "memory_mb": 2000, "disk_mb": 4000}) applied
+            to every processor/reducer call respectively, via
+            Manager.set_category_resources_max.
+        environment: path to a packed poncho package tarball (see
+            get_environment() in remote_environment.py) to ship and activate
+            on every worker task; None runs tasks in whatever Python
+            environment the worker itself was started with.
+        manager: an already-constructed vine.Manager (or subclass, e.g.
+            vine.DaskVine) to use instead of building one from port/name -
+            lets vine_reduce's tasks and a caller's own tasks share one
+            manager/port and worker pool.
+        checkpoint_dir: local directory (on this process's filesystem, i.e.
+            wherever the manager runs) this distributor writes a result's
+            file to when submit() is called with is_checkpoint=True - see
+            the module docstring and checkpoint_path().
         ssl: whether the manager encrypts its connections to workers, via a
-        self-signed cert vine.Manager generates on the fly; ignored when
-        manager is given (that manager's own ssl setting, if any, applies
-        instead). Workers started with vine.Factory(manager=...) pick this
-        up automatically (Factory reads it off the manager); Factory started
-        with manager_host_port= instead needs `ssl=True` passed to it too."""
+            self-signed cert vine.Manager generates on the fly; ignored when
+            manager is given (that manager's own ssl setting, if any,
+            applies instead). Workers started with vine.Factory(manager=...)
+            pick this up automatically (Factory reads it off the manager);
+            Factory started with manager_host_port= instead needs
+            `ssl=True` passed to it too."""
         self._owns_manager = manager is None
         self._manager = (
             manager if manager is not None else vine.Manager(port=port, name=name, ssl=ssl)

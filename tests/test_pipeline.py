@@ -512,7 +512,7 @@ def test_restart_with_final_checkpoint_for_all_files_skips_pipeline_entirely(
 
     assert pipeline.finished is True
     assert pipeline.pool == []
-    assert pipeline.in_flight_count() == 0
+    assert pipeline.in_flight_count == 0
     assert len(pipeline.final_results) == 1
     db.close()
 

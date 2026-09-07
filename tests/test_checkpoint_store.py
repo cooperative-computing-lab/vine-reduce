@@ -162,9 +162,9 @@ def test_checksum_dataset_stable_and_sensitive_to_content():
 
 
 def _write_old_schema_db(db_path: str) -> None:
-    """Build a db in the shape today's (pre-rewrite) CheckpointDB produces:
-    a single `checkpoints` table with a JSON `covers_files` TEXT column, and
-    no user_version set (defaults to 0)."""
+    """Build a db in the old schema shape: a single `checkpoints` table with
+    a JSON `covers_files` TEXT column, and no user_version set (defaults to
+    0)."""
     conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE checkpoints (
