@@ -754,8 +754,8 @@ Two `Distributor` implementations ship with vine_reduce.
 ### LocalDistributor (`src/vine_reduce/local_distributor.py`)
 
 The default when `distributor=` is omitted: runs every processor/reducer call in a local
-`ProcessPoolExecutor`, for development, testing, and as the minimal reference implementation of
-the protocol.
+`CloudpickleProcessPoolExecutor` (see `executor.py`), for development, testing, and as the
+minimal reference implementation of the protocol.
 
 - Worker "nodes" are local subprocesses sharing vine_reduce's filesystem, so `retrieve()` is a
   plain file copy and `add_file()` is a no-op. Env vars from `set_env_var` are applied inside
@@ -775,8 +775,10 @@ the protocol.
   just records `path` under `result_id` (workers share the filesystem, so `path` is usable
   as-is); the seeded item is then released/retrieved/resubmitted through exactly the same code
   paths as a this-run result.
-- `func`/`args` are cloudpickled before crossing into the subprocess, so
-  `processor`/`reducer`/etc. may be closures or lambdas, not just module-level callables.
+- `func`/`args` are cloudpickled before crossing into the subprocess (via
+  `CloudpickleProcessPoolExecutor.submit`), so `processor`/`reducer`/etc. may be closures or
+  lambdas, not just module-level callables. This also means inheriting that executor's
+  `mp_context="fork"`.
 - Priority is best-effort only: a pending call waits in a priority queue until a worker slot is
   free, but once dispatched it cannot be preempted by a higher-priority call submitted later.
 - `resources(kind)` always returns `{"cores": 1}`: this runs on the same machine as vine_reduce

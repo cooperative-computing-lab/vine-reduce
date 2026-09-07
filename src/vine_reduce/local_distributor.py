@@ -1,4 +1,4 @@
-"""A basic Distributor backed by concurrent.futures.ProcessPoolExecutor.
+"""A basic Distributor backed by executor.py's CloudpickleProcessPoolExecutor.
 
 This exists to run vine_reduce locally for development and testing, and to
 serve as a minimal reference for what a Distributor implementation needs to
@@ -9,8 +9,11 @@ do. It is intentionally simple, not production-grade:
   - "worker nodes" are local subprocesses that share vine_reduce's
     filesystem, so retrieve() is a plain file copy.
   - func/args are cloudpickled before being handed to the pool (see
-    _run_cloudpickled below), so processor/reducer/etc. may be closures
-    or lambdas, not just module-level callables.
+    CloudpickleProcessPoolExecutor), so processor/reducer/etc. may be
+    closures or lambdas, not just module-level callables. This also
+    inherits CloudpickleProcessPoolExecutor's mp_context="fork" - fine
+    here since LocalDistributor itself starts no threads of its own
+    before the pool is created.
   - a checkpoint (submit(..., is_checkpoint=True)) lands under
     checkpoint_dir, a real directory that shutdown() never removes; an
     ordinary result lands under work_dir instead, which is scratch space
@@ -31,13 +34,12 @@ import os
 import shutil
 import tempfile
 import traceback as traceback_module
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 from uuid import uuid4
 
-import cloudpickle
-
+from .executor import CloudpickleProcessPoolExecutor
 from .types import Outcome, RuntimeFailure, Success
 
 # Placeholder usage for a call whose outcome had to be synthesized rather
@@ -46,15 +48,12 @@ from .types import Outcome, RuntimeFailure, Success
 _UNMEASURED_RESOURCES = {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
 
 
-def _run_cloudpickled(payload: bytes) -> Any:
-    """Runs in the worker subprocess. ProcessPoolExecutor pickles whatever it
-    is given with stdlib pickle, which cannot handle closures or lambdas;
-    cloudpickle can, so func/args are cloudpickled into a byte string here
-    and only that string (plus this module-level function) crosses the
-    stdlib-pickle boundary. env_vars is applied here, in the worker process,
-    rather than in the parent, so it takes effect regardless of when the
-    pool actually forked this worker relative to set_env_var being called."""
-    func, args, env_vars = cloudpickle.loads(payload)
+def _run_with_env(func: Callable[..., Any], args: tuple, env_vars: dict[str, str]) -> Any:
+    """Runs in the worker subprocess, via CloudpickleProcessPoolExecutor (so
+    func/args may be closures or lambdas). env_vars is applied here, in the
+    worker process, rather than in the parent, so it takes effect regardless
+    of when the pool actually forked this worker relative to set_env_var
+    being called."""
     os.environ.update(env_vars)
     return func(*args)
 
@@ -79,7 +78,7 @@ class LocalDistributor:
         (submit(..., is_checkpoint=True)) result files into; never removed
         by shutdown() - see the module docstring."""
         self._max_workers = max_workers or os.process_cpu_count() or 1
-        self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
+        self._pool = CloudpickleProcessPoolExecutor(max_workers=self._max_workers)
 
         self._owns_work_dir = work_dir is None
         self._work_dir = work_dir or tempfile.mkdtemp(prefix="vine_reduce_local_")
@@ -127,8 +126,8 @@ class LocalDistributor:
             _, _, result_id, func, args, is_checkpoint = heapq.heappop(self._pending)
             base_dir = self._checkpoint_dir if is_checkpoint else self._work_dir
             dest_file = os.path.join(base_dir, f"{uuid4().hex}.pkl.zst")
-            payload = cloudpickle.dumps((func, (dest_file, *args), self._env_vars))
-            self._running[self._pool.submit(_run_cloudpickled, payload)] = (result_id, dest_file)
+            future = self._pool.submit(_run_with_env, func, (dest_file, *args), self._env_vars)
+            self._running[future] = (result_id, dest_file)
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
         """Block until a queued call finishes, returning its Outcome, or
@@ -154,7 +153,7 @@ class LocalDistributor:
             raw: Outcome = future.result()
         except BrokenProcessPool:
             self._pool.shutdown(wait=False)
-            self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
+            self._pool = CloudpickleProcessPoolExecutor(max_workers=self._max_workers)
             if os.path.exists(dest_file):
                 os.remove(dest_file)
             outcome: Outcome = RuntimeFailure(
@@ -223,7 +222,7 @@ class LocalDistributor:
 
     def set_env_var(self, name: str, value: str) -> None:
         """Set an environment variable for every call submitted from now on,
-        applied inside each worker subprocess (see _run_cloudpickled)."""
+        applied inside each worker subprocess (see _run_with_env)."""
         self._env_vars[name] = value
 
     def shutdown(self) -> None:
