@@ -189,7 +189,7 @@ class VineReduce:
         was killed for exceeding its allocation) against the same budget.
         attempts=1 means no retries. A halving of chunksize/reduction_size
         resets the budget for the smaller unit it produces (a fresh start,
-        not a strike against it); once a chunk/reduction is already at the
+        not a strike against it); once a chunk/reduction is already below
         minimum size (minimum_chunksize / minimum_reduction_size) a further
         ResourceExhaustion raises immediately, since there is no smaller
         size left to retry at. Once the budget for a specific chunk is

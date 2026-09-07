@@ -647,8 +647,7 @@ class Pipeline:
             # in _handle_reduce_resource_exhaustion.
             self._retry_chunks.append(_ChunkTask(chunk, 0))
             return
-        new_size = max(chunk.num_events, current_size) // 2
-        if new_size < self._minimum_chunksize:
+        if current_size <= self._minimum_chunksize:
             self._give_up_on_file(
                 chunk,
                 kind="processor",
@@ -657,12 +656,16 @@ class Pipeline:
                 traceback=None,
                 abort_message=(
                     f"processor {self.processor_name!r} exhausted resources on "
-                    f"{chunk.url}[{chunk.start}:{chunk.stop}] below the minimum chunk "
+                    f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk "
                     f"size ({self._minimum_chunksize} events); cannot retry smaller."
                 ),
             )
             return
-        self.chunksize = new_size
+        # Clamp to the floor rather than halving straight past it - a
+        # chunksize of 1500 with minimum_chunksize=1000 must still try 1000
+        # before giving up, not jump straight from 1500 to 750
+        # (Correctness #6).
+        self.chunksize = max(current_size // 2, self._minimum_chunksize)
         # attempts_used carries over unchanged here - it is reset to 0 in
         # _next_chunk once this chunk is actually split at the new,
         # smaller chunksize (a halving is a fresh start, not a strike
@@ -782,8 +785,7 @@ class Pipeline:
             # regardless of size) was never tried at the current size, so it
             # is not such evidence and falls through unshrunk to the re-pool
             # below.
-            new_size = max(len(group), self.reduction_size) // 2
-            if new_size < self._minimum_reduction_size:
+            if self.reduction_size <= self._minimum_reduction_size:
                 self._give_up_on_reduction(
                     group,
                     attempts=1 + max((item.attempts for item in group), default=0),
@@ -792,10 +794,13 @@ class Pipeline:
                 )
                 raise VineReduceError(
                     f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                    "resources below the minimum reduction_size "
+                    "resources at the minimum reduction_size "
                     f"({self._minimum_reduction_size}); cannot retry smaller."
                 )
-            self.reduction_size = new_size
+            # Clamp to the floor rather than halving straight past it - a
+            # reduction_size of 3 with minimum_reduction_size=2 must still
+            # try 2 before giving up, not jump straight from 3 to 1
+            self.reduction_size = max(self.reduction_size // 2, self._minimum_reduction_size)
         # Any ResourceExhaustion is a fresh start for these items, not a
         # strike against the budget - see PoolItem.attempts's docstring.
         for item in group:
@@ -820,7 +825,12 @@ class Pipeline:
             )
         for item in group:
             item.attempts = attempts_used
-        self._submit_reduction(group)  # retry the exact same group unchanged
+        # force_final must carry over - this may be the drain group (the
+        # last reduction of a dataset, forced final regardless of
+        # _is_result), and retrying without it would let _is_result
+        # recompute is_final and possibly say False, so the group's
+        # eventual success is never recognized as the dataset's final
+        self._submit_reduction(group, force_final=task.force_final)
 
     def _reduce_task_description(self, task: _ReduceTask) -> tuple[str, str]:
         """The (kind, description) pair identifying one reduce task, for
