@@ -68,7 +68,12 @@ from .types import Outcome, RawOutcome, ResourceExhaustion, RuntimeFailure, Succ
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
-_RESOURCE_EXHAUSTION_RESULTS = {"resource exhaustion", "max wall time", "disk alloc full"}
+_RESOURCE_EXHAUSTION_RESULTS = {
+    "resource exhaustion",
+    "max wall time",
+    "sandbox exhaustion",
+    "max end time",
+}
 
 # resources_processor/resources_reducer use vine_reduce's own key names; this maps
 # them onto the resource_monitor's rmsummary field names expected by
@@ -355,12 +360,11 @@ class TaskVineDistributor:
         )
 
     def _resources_from_task(self, task: vine.Task, kind: TaskKind) -> dict[str, Any]:
-        default_cores = self._resources_by_kind[kind].get("cores", 1)
         measured = task.resources_measured
         if measured is None:
-            return {"cores": default_cores, "memory_mb": 0.0, "wall_time_s": 0.0}
+            return {"cores": 0.0, "memory_mb": 0.0, "wall_time_s": 0.0}
         return {
-            "cores": measured.cores or default_cores,
+            "cores": measured.cores or 0.0,
             "memory_mb": measured.memory or 0.0,
             "wall_time_s": (measured.wall_time or 0) / 1e6,
         }

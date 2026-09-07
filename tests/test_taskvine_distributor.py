@@ -292,6 +292,7 @@ def test_failed_task_reports_real_traceback_not_output_missing(monkeypatch, tmp_
             assert _result_token(result_id) not in dist._files_by_key
 
 
+
 def test_capacity_reports_a_non_negative_capacity(monkeypatch, tmp_path):
     # No task is ever submitted here, so no worker is needed - skip the
     # Factory entirely (see test_wait_returns_none_when_nothing_pending and
