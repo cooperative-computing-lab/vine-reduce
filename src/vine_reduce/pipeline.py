@@ -1034,39 +1034,57 @@ class Pipeline:
             return True
         return False
 
-    def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
-        # Phase 1 - locate/create the durable copy.
+    def _durable_path(self, new_item: PoolItem, is_final: bool) -> str:
+        """Locate or create new_item's durable on-disk copy.
+
+        A final result is copied out to vine_reduce's own results_dir and
+        its distributor handle released immediately, since nothing will ever
+        reduce it further. A non-final checkpoint was already made durable
+        by the distributor at submit time (is_checkpoint=True - see
+        _submit_reduction), so only its path needs to be learned; the handle
+        stays live and reusable as input to a later reduction until a
+        further checkpoint covers this item (via _release_covered).
+        """
         if is_final:
-            # A final result is vine_reduce's own deliverable, so it gets
-            # vine_reduce's own naming/location (results_dir), independent of
-            # whatever durable storage the distributor itself used. Nothing
-            # will ever reduce it further, so once it is safely on disk here
-            # the distributor's every copy of it can go, handle included.
             path = os.path.join(self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
             self._distributor.retrieve(new_item.handle.result_id, path)
             self._distributor.release_result(new_item.handle.result_id)
             new_item.handle = None
         else:
-            # The distributor already made this durable at submit time
-            # (is_checkpoint=True - see _submit_reduction), so there is
-            # nothing to copy, just a path to learn. The handle stays live
-            # and reusable as input to a later reduction, so the manager
-            # never has to re-send a checkpoint it already generated; it is
-            # released only once a FURTHER checkpoint covers this item (via
-            # _release_covered) - the other half of invariant #2.
             path = self._distributor.checkpoint_path(new_item.handle.result_id)
+        return path
 
-        # Phase 2 - record durably, atomically superseding the rows this
-        # replaces: the new row and the superseded rows' deletes are one
-        # transaction, so this checkpoint event either fully lands or, on a
-        # crash mid-way, fully doesn't (never leaves both old and new rows
-        # covering the same files on disk). Walk each input's whole lineage,
-        # not just the direct inputs: phase 3's _release_covered below will
-        # free the durable file of every checkpoint it reaches, however deep,
-        # so every one of those rows must be superseded here too - otherwise
-        # a checkpoint folded in through a non-checkpointed intermediate
-        # would have its file deleted while its row stays on file, pointing
-        # nowhere.
+    def _mark_durable(
+        self, new_item: PoolItem, inputs: list[PoolItem], row_id: int, path: str
+    ) -> None:
+        """Free everything new_item's now-committed checkpoint supersedes.
+
+        Each input's not-yet-checkpointed lineage was only ever kept alive
+        as a fallback in case new_item was lost before being checkpointed -
+        now that the DB row above is committed, that lineage (and any
+        checkpoint reached through it, whose row was superseded above) is
+        safe to release.
+        """
+        for item in inputs:
+            self._release_covered(item)
+        new_item.inputs = []
+        new_item.checkpoint = CheckpointRef(row_id, path)
+        new_item.since_checkpoint_time = 0
+        new_item.since_checkpoint_distance = 0
+
+    def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
+        path = self._durable_path(new_item, is_final)
+
+        # Record durably, atomically superseding the rows this replaces: the
+        # new row and the superseded rows' deletes are one transaction, so
+        # this checkpoint event either fully lands or, on a crash mid-way,
+        # fully doesn't (never leaves both old and new rows covering the
+        # same files on disk). Walk each input's whole lineage, not just the
+        # direct inputs: _mark_durable below will free the durable file of
+        # every checkpoint it reaches, however deep, so every one of those
+        # rows must be superseded here too - otherwise a checkpoint folded
+        # in through a non-checkpointed intermediate would have its file
+        # deleted while its row stays on file, pointing nowhere.
         superseded = [row_id for item in inputs for row_id in self._checkpoints_in(item)]
         row_id = self._db.record(
             processor=self.processor_name,
@@ -1080,19 +1098,7 @@ class Pipeline:
             supersedes=superseded,
         )
 
-        # Phase 3 - new_item is durable, so everything it covers can be
-        # freed: its inputs' whole not-yet-checkpointed lineage (only ever
-        # kept alive as a fallback in case new_item was lost before being
-        # checkpointed), and any superseded checkpoint's durable file too -
-        # release_result removes that file as part of its contract (the
-        # distributor is the single owner of non-final checkpoint files),
-        # and the store stopped pointing at it when phase 2 committed.
-        for item in inputs:
-            self._release_covered(item)
-        new_item.inputs = []
-        new_item.checkpoint = CheckpointRef(row_id, path)
-        new_item.since_checkpoint_time = 0
-        new_item.since_checkpoint_distance = 0
+        self._mark_durable(new_item, inputs, row_id, path)
 
     @staticmethod
     def _checkpoints_in(root: PoolItem) -> list[int]:
@@ -1101,8 +1107,8 @@ class Pipeline:
         traversal rule as _release_covered itself: descend through
         not-yet-checkpointed items, but stop descending past a checkpointed
         one (its own lineage was already freed when IT was checkpointed).
-        Used by _checkpoint to supersede every row whose file phase 3 is
-        about to delete, not just root's."""
+        Used by _checkpoint to supersede every row whose file _mark_durable
+        is about to delete, not just root's."""
         row_ids = []
         stack = [root]
         while stack:
@@ -1114,21 +1120,21 @@ class Pipeline:
         return row_ids
 
     def _release_covered(self, root: PoolItem, *, keep_checkpoints: bool = False) -> None:
-        """Retention rule (invariant #3): a result may be freed only once a
-        durable checkpoint covers it downstream; this is called exactly when
-        such a checkpoint lands, once per item folded into it. Frees root
-        and its whole not-yet-checkpointed lineage, stopping its descent at
-        any item that is itself a checkpoint - that item's own lineage was
-        already freed when IT was checkpointed (invariant #2). An explicit
-        stack, not recursion, so an arbitrarily long uncheckpointed chain
-        cannot hit Python's recursion limit; clearing handle/inputs as it
-        goes makes double-release structurally impossible.
+        """Retention rule: a result may be freed only once a durable
+        checkpoint covers it downstream; this is called exactly when such a
+        checkpoint lands, once per item folded into it. Frees root and its
+        whole not-yet-checkpointed lineage, stopping its descent at any item
+        that is itself a checkpoint - that item's own lineage was already
+        freed when IT was checkpointed. An explicit stack, not recursion, so
+        an arbitrarily long uncheckpointed chain cannot hit Python's
+        recursion limit; clearing handle/inputs as it goes makes
+        double-release structurally impossible.
 
         keep_checkpoints=True skips release_result on any item that is
         itself a checkpoint (its handle and inputs are still cleared): used
         by _give_up_on_reduction, where nothing supersedes those rows'
-        durable files the way a successful _checkpoint's phase 2 does, so
-        deleting them here would strand a surviving DB row pointing at
+        durable files the way a successful _checkpoint's _mark_durable does,
+        so deleting them here would strand a surviving DB row pointing at
         nothing."""
         stack = [root]
         while stack:
