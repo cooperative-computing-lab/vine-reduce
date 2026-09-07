@@ -27,7 +27,6 @@ from .types import (
     Success,
 )
 
-
 # Minimum denominator for the permanently-failed-files/files-concluded ratio
 # (see _give_up_on_file) - so a lone early failure can't spuriously trip a
 # nonzero failure_proportion threshold on a small dataset.

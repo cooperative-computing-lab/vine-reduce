@@ -507,9 +507,7 @@ def test_engine_end_to_end_via_taskvine(dist_with_workers, tmp_path, dataset_inp
     this drives it through the real VineReduce pipeline (chunking, pooled
     reduction across two files, checkpointing) the way a user actually would."""
     dist = dist_with_workers
-    input_path = dataset_input(
-        {"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}}
-    )
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}})
 
     vr = VineReduce(
         processors={"count": count_events},

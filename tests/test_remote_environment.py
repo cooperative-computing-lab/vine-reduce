@@ -64,9 +64,7 @@ def test_find_editable_pip_installs_decodes_spaces_in_path(monkeypatch):
         lambda: [editable, non_editable, no_direct_url],
     )
 
-    assert _find_editable_pip_installs() == {
-        "vine_reduce": "/home/user/My Projects/vine-reduce"
-    }
+    assert _find_editable_pip_installs() == {"vine_reduce": "/home/user/My Projects/vine-reduce"}
 
 
 def test_combined_commit_key_with_no_editable_packages_is_fixed():
