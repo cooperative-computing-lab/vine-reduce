@@ -26,15 +26,16 @@ CloudpickleExecutor and DaskExecutor are alternatives:
 
 from __future__ import annotations
 
+import abc
 import multiprocessing as mp
 import os
 from concurrent.futures import Future, ProcessPoolExecutor
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 import cloudpickle
 
 
-class Executor(Protocol):
+class Executor(abc.ABC):
     """The interface VineReduce needs from an executor. An executor runs
     fn(*args) at the execution site chosen by the distributor. It is
     configured once, in the vine_reduce process, and cloudpickled into every
@@ -42,8 +43,12 @@ class Executor(Protocol):
     must be picklable at all times - any live resource (e.g. a process pool)
     must be created lazily at submit time and dropped before pickling.
     executor_wrapper uses the fresh deserialized copy for exactly one call:
-    `with executor: executor.submit(...).result()`."""
+    `with executor: executor.submit(...).result()`. Concrete implementations
+    (see SimpleExecutor, CloudpickleExecutor, DaskExecutor below) subclass
+    this and only need to provide submit()/shutdown() - __enter__/__exit__
+    are inherited from here."""
 
+    @abc.abstractmethod
     def submit(
         self,
         fn: Callable[..., Any],
@@ -58,6 +63,7 @@ class Executor(Protocol):
         config."""
         ...
 
+    @abc.abstractmethod
     def shutdown(self, wait: bool = True) -> None:
         """Release whatever resources this executor owns (e.g. a process
         pool). Also reachable via `with executor: ...`, which calls this on
@@ -65,18 +71,6 @@ class Executor(Protocol):
         ...
 
     def __enter__(self) -> "Executor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.shutdown(wait=True)
-
-
-class _ExecutorBase:
-    """Shared __enter__/__exit__ for every Executor implementation below,
-    defined once, in terms of shutdown() - so a concrete implementation only
-    needs to provide submit() and shutdown()."""
-
-    def __enter__(self) -> "_ExecutorBase":
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -95,7 +89,7 @@ def _submitted(fn: Callable[..., Any], *args: Any) -> Future:
     return future
 
 
-class SimpleExecutor(_ExecutorBase):
+class SimpleExecutor(Executor):
     """Calls fn(*args) directly, in the same process/task running
     executor_wrapper. The default `executor` for VineReduce. Ignores all
     three metadata dicts. Stateless, so trivially picklable."""
@@ -143,7 +137,7 @@ class CloudpickleProcessPoolExecutor(ProcessPoolExecutor):
         return super().submit(_run_cloudpickled, payload)
 
 
-class CloudpickleExecutor(_ExecutorBase):
+class CloudpickleExecutor(Executor):
     """Runs each fn(*args) in its own subprocess (via
     CloudpickleProcessPoolExecutor), isolating a crash or memory leak in fn
     from the worker task running executor_wrapper. fn may be a closure or
@@ -201,7 +195,7 @@ def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
     return os.process_cpu_count() or 1
 
 
-class DaskExecutor(_ExecutorBase):
+class DaskExecutor(Executor):
     """For an fn that returns a dask-delayed object (or dask
     array/dataframe): calls fn(*args), then computes the result at the
     execution site, on dask's "processes" scheduler backed by a
