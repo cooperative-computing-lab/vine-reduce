@@ -396,14 +396,6 @@ class Pipeline:
         )
 
     @property
-    def proc_tasks_in_flight(self) -> int:
-        return sum(1 for task in self._in_flight.values() if isinstance(task, _ChunkTask))
-
-    @property
-    def reduce_tasks_in_flight(self) -> int:
-        return self.in_flight_count() - self.proc_tasks_in_flight
-
-    @property
     def failed_files(self) -> frozenset[str]:
         """Dataset file URLs permanently given up on during preprocessing -
         see _give_up_on_file. Does not include files caught up in a reducer
