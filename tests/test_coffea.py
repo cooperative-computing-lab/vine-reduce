@@ -4,10 +4,10 @@ import json
 
 import pytest
 
+from vine_reduce.checkpoint_store import checksum_dataset
 from vine_reduce.coffea import (
     CoffeaExecutor,
     VineReduceCoffea,
-    _checksum_fileset,
     coffea_input_to_datasets,
     default_reducer,
 )
@@ -170,7 +170,7 @@ def test_preprocess_cache_hit_skips_preprocess(tmp_path, monkeypatch):
     fileset = {"ds": {"files": {"a.root": "Events"}}}
     cache_file = tmp_path / "cache.jsonl"
     cached_result = {"ds": {"files": {"a.root": {"num_entries": 100}}}}
-    checksum = _checksum_fileset(fileset)
+    checksum = checksum_dataset(fileset)
     with open(cache_file, "w") as f:
         f.write(json.dumps({"checksum": checksum}) + "\n")
         f.write(json.dumps(cached_result) + "\n")

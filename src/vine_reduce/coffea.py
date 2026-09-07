@@ -11,7 +11,6 @@ overall design.
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import operator
 import os
@@ -23,6 +22,7 @@ from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 from coffea.nanoevents import NanoAODSchema
 
 from . import defaults
+from .checkpoint_store import checksum_dataset
 from .engine import VineReduce
 from .executor import SimpleExecutor
 from .types import Chunk
@@ -77,11 +77,7 @@ def coffea_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]
     means the fileset hasn't been preprocessed yet. Run
     VineReduceCoffea.preprocess_cache(fileset, cache_file=...) first and pass
     its result (or the cache_file path) in as input_data."""
-    if isinstance(input_data, dict):
-        raw = input_data
-    else:
-        with open(input_data) as f:
-            raw = json.load(f)
+    raw = defaults.default_input_to_datasets(input_data)
 
     datasets = {}
     for name, spec in raw.items():
@@ -158,13 +154,6 @@ class CoffeaExecutor(SimpleExecutor):
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         return _materialize(fn(*args, **self.processor_args))
-
-
-def _checksum_fileset(fileset: dict[str, Any]) -> str:
-    """A stable hash of a fileset's contents, used to detect whether a
-    preprocess_cache entry is still valid for the given input fileset."""
-    encoded = json.dumps(fileset, sort_keys=True, default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_preprocess_cache(cache_file: str | Path, checksum: str) -> dict[str, Any] | None:
@@ -293,7 +282,7 @@ class VineReduceCoffea(VineReduce):
         (not vine_reduce's flat shape); pass the result as input to
         coffea_input_to_datasets (e.g. via VineReduceCoffea's default
         input_to_datasets)."""
-        checksum = _checksum_fileset(fileset)
+        checksum = checksum_dataset(fileset)
         cached = _read_preprocess_cache(cache_file, checksum)
         if cached is not None:
             return cached
