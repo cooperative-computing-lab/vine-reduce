@@ -911,16 +911,15 @@ class Pipeline:
                 )
         # Only the group's not-yet-checkpointed fallback lineage is ours to
         # free here - it was never durable, so losing it is fine now that the
-        # group itself is being given up on. A group item that is ITSELF
-        # already a checkpoint still has its own untouched DB row (this
-        # failure never superseded it - only a successful _checkpoint does
-        # that), so _release_covered must not run on it: that call
-        # unconditionally deletes the item's durable file, which would leave
-        # the surviving row pointing at nothing and break adopting it on
-        # restart.
+        # group itself is being given up on. Any item that is ITSELF a
+        # checkpoint - whether at the top of the group or reached through a
+        # non-checkpointed intermediate - still has its own untouched DB row
+        # (this failure never superseded it - only a successful _checkpoint
+        # does that), so keep_checkpoints=True must stop _release_covered
+        # from deleting its durable file, which would leave the surviving
+        # row pointing at nothing and break adopting it on restart.
         for item in group:
-            if not item.is_checkpointed:
-                self._release_covered(item)
+            self._release_covered(item, keep_checkpoints=True)
 
     def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
         """Whether enough work has piled up since the last checkpoint - in wall
@@ -1025,7 +1024,7 @@ class Pipeline:
                 stack.extend(item.inputs)
         return row_ids
 
-    def _release_covered(self, root: PoolItem) -> None:
+    def _release_covered(self, root: PoolItem, *, keep_checkpoints: bool = False) -> None:
         """Retention rule (invariant #3): a result may be freed only once a
         durable checkpoint covers it downstream; this is called exactly when
         such a checkpoint lands, once per item folded into it. Frees root
@@ -1034,12 +1033,20 @@ class Pipeline:
         already freed when IT was checkpointed (invariant #2). An explicit
         stack, not recursion, so an arbitrarily long uncheckpointed chain
         cannot hit Python's recursion limit; clearing handle/inputs as it
-        goes makes double-release structurally impossible."""
+        goes makes double-release structurally impossible.
+
+        keep_checkpoints=True skips release_result on any item that is
+        itself a checkpoint (its handle and inputs are still cleared): used
+        by _give_up_on_reduction, where nothing supersedes those rows'
+        durable files the way a successful _checkpoint's phase 2 does, so
+        deleting them here would strand a surviving DB row pointing at
+        nothing."""
         stack = [root]
         while stack:
             item = stack.pop()
             if item.handle is not None:
-                self._distributor.release_result(item.handle.result_id)
+                if not (keep_checkpoints and item.is_checkpointed):
+                    self._distributor.release_result(item.handle.result_id)
                 item.handle = None
             if not item.is_checkpointed:
                 stack.extend(item.inputs)

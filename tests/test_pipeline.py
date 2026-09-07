@@ -1130,6 +1130,58 @@ def test_reducer_permanent_failure_keeps_checkpointed_inputs_on_disk(fake_distri
     db.close()
 
 
+def test_reducer_permanent_failure_keeps_deep_checkpointed_lineage_on_disk(fake_distributor, tmp_path):
+    """Same guarantee as the test above, but for a checkpoint reached
+    through a non-checkpointed intermediate reduction rather than sitting
+    directly in the failing group: a.root restarts as an already-
+    checkpointed item A; b.root/c.root are processed fresh into B and C.
+    reduction_size=2 folds A+B into X first - a non-final, non-checkpointed
+    reduction, since no checkpoint thresholds are set - then X+C is
+    attempted and fails permanently. _release_covered must stop at A
+    (reached through X's uncheckpointed lineage) rather than deleting its
+    durable file while its DB row survives."""
+    dataset = {"files": {"a.root": 5, "b.root": 5, "c.root": 5}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    file_a = checkpoint_dir / "a.pkl.zst"
+    serialization.dump(5, str(file_a))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers_files=["a.root"],
+        num_events=5,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=False,
+        path=str(file_a),
+    )
+
+    def reducer(a, b):
+        if a + b == 15:  # only the X+C fold sums to 15; A+B (=10) must succeed
+            raise ValueError("boom")
+        return a + b
+
+    pipeline, _ = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reducer=reducer,
+        reduction_size=2,
+        attempts=1,
+        db=db,
+    )
+
+    with pytest.raises(VineReduceError):
+        run_to_completion(pipeline, fake_distributor)
+
+    rows = db.checkpoints_for("proc", "ds")
+    assert len(rows) == 1  # A's row was never superseded - the fold never succeeded
+    assert os.path.exists(rows[0].path)
+    db.close()
+
+
 def test_processor_permanent_failure_is_skipped_within_failure_proportion(
     fake_distributor, tmp_path
 ):
