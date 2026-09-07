@@ -149,7 +149,7 @@ class TaskVineDistributor(Distributor):
         self._tag = f"vine_reduce_{uuid4().hex}"
 
         if self._owns_manager:
-            self._manager.tune("category-steady-n-tasks", 2)
+            self._manager.tune("category-steady-n-tasks", 1)
             self._manager.tune("hungry-minimum", 100)
             self._manager.tune("prefer-dispatch", 1)
             self._manager.tune("temp-replica-count", 3)
