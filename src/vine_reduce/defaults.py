@@ -124,27 +124,21 @@ def executor_wrapper(
     dest_file: str,
     processor: Callable[[Any], Any],
     chunk: Chunk,
-    dataset_metadata: dict[str, Any],
-    distributor_metadata: dict[str, Any] | None,
-    executor_metadata: dict[str, Any] | None,
+    metadata: dict[str, dict[str, Any] | None],
     chunk_to_args: Callable[..., Any],
     executor: Executor,
 ) -> Outcome:
     """Runs remotely. Calls chunk_to_args then executor.submit, measures
     resources, and serializes the processing result to dest_file on
     success. executor is a fresh, just-deserialized copy for this call
-    alone - shut down via `with executor:` once run() returns."""
+    alone - shut down via `with executor:` once run() returns. metadata
+    holds the dataset/distributor/executor metadata dicts, keyed "dataset"/
+    "distributor"/"executor" - see Executor.submit."""
 
     def run() -> Any:
-        args = chunk_to_args(chunk, dataset_metadata, distributor_metadata)
+        args = chunk_to_args(chunk, metadata["dataset"], metadata.get("distributor"))
         with executor:
-            return executor.submit(
-                processor,
-                args,
-                dataset_metadata=dataset_metadata,
-                distributor_metadata=distributor_metadata,
-                executor_metadata=executor_metadata,
-            ).result()
+            return executor.submit(processor, args, metadata=metadata).result()
 
     return _run_and_wrap(dest_file, run)
 

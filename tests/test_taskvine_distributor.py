@@ -236,9 +236,7 @@ def test_failed_task_reports_real_traceback_not_output_missing(dist_with_workers
         executor_wrapper,
         failing_processor,
         Chunk("a.root", 0, 5),
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         default_chunk_to_args,
         SimpleExecutor(),
     )
@@ -342,9 +340,7 @@ def test_add_file_ships_file_to_every_task_sandbox(dist_with_workers, tmp_path):
         executor_wrapper,
         read_shipped_file,
         Chunk("a.root", 0, 1),
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         default_chunk_to_args,
         SimpleExecutor(),
     )
@@ -370,9 +366,7 @@ def test_set_env_var_is_visible_to_every_task(dist_with_workers, tmp_path):
         executor_wrapper,
         read_env_var,
         Chunk("a.root", 0, 1),
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         default_chunk_to_args,
         SimpleExecutor(),
     )

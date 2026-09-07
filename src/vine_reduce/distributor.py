@@ -86,8 +86,9 @@ class Distributor(Protocol):
         kind, or None if this distributor has no meaningful default. This is
         a static cap known ahead of dispatch (e.g. TaskVineDistributor's
         configured category limit) - vine_reduce passes it as
-        distributor_metadata into executor_wrapper/chunk_to_args/executor,
-        for use as a fallback where the execution site itself doesn't report
+        metadata["distributor"] into executor_wrapper (which also forwards
+        it to chunk_to_args and executor.submit), for use as a fallback
+        where the execution site itself doesn't report
         a more precise, real allocation (e.g. TaskVine's worker setting the
         CORES environment variable at dispatch time, which may be less than
         this cap - see DaskExecutor's _num_workers)."""

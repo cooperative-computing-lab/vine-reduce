@@ -49,14 +49,13 @@ class Executor(Protocol):
         fn: Callable[..., Any],
         /,
         *args: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
+        metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
-        """Run fn(*args) and return a Future for its result. The three
-        metadata dicts are the same ones chunk_to_args receives - dataset
-        metadata, per-task resource info from the distributor (e.g.
-        "cores"), and free-form executor config."""
+        """Run fn(*args) and return a Future for its result. metadata holds
+        the same three dicts chunk_to_args receives, keyed "dataset" /
+        "distributor" / "executor" - dataset metadata, per-task resource
+        info from the distributor (e.g. "cores"), and free-form executor
+        config."""
         ...
 
     def shutdown(self, wait: bool = True) -> None:
@@ -106,9 +105,7 @@ class SimpleExecutor(_ExecutorBase):
         fn: Callable[..., Any],
         /,
         *args: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
+        metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
         return _submitted(self._call, fn, *args)
 
@@ -172,9 +169,7 @@ class CloudpickleExecutor(_ExecutorBase):
         fn: Callable[..., Any],
         /,
         *args: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
+        metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
         return self._ensure_pool().submit(fn, *args)
 
@@ -225,13 +220,11 @@ class DaskExecutor(_ExecutorBase):
         fn: Callable[..., Any],
         /,
         *args: Any,
-        dataset_metadata: dict[str, Any] | None = None,
-        distributor_metadata: dict[str, Any] | None = None,
-        executor_metadata: dict[str, Any] | None = None,
+        metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
         def call() -> Any:
             to_maybe_compute = fn(*args)
-            num_workers = self.num_workers or _num_workers(distributor_metadata)
+            num_workers = self.num_workers or _num_workers((metadata or {}).get("distributor"))
             with CloudpickleProcessPoolExecutor(max_workers=num_workers) as pool:
                 return to_maybe_compute.compute(
                     scheduler="processes",

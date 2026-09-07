@@ -520,9 +520,11 @@ class Pipeline:
             defaults.executor_wrapper,
             self._processor,
             chunk,
-            self._dataset_metadata,
-            self._distributor.resources("processor"),
-            None,
+            {
+                "dataset": self._dataset_metadata,
+                "distributor": self._distributor.resources("processor"),
+                "executor": None,
+            },
             self._chunk_to_args,
             self._executor,
         )

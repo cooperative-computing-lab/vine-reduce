@@ -126,7 +126,7 @@ def test_dask_executor_constructor_num_workers_overrides_distributor_metadata():
     chunk = type("Chunk", (), {"start": 0, "stop": 5})()
     result = (
         DaskExecutor(num_workers=2)
-        .submit(processor, chunk, distributor_metadata={"cores": 7})
+        .submit(processor, chunk, metadata={"distributor": {"cores": 7}})
         .result()
     )
 

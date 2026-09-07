@@ -132,7 +132,7 @@ def test_vine_reduce_coffea_executor_materializes_result():
     def processor(events):
         return {"count": len(events)}
 
-    result = vr.executor.submit(processor, [1, 2, 3], dataset_metadata={}).result()
+    result = vr.executor.submit(processor, [1, 2, 3], metadata={"dataset": {}}).result()
     assert result == {"count": 3}
 
 

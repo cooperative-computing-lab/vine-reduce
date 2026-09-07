@@ -83,13 +83,13 @@ it as:
 ```python
 executor.submit(
     processor, args,
-    dataset_metadata=..., distributor_metadata=..., executor_metadata=...,
+    metadata={"dataset": ..., "distributor": ..., "executor": ...},
 ).result()
 ```
 
 `Executor` follows `concurrent.futures.Executor`'s `submit`/`shutdown`
 shape (and is usable as a context manager), though `submit` takes the
-three metadata dicts above as extra keyword arguments.
+`metadata` dict-of-dicts above as an extra keyword argument.
 
 - `SimpleExecutor()` (default) — calls `processor(args)` directly.
 - `CloudpickleExecutor(max_workers=1)` — runs `processor(args)` in its own

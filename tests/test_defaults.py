@@ -71,9 +71,7 @@ def test_executor_wrapper_success(tmp_path):
         dest,
         count_events,
         chunk,
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
@@ -90,9 +88,7 @@ def test_executor_wrapper_failure_captures_traceback(tmp_path):
         dest,
         failing_processor,
         chunk,
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
@@ -112,9 +108,7 @@ def test_executor_wrapper_resource_exhaustion(tmp_path):
         dest,
         exhausting_processor,
         chunk,
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
@@ -132,9 +126,7 @@ def test_executor_wrapper_unpicklable_result_becomes_failure(tmp_path):
         dest,
         unpicklable_processor,
         chunk,
-        {},
-        None,
-        None,
+        {"dataset": {}, "distributor": None, "executor": None},
         lambda c, dm, dmeta=None: c,
         SimpleExecutor(),
     )
