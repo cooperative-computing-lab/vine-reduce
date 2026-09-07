@@ -55,7 +55,17 @@ _MIN_REFRESH_INTERVAL_S = 0.2
 
 
 def _fmt(value: Any) -> str:
-    return f"{value:.2f}" if isinstance(value, float) else str(value)
+    return str(math.ceil(value)) if isinstance(value, float) else str(value)
+
+
+def _fmt_resource(measured: Any, allocated: Any) -> str:
+    """measured(allocated), e.g. memory_mb=200(500) - or just the measured
+    value when this resource has no known allocation (e.g. wall_time_s,
+    which isn't a cap a distributor sets)."""
+    text = _fmt(measured)
+    if allocated is not None:
+        text += f"({_fmt(allocated)})"
+    return text
 
 
 class NullProgressReporter:
@@ -196,14 +206,16 @@ class ProgressReporter:
 
     def report(self, task: TaskReport) -> None:
         style = _STATUS_STYLE[task.status]
-        cores = task.resources.get("cores")
-        memory_mb = task.resources.get("memory_mb")
-        wall_time_s = task.resources.get("wall_time_s")
+        allocated = task.resources_allocated or {}
+        resources = " ".join(
+            f"{key}={_fmt_resource(task.resources.get(key), allocated.get(key))}"
+            for key in ("cores", "memory_mb", "wall_time_s")
+        )
         self._console.print(
             f"[{style}]{task.status:<20}[/{style}] "
             f"{task.kind:<9} {task.processor_name}/{task.dataset_name} {task.description} "
             f"(id={task.result_id[:8]}) "
-            f"cores={_fmt(cores)} memory_mb={_fmt(memory_mb)} wall_time_s={_fmt(wall_time_s)}"
+            f"{resources}"
         )
         if task.status != "success" and task.std_output:
             self._console.print(task.std_output, style="dim", highlight=False)

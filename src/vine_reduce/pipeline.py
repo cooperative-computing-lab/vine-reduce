@@ -37,6 +37,7 @@ class TaskReport:
     description: str
     status: str  # "success" | "resource_exhaustion" | "failure"
     resources: dict[str, Any]
+    resources_allocated: dict[str, Any] | None
     std_output: str | None
 
 
@@ -605,6 +606,12 @@ class Pipeline:
     def _report_task(self, kind: str, description: str, outcome: Outcome) -> None:
         if self._task_reporter is None:
             return
+        resources_allocated = outcome.resources_allocated
+        if resources_allocated is None:
+            # The distributor didn't report a per-call allocation.
+            # Fall back to what was requested at submit time.
+            distributor_kind = "processor" if kind == "processor" else "reducer"
+            resources_allocated = self._distributor.resources(distributor_kind)
         self._task_reporter.report(
             TaskReport(
                 processor_name=self.processor_name,
@@ -614,6 +621,7 @@ class Pipeline:
                 description=description,
                 status=_status_of(outcome),
                 resources=outcome.resources,
+                resources_allocated=resources_allocated,
                 std_output=outcome.std_output,
             )
         )

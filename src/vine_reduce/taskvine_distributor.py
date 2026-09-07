@@ -325,6 +325,7 @@ class TaskVineDistributor:
 
         entry = self._in_flight_by_taskvine_id.pop(task.id)
         result_id, kind = entry.result_id, entry.kind
+        allocated = self._allocated_from_task(task)
 
         if task.successful():
             raw = task.output
@@ -337,11 +338,14 @@ class TaskVineDistributor:
                 self.release_result(result_id)
                 return RuntimeFailure(
                     result_id=result_id,
-                    resources=self._resources_from_task(task, kind),
+                    resources=self._measured_from_task(task),
+                    resources_allocated=allocated,
                     std_output=task.std_output,
                     traceback=f"failed to load task output: {raw!r}",
                 )
-            outcome = raw.to_outcome(result_id, std_output=task.std_output)
+            outcome = raw.to_outcome(
+                result_id, std_output=task.std_output, resources_allocated=allocated
+            )
             if not isinstance(outcome, Success):
                 # The wrapper ran to completion but reported a Python-level
                 # failure/exhaustion (see defaults.py's _run_and_wrap) -
@@ -361,26 +365,50 @@ class TaskVineDistributor:
         # here, or it would leak for the rest of the run (a resource-
         # exhausted chunk, say, is simply retried).
         self.release_result(result_id)
-        resources = self._resources_from_task(task, kind)
+        resources = self._measured_from_task(task)
         if task.result in _RESOURCE_EXHAUSTION_RESULTS:
             return ResourceExhaustion(
-                result_id=result_id, resources=resources, std_output=task.std_output
+                result_id=result_id,
+                resources=resources,
+                resources_allocated=allocated,
+                std_output=task.std_output,
             )
         return RuntimeFailure(
             result_id=result_id,
             resources=resources,
+            resources_allocated=allocated,
             std_output=task.std_output,
             traceback=f"taskvine result: {task.result}\n{task.std_output}",
         )
 
-    def _resources_from_task(self, task: vine.Task, kind: TaskKind) -> dict[str, Any]:
-        measured = task.resources_measured
-        if measured is None:
-            return {"cores": 0.0, "memory_mb": 0.0, "wall_time_s": 0.0}
+    def _measured_from_task(self, task: vine.Task) -> dict[str, Any]:
+        """Usage actually measured for this task, or an all-zero placeholder
+        if TaskVine has no resource_monitor data for it (e.g. it crashed
+        before monitoring even started)."""
+        return self._rmsummary_to_dict(task.resources_measured) or {
+            "cores": 0.0,
+            "memory_mb": 0.0,
+            "wall_time_s": 0.0,
+        }
+
+    def _allocated_from_task(self, task: vine.Task) -> dict[str, Any] | None:
+        """What TaskVine actually allocated this task on its latest attempt
+        - may differ from the category's static resources_processor/
+        resources_reducer cap once automatic resource allocation ("max"
+        mode - see _configure_category) starts adapting per task from
+        measured history. None if TaskVine has no allocation info for it,
+        so the caller falls back to that static cap (see Pipeline.
+        _report_task) instead of a misleading zero."""
+        return self._rmsummary_to_dict(task.resources_allocated)
+
+    @staticmethod
+    def _rmsummary_to_dict(summary: Any) -> dict[str, Any] | None:
+        if summary is None:
+            return None
         return {
-            "cores": measured.cores or 0.0,
-            "memory_mb": measured.memory or 0.0,
-            "wall_time_s": (measured.wall_time or 0) / 1e6,
+            "cores": summary.cores or 0.0,
+            "memory_mb": summary.memory or 0.0,
+            "wall_time_s": (summary.wall_time or 0) / 1e6,
         }
 
     def release_result(self, result_id: str) -> None:

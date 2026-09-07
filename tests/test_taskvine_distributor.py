@@ -152,6 +152,7 @@ def test_wait_survives_a_corrupted_task_output(monkeypatch, tmp_path):
             std_output = ""
             output = ValueError("simulated cloudpickle.load failure")
             resources_measured = None
+            resources_allocated = None
 
             def successful(self):
                 return True

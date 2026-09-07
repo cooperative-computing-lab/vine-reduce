@@ -10,7 +10,7 @@ distributor.py).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -41,6 +41,15 @@ class Outcome:
     resources: usage reported for the call, e.g. {"cores", "memory_mb",
         "wall_time_s"} - see each Distributor implementation for exactly
         which keys it fills in.
+    resources_allocated: what the distributor actually gave this call, if it
+        knows and reports that (e.g. TaskVineDistributor, from
+        task.resources_allocated - TaskVine's automatic resource allocation
+        can adapt this per task from measured history, so it may differ
+        from the category's static resources_processor/resources_reducer
+        cap). None when a distributor has no such per-call figure (e.g.
+        LocalDistributor, or a TaskVine task with no resource_monitor data)
+        - the caller then falls back to that static default (see Pipeline.
+        _report_task).
     std_output: whatever the call printed to stdout, if the distributor is
         able to capture it (e.g. TaskVineDistributor, from task.std_output)
         and None otherwise (e.g. LocalDistributor, which runs in a plain
@@ -51,6 +60,7 @@ class Outcome:
     result_id: str
     resources: dict[str, Any]
     std_output: str | None
+    resources_allocated: dict[str, Any] | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -96,13 +106,20 @@ class RawOutcome:
     file: str | None = None
     traceback: str | None = None
 
-    def to_outcome(self, result_id: str, std_output: str | None = None) -> Outcome:
-        """Attach result_id (and std_output, when the distributor has it -
-        see Outcome) and convert to the matching Outcome subclass."""
+    def to_outcome(
+        self,
+        result_id: str,
+        std_output: str | None = None,
+        resources_allocated: dict[str, Any] | None = None,
+    ) -> Outcome:
+        """Attach result_id (and std_output/resources_allocated, when the
+        distributor has them - see Outcome) and convert to the matching
+        Outcome subclass."""
         if self.status == "success":
             return Success(
                 result_id=result_id,
                 resources=self.resources,
+                resources_allocated=resources_allocated,
                 std_output=std_output,
                 file=self.file,
             )
@@ -110,11 +127,15 @@ class RawOutcome:
             return RuntimeFailure(
                 result_id=result_id,
                 resources=self.resources,
+                resources_allocated=resources_allocated,
                 std_output=std_output,
                 traceback=self.traceback,
             )
         if self.status == "exhausted":
             return ResourceExhaustion(
-                result_id=result_id, resources=self.resources, std_output=std_output
+                result_id=result_id,
+                resources=self.resources,
+                resources_allocated=resources_allocated,
+                std_output=std_output,
             )
         raise ValueError(f"unknown RawOutcome status: {self.status!r}")
