@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import logging
@@ -49,6 +50,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 logger = logging.getLogger(__name__)
 
@@ -157,18 +160,17 @@ def _create_env(
 
 def _find_editable_pip_installs() -> dict[str, str]:
     """package name -> local checkout path, for every package currently
-    `pip install -e`d in this Python's environment."""
-    raw = subprocess.check_output(
-        [sys.executable, "-m", "pip", "list", "--editable"], stdin=subprocess.DEVNULL
-    ).decode()
-
-    # first two lines are a header ("Package Version Editable project location", "----")
+    `pip install -e`d in this Python's environment. """
     paths_by_package = {}
-    for line in raw.splitlines()[2:]:
-        if not line:
+    for dist in importlib.metadata.distributions():
+        raw_direct_url = dist.read_text("direct_url.json")
+        if raw_direct_url is None:
             continue
-        package, _version, location = line.split()
-        paths_by_package[package] = location
+        direct_url = json.loads(raw_direct_url)
+        if not direct_url.get("dir_info", {}).get("editable", False):
+            continue
+        location = url2pathname(urlparse(direct_url["url"]).path)
+        paths_by_package[dist.metadata["Name"]] = location
     return paths_by_package
 
 

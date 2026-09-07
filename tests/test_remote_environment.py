@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.metadata
+import json
 import os
 import subprocess
 import time
@@ -11,10 +13,59 @@ from vine_reduce.remote_environment import (
     UnstagedChanges,
     _check_pack_dependencies,
     _combined_commit_key,
+    _find_editable_pip_installs,
     _local_pip_commits,
     _trim_cache,
     get_environment,
 )
+
+
+class _FakeDistribution:
+    """Just enough of importlib.metadata.Distribution's interface for
+    _find_editable_pip_installs: read_text("direct_url.json") and
+    metadata["Name"]."""
+
+    def __init__(self, name, direct_url_json):
+        self._name = name
+        self._direct_url_json = direct_url_json
+
+    def read_text(self, filename):
+        if filename == "direct_url.json":
+            return self._direct_url_json
+        return None
+
+    @property
+    def metadata(self):
+        return {"Name": self._name}
+
+
+def test_find_editable_pip_installs_decodes_spaces_in_path(monkeypatch):
+    """direct_url.json percent-encodes the checkout path as a file:// URL, so
+    a path containing a space must round-trip correctly - the old `pip list
+    --editable` text-table parser broke on exactly this (Correctness #13)."""
+    editable = _FakeDistribution(
+        "vine_reduce",
+        json.dumps(
+            {
+                "url": "file:///home/user/My%20Projects/vine-reduce",
+                "dir_info": {"editable": True},
+            }
+        ),
+    )
+    non_editable = _FakeDistribution(
+        "numpy", json.dumps({"url": "file:///opt/conda/pkgs/numpy", "dir_info": {}})
+    )
+    no_direct_url = _FakeDistribution("six", None)
+
+    monkeypatch.setattr(
+        importlib.metadata,
+        "distributions",
+        lambda: [editable, non_editable, no_direct_url],
+    )
+
+    assert _find_editable_pip_installs() == {
+        "vine_reduce": "/home/user/My Projects/vine-reduce"
+    }
 
 
 def test_combined_commit_key_with_no_editable_packages_is_fixed():
