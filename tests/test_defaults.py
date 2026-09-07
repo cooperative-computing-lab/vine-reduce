@@ -78,7 +78,7 @@ def test_executor_wrapper_success(tmp_path):
     assert isinstance(outcome, Success)
     assert outcome.file == dest
     assert serialization.load(dest) == 5
-    assert outcome.resources["wall_time_s"] >= 0
+    assert outcome.resources.wall_time_s >= 0
 
 
 def test_executor_wrapper_failure_captures_traceback(tmp_path):

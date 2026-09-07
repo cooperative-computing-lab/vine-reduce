@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .types import ResourceUsage
+
 
 @dataclass(frozen=True)
 class FailureRecord:
@@ -29,7 +31,7 @@ class FailureRecord:
     kind: str
     attempts: int
     resources_allocated: dict[str, Any] | None
-    resources_measured: dict[str, Any] | None
+    resources_measured: ResourceUsage | None
     traceback: str | None
 
 

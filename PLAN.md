@@ -716,10 +716,10 @@ num_events int: property, stop - start.
 ```python
 Outcome: Union of RuntimeFailure, ResourceExhaustion, Success. All variants carry:
   result_id: the id vine_reduce passed to the submit() call this outcome corresponds to.
-  resources Dict[str, Any]: resources used by the task, e.g.
-                            {"cores": ..., "memory_mb": ..., "wall_time_s": ...}.
-                            Measured by executor_wrapper/reducer_wrapper using core python
-                            modules where possible (e.g. resource.getrusage, time.monotonic).
+  resources ResourceUsage: resources used by the task (cores, memory_mb, wall_time_s, disk_mb -
+                            see types.py). Measured by executor_wrapper/reducer_wrapper using
+                            core python modules where possible (e.g. resource.getrusage,
+                            time.monotonic).
 
 RuntimeFailure additionally carries:
   traceback str: captured traceback of the processing/reduction function failure.

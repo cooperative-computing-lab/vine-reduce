@@ -41,12 +41,12 @@ from uuid import uuid4
 
 from .distributor import Distributor
 from .executor import CloudpickleProcessPoolExecutor
-from .types import Outcome, RuntimeFailure, Success
+from .types import Outcome, ResourceUsage, RuntimeFailure, Success
 
 # Placeholder usage for a call whose outcome had to be synthesized rather
 # than measured (see wait()'s BrokenProcessPool handling) - mirrors
 # defaults.py's _unmeasured_resources.
-_UNMEASURED_RESOURCES = {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
+_UNMEASURED_RESOURCES = ResourceUsage(cores=1, memory_mb=0, wall_time_s=0)
 
 
 def _run_with_env(func: Callable[..., Any], args: tuple, env_vars: dict[str, str]) -> Any:

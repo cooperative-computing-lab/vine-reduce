@@ -208,7 +208,7 @@ class ProgressReporter:
         style = _STATUS_STYLE[task.status]
         allocated = task.resources_allocated or {}
         resources = " ".join(
-            f"{key}={_fmt_resource(task.resources.get(key), allocated.get(key))}"
+            f"{key}={_fmt_resource(getattr(task.resources, key), allocated.get(key))}"
             for key in ("cores", "memory_mb", "wall_time_s")
         )
         self._console.print(

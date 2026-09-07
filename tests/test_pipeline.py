@@ -18,7 +18,13 @@ from vine_reduce.pipeline import (
     plan_restart,
 )
 from vine_reduce.size_log import SizeLog
-from vine_reduce.types import Chunk, ResourceExhaustion, ResultHandle, RuntimeFailure
+from vine_reduce.types import (
+    Chunk,
+    ResourceExhaustion,
+    ResourceUsage,
+    ResultHandle,
+    RuntimeFailure,
+)
 
 from helpers import (
     count_events,
@@ -812,7 +818,7 @@ def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor,
     pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=1)  # 1 of 2 already used
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
-        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r1", resources=ResourceUsage(), std_output=None),
     )
     assert pipeline.chunksize == 2
     # not yet split - attempts still carried as-is until it actually splits
@@ -840,7 +846,7 @@ def test_chunk_resource_exhaustion_above_current_size_repools_without_shrinking(
     pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=1)
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
-        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r1", resources=ResourceUsage(), std_output=None),
     )
 
     assert pipeline.chunksize == 2  # not shrunk further
@@ -863,7 +869,7 @@ def test_chunk_resource_exhaustion_above_floor_does_not_give_up_early(fake_distr
     pipeline._in_flight["r1"] = _ChunkTask(chunk=chunk, attempts=0)
     pipeline._handle_chunk_outcome(
         pipeline._in_flight.pop("r1"),
-        ResourceExhaustion(result_id="r1", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r1", resources=ResourceUsage(), std_output=None),
     )
 
     assert pipeline.chunksize == 1  # unchanged, still the floor
@@ -905,7 +911,8 @@ def test_reduction_runtime_failure_retry_preserves_force_final(fake_distributor,
     task = _ReduceTask(group=items, is_final=True, is_checkpoint=True, force_final=True)
 
     pipeline._handle_reduce_runtime_failure(
-        task, RuntimeFailure(result_id="r", resources={}, std_output=None, traceback="boom")
+        task,
+        RuntimeFailure(result_id="r", resources=ResourceUsage(), std_output=None, traceback="boom"),
     )
 
     assert len(pipeline._in_flight) == 1
@@ -1025,7 +1032,7 @@ def test_reduction_attempts_budget_resets_after_resource_exhaustion(fake_distrib
     )
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
-        ResourceExhaustion(result_id="r", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
     )
 
     assert pipeline.reduction_size == 2
@@ -1061,7 +1068,7 @@ def test_reduction_resource_exhaustion_below_current_size_shrinks_and_repools(
     assert pipeline.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
-        ResourceExhaustion(result_id="r", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
     )
 
     assert pipeline.reduction_size == 2  # halved
@@ -1096,7 +1103,7 @@ def test_reduction_resource_exhaustion_below_current_size_at_minimum_raises(
     with pytest.raises(VineReduceError, match="minimum reduction_size"):
         pipeline._handle_reduce_outcome(
             pipeline._in_flight.pop("r"),
-            ResourceExhaustion(result_id="r", resources={}, std_output=None),
+            ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
         )
 
     assert pipeline.reduction_size == 2  # still at the floor
@@ -1132,7 +1139,7 @@ def test_reduction_resource_exhaustion_above_current_size_repools_without_shrink
     assert pipeline.reduce_tasks_submitted == 0
     pipeline._handle_reduce_outcome(
         pipeline._in_flight.pop("r"),
-        ResourceExhaustion(result_id="r", resources={}, std_output=None),
+        ResourceExhaustion(result_id="r", resources=ResourceUsage(), std_output=None),
     )
 
     assert pipeline.reduction_size == 2  # unchanged, not treated as exhausted

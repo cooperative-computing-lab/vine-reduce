@@ -35,13 +35,47 @@ class Chunk:
 
 
 @dataclass(frozen=True)
+class ResourceUsage:
+    """Usage measured (or allocated) for one processor/reducer call, in
+    vine_reduce's own units. A field is None when this distributor/
+    measurement doesn't report that resource - e.g. no distributor
+    measures disk_mb yet (size.jsonl's own docstring anticipates one
+    eventually will); wall_time_s is never a cap, only ever measured."""
+
+    cores: float | None = None
+    memory_mb: float | None = None
+    wall_time_s: float | None = None
+    disk_mb: float | None = None
+
+    def to_rmsummary(self) -> dict[str, float]:
+        """This usage's non-None fields under TaskVine's RMSummary
+        attribute names (cores/memory/disk) - see
+        TaskVineDistributor._configure_category, which builds a
+        ResourceUsage from its configured resource cap to get this."""
+        return self._renamed({"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"})
+
+    def to_size_row(self) -> dict[str, float]:
+        """This usage's non-None fields under size.jsonl's column names
+        (see size_log.py) - see pipeline.py's _update_resource_max, the
+        only caller."""
+        return self._renamed({"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"})
+
+    def _renamed(self, key_map: dict[str, str]) -> dict[str, float]:
+        result = {}
+        for internal_key, output_key in key_map.items():
+            value = getattr(self, internal_key)
+            if value is not None:
+                result[output_key] = value
+        return result
+
+
+@dataclass(frozen=True)
 class Outcome:
     """Base class for the result of a submitted call, as reported by a distributor.
 
     result_id: the id passed to Distributor.submit() for this call.
-    resources: usage reported for the call, e.g. {"cores", "memory_mb",
-        "wall_time_s"} - see each Distributor implementation for exactly
-        which keys it fills in.
+    resources: usage reported for the call - see each Distributor
+        implementation for exactly which fields it fills in.
     resources_allocated: what the distributor actually gave this call, if it
         knows and reports that (e.g. TaskVineDistributor, from
         task.resources_allocated - TaskVine's automatic resource allocation
@@ -59,7 +93,7 @@ class Outcome:
     """
 
     result_id: str
-    resources: dict[str, Any]
+    resources: ResourceUsage
     std_output: str | None
     resources_allocated: dict[str, Any] | None = field(default=None, kw_only=True)
 

@@ -65,7 +65,7 @@ from uuid import uuid4
 import ndcctools.taskvine as vine
 
 from .distributor import Distributor, TaskKind
-from .types import Outcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Outcome, ResourceExhaustion, ResourceUsage, RuntimeFailure, Success
 
 # TaskVine result strings (Task.result) that mean the task was killed for
 # overrunning a resource allocation, as opposed to a genuine execution error.
@@ -75,11 +75,6 @@ _RESOURCE_EXHAUSTION_RESULTS = {
     "sandbox exhaustion",
     "max end time",
 }
-
-# resources_processor/resources_reducer use vine_reduce's own key names; this maps
-# them onto the resource_monitor's rmsummary field names expected by
-# Manager.set_category_resources_max.
-_RESOURCE_KEY_TO_RMSUMMARY = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
 
 
 def _result_token(result_id: str) -> str:
@@ -268,11 +263,10 @@ class TaskVineDistributor(Distributor):
         per-task setting."""
         if category in self._categories_configured:
             return
-        limits = {
-            _RESOURCE_KEY_TO_RMSUMMARY[key]: value
-            for key, value in self._resources_by_kind[kind].items()
-            if key in _RESOURCE_KEY_TO_RMSUMMARY
-        }
+        caps = self._resources_by_kind[kind]
+        limits = ResourceUsage(
+            cores=caps.get("cores"), memory_mb=caps.get("memory_mb"), disk_mb=caps.get("disk_mb")
+        ).to_rmsummary()
         self._manager.set_category_resources_max(category, limits)
         self._manager.set_category_mode(category, "max")
         self._categories_configured.add(category)
@@ -382,15 +376,14 @@ class TaskVineDistributor(Distributor):
             traceback=f"taskvine result: {task.result}\n{task.std_output}",
         )
 
-    def _measured_from_task(self, task: vine.Task) -> dict[str, Any]:
+    def _measured_from_task(self, task: vine.Task) -> ResourceUsage:
         """Usage actually measured for this task, or an all-zero placeholder
         if TaskVine has no resource_monitor data for it (e.g. it crashed
         before monitoring even started)."""
-        return self._rmsummary_to_dict(task.resources_measured) or {
-            "cores": 0.0,
-            "memory_mb": 0.0,
-            "wall_time_s": 0.0,
-        }
+        measured = self._rmsummary_to_dict(task.resources_measured)
+        if measured is None:
+            return ResourceUsage(cores=0.0, memory_mb=0.0, wall_time_s=0.0)
+        return ResourceUsage(**measured)
 
     def _allocated_from_task(self, task: vine.Task) -> dict[str, Any] | None:
         """What TaskVine actually allocated this task on its latest attempt

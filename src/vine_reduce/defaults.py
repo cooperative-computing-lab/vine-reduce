@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 
 from . import serialization
 from .executor import Executor
-from .types import Chunk, Outcome, ResourceExhaustion, RuntimeFailure, Success
+from .types import Chunk, Outcome, ResourceExhaustion, ResourceUsage, RuntimeFailure, Success
 
 
 def default_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]:
@@ -72,19 +72,19 @@ def default_chunk_to_args(
     return chunk
 
 
-def _measure(fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
+def _measure(fn: Callable[[], Any]) -> tuple[Any, ResourceUsage]:
     start_time = time.monotonic()
     result = fn()
     wall_time_s = time.monotonic() - start_time
     # ru_maxrss is kilobytes on Linux, bytes on macOS/BSD; this module targets Linux.
     memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    return result, {"cores": 1, "memory_mb": memory_mb, "wall_time_s": wall_time_s}
+    return result, ResourceUsage(cores=1, memory_mb=memory_mb, wall_time_s=wall_time_s)
 
 
-def _unmeasured_resources() -> dict[str, Any]:
+def _unmeasured_resources() -> ResourceUsage:
     """Placeholder usage for a call that failed before _measure could report
-    anything real. A fresh dict each time, since it ends up on an Outcome."""
-    return {"cores": 1, "memory_mb": 0, "wall_time_s": 0}
+    anything real."""
+    return ResourceUsage(cores=1, memory_mb=0, wall_time_s=0)
 
 
 def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> Outcome:
@@ -105,9 +105,7 @@ def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> Outcome:
         serialization.dump(result, dest_file)
     except MemoryError:
         serialization.dump(None, dest_file)
-        return ResourceExhaustion(
-            result_id="", resources=_unmeasured_resources(), std_output=None
-        )
+        return ResourceExhaustion(result_id="", resources=_unmeasured_resources(), std_output=None)
     except Exception:
         serialization.dump(None, dest_file)
         return RuntimeFailure(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from vine_reduce.failure_log import FailureLog, FailureRecord
+from vine_reduce.types import ResourceUsage
 
 
 def test_failure_log_creates_file_lazily(tmp_path):
@@ -35,7 +36,7 @@ def test_failure_log_appends_readable_blocks_in_order(tmp_path):
             kind="processor",
             attempts=3,
             resources_allocated={"cores": 1},
-            resources_measured={"cores": 1, "memory_mb": 512.0, "wall_time_s": 1.5},
+            resources_measured=ResourceUsage(cores=1, memory_mb=512.0, wall_time_s=1.5),
             traceback="Traceback (most recent call last):\nValueError: boom",
         )
     )

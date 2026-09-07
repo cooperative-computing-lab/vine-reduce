@@ -17,7 +17,15 @@ from .distributor import Distributor
 from .executor import Executor
 from .failure_log import FailureLog, FailureRecord
 from .size_log import SizeLog, SizeRecord
-from .types import Chunk, Outcome, ResourceExhaustion, ResultHandle, RuntimeFailure, Success
+from .types import (
+    Chunk,
+    Outcome,
+    ResourceExhaustion,
+    ResourceUsage,
+    ResultHandle,
+    RuntimeFailure,
+    Success,
+)
 
 
 class VineReduceError(RuntimeError):
@@ -38,7 +46,7 @@ class TaskReport:
     result_id: str
     description: str
     status: str  # "success" | "resource_exhaustion" | "failure"
-    resources: dict[str, Any]
+    resources: ResourceUsage
     resources_allocated: dict[str, Any] | None
     std_output: str | None
 
@@ -69,23 +77,13 @@ def _status_of(outcome: Outcome) -> str:
     return "failure"
 
 
-# Maps an Outcome.resources key onto its size.jsonl name (see size_log.py) -
-# only a key a distributor actually reports ends up in a SizeRecord's
-# processing/reduction dict, so e.g. "disk" stays absent until some
-# distributor starts measuring it.
-_SIZE_RESOURCE_KEYS = {"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"}
-
-
-def _update_resource_max(maxes: dict[str, float], resources: dict[str, Any]) -> None:
+def _update_resource_max(maxes: dict[str, float], resources: ResourceUsage) -> None:
     """Folds one Success outcome's measured resources into a running
     {"cores"/"memory"/"disk": peak} dict - see SizeRecord.processing/
     reduction. Only called for Success outcomes (see Pipeline._handle_chunk_
     outcome/_handle_reduce_outcome) - a killed/failed task's numbers aren't
     trusted as a genuine peak."""
-    for internal_key, output_key in _SIZE_RESOURCE_KEYS.items():
-        value = resources.get(internal_key)
-        if value is None:
-            continue
+    for output_key, value in resources.to_size_row().items():
         maxes[output_key] = max(maxes.get(output_key, value), value)
 
 
@@ -739,8 +737,8 @@ class Pipeline:
         self.proc_tasks_completed += 1
         self.events_completed += chunk.num_events
         _update_resource_max(self._processing_max, outcome.resources)
-        wall_time_s = outcome.resources.get("wall_time_s", 0.0)
-        memory_mb = outcome.resources.get("memory_mb", 0.0)
+        wall_time_s = outcome.resources.wall_time_s or 0.0
+        memory_mb = outcome.resources.memory_mb or 0.0
 
         progress = self._files_in_progress[chunk.url]
         progress.covered_events += chunk.num_events
@@ -791,7 +789,7 @@ class Pipeline:
         *,
         kind: str,
         attempts: int,
-        resources_measured: dict[str, Any] | None,
+        resources_measured: ResourceUsage | None,
         traceback: str | None,
     ) -> bool:
         """A processor permanent failure: log it, drop the file from the
@@ -924,8 +922,8 @@ class Pipeline:
         # recover it without recomputing everything from scratch. See
         # _release_covered, invoked from _checkpoint once new_item
         # eventually does become durable.
-        wall_time_s = outcome.resources.get("wall_time_s", 0.0)
-        memory_mb = outcome.resources.get("memory_mb", 0.0)
+        wall_time_s = outcome.resources.wall_time_s or 0.0
+        memory_mb = outcome.resources.memory_mb or 0.0
         new_item = PoolItem(
             handle=ResultHandle(outcome.result_id, outcome.file),
             num_events=sum(item.num_events for item in group),
@@ -950,7 +948,7 @@ class Pipeline:
         group: list[PoolItem],
         *,
         attempts: int,
-        resources_measured: dict[str, Any] | None,
+        resources_measured: ResourceUsage | None,
         traceback: str | None,
     ) -> None:
         """A reducer permanent failure: log every file folded into the
