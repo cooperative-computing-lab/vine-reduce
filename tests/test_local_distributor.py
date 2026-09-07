@@ -154,6 +154,34 @@ def test_checkpoint_result_is_written_to_checkpoint_dir_not_work_dir(distributor
     assert outcomes[checkpoint_id].file.startswith(str(tmp_path / "checkpoints") + os.sep)
 
 
+def test_failed_checkpoint_task_does_not_leak_a_placeholder_file(distributor, tmp_path):
+    """_run_and_wrap always writes dest_file, even on failure, as a
+    placeholder - wait() must remove it for a non-Success outcome, or it
+    accumulates forever under checkpoint_dir, which shutdown() never
+    touches (Correctness #7)."""
+    checkpoint_id = uuid4().hex
+    distributor.submit(
+        checkpoint_id,
+        1,
+        "test:process",
+        "processor",
+        executor_wrapper,
+        failing_processor,
+        Chunk("a.root", 0, 5),
+        {},
+        None,
+        None,
+        default_chunk_to_args,
+        SimpleExecutor(),
+        is_checkpoint=True,
+    )
+
+    outcome = distributor.wait(timeout=30)
+
+    assert isinstance(outcome, RuntimeFailure)
+    assert os.listdir(str(tmp_path / "checkpoints")) == []
+
+
 def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
     """A checkpoint has to survive this process ending, so it can be read back
     on restart - unlike an owned work_dir, which is disposable scratch space
