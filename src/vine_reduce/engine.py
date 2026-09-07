@@ -289,7 +289,15 @@ class VineReduce:
 
             datasets = input_to_datasets(self.input)
             for name, dataset in datasets.items():
-                db.dataset_changed(name, checksum_dataset(dataset))
+                discarded_paths = db.dataset_changed(name, checksum_dataset(dataset))
+                for path in discarded_paths:
+                    # The dataset's definition changed, so these checkpoints
+                    # (including any prior final result) no longer apply -
+                    # dataset_changed only drops the DB rows, so the orphaned
+                    # files are removed here or they'd sit in results_dir
+                    # forever next to the result this run produces.
+                    if os.path.exists(path):
+                        os.remove(path)
 
             reporter: ProgressReporter | NullProgressReporter = stack.enter_context(
                 ProgressReporter() if self.progress else NullProgressReporter()

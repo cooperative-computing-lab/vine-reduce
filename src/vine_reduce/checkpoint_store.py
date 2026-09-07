@@ -133,15 +133,27 @@ class CheckpointStore:
             )
             """)
 
-    def dataset_changed(self, dataset: str, checksum: str) -> bool:
+    def dataset_changed(self, dataset: str, checksum: str) -> list[str]:
         """Compares checksum to what's on record for dataset. If different (or
         not on record yet), records it, discards any checkpoints on file for
-        that dataset (they no longer apply), and returns True."""
+        that dataset (they no longer apply), and returns the discarded rows'
+        result file paths - dataset_changed only touches the database, so
+        it's the caller's job to unlink those files (otherwise a changed
+        dataset's old final result sits in results_dir next to the new one
+        forever). Empty (falsy) when the checksum matches and nothing was
+        discarded."""
         row = self._conn.execute(
             "SELECT checksum FROM dataset_checksums WHERE dataset = ?", (dataset,)
         ).fetchone()
         if row is not None and row["checksum"] == checksum:
-            return False
+            return []
+
+        discarded_paths = [
+            r["path"]
+            for r in self._conn.execute(
+                "SELECT path FROM checkpoints WHERE dataset = ?", (dataset,)
+            ).fetchall()
+        ]
 
         with self._conn:
             # ON DELETE CASCADE clears the matching checkpoint_files rows too.
@@ -151,7 +163,7 @@ class CheckpointStore:
                 "ON CONFLICT(dataset) DO UPDATE SET checksum = excluded.checksum",
                 (dataset, checksum),
             )
-        return True
+        return discarded_paths
 
     def record(
         self,

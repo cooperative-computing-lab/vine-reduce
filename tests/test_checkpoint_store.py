@@ -109,14 +109,14 @@ def test_record_is_atomic_when_insert_fails(tmp_path):
 
 def test_dataset_changed_first_time_is_true(tmp_path):
     store = CheckpointStore(str(tmp_path / "db.sqlite"))
-    assert store.dataset_changed("ds", "checksum-1") is True
+    assert store.dataset_changed("ds", "checksum-1") == []
     store.close()
 
 
 def test_dataset_changed_stable_checksum_is_false(tmp_path):
     store = CheckpointStore(str(tmp_path / "db.sqlite"))
     store.dataset_changed("ds", "checksum-1")
-    assert store.dataset_changed("ds", "checksum-1") is False
+    assert store.dataset_changed("ds", "checksum-1") == []
     store.close()
 
 
@@ -145,7 +145,7 @@ def test_dataset_changed_wipes_checkpoints_for_that_dataset_only(tmp_path):
         path="/tmp/b.pkl",
     )
 
-    assert store.dataset_changed("ds1", "checksum-2") is True
+    assert store.dataset_changed("ds1", "checksum-2") == ["/tmp/a.pkl"]
 
     assert store.checkpoints_for("proc", "ds1") == []
     assert len(store.checkpoints_for("proc", "ds2")) == 1

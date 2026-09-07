@@ -251,6 +251,50 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     assert os.listdir(str(results_dir)) == ["already_done.pkl.zst"]
 
 
+def test_dataset_change_deletes_the_stale_final_result_file(tmp_path, dataset_input, distributor):
+    """dataset_changed() drops the DB row for a changed dataset's old final
+    result, but that alone leaves the file itself sitting in results_dir
+    forever (Correctness #4) - compute() must unlink it too, so a re-run
+    after editing a dataset's definition doesn't leave the old final result
+    beside the new one."""
+    old_datasets = {"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3}}}
+    new_datasets = {"numbers": {"metadata": {}, "files": {"a.root": 7, "b.root": 3, "c.root": 5}}}
+    input_path = dataset_input(new_datasets)
+
+    db_path = tmp_path / "vine_reduce.db"
+    results_dir = tmp_path / "results" / "numbers" / "count"
+    results_dir.mkdir(parents=True)
+    stale_file = results_dir / "stale.pkl.zst"
+    serialization.dump(999, str(stale_file))
+
+    db = CheckpointStore(str(db_path))
+    db.dataset_changed("numbers", checksum_dataset(old_datasets["numbers"]))
+    db.record(
+        processor="count",
+        dataset="numbers",
+        covers_files=["a.root", "b.root"],
+        num_events=10,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=True,
+        path=str(stale_file),
+    )
+    db.close()
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        db_path=str(db_path),
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+    vr.compute()
+
+    assert not os.path.exists(stale_file)
+    assert _read_only_result(vr.results_dir, "numbers") == 15
+
+
 def test_environment_variables_reach_the_processor(tmp_path, dataset_input, distributor):
     input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 1}}})
 

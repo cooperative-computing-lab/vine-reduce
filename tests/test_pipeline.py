@@ -758,6 +758,30 @@ def test_chunk_resource_exhaustion_at_minimum_size_raises_immediately(fake_distr
     db.close()
 
 
+def test_chunk_resource_exhaustion_clamps_to_minimum_instead_of_jumping_below_it(
+    fake_distributor, tmp_path
+):
+    """chunksize=6 with minimum_chunksize=4 (both legal) must still try
+    size 4 before giving up - halving 6 -> 3 and giving up without ever
+    trying 4 was Correctness #6."""
+    dataset = {"files": {"a.root": 6}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        processor=exhausting_processor,
+        chunksize=6,
+        minimum_chunksize=4,
+        attempts=5,
+    )
+
+    with pytest.raises(VineReduceError, match="minimum chunk size"):
+        run_to_completion(pipeline, fake_distributor)
+
+    assert pipeline.chunksize == 4  # tried the floor, not skipped past it
+    db.close()
+
+
 def test_chunk_attempts_budget_resets_after_a_productive_split(fake_distributor, tmp_path):
     """A ResourceExhaustion-driven halving is a fresh start for the smaller
     chunks it produces, not a strike against the attempts already used."""
@@ -843,6 +867,43 @@ def test_reduction_runtime_failure_retries_within_attempts_then_succeeds(
     db.close()
 
 
+def test_reduction_runtime_failure_retry_preserves_force_final(fake_distributor, tmp_path):
+    """The drain group (maybe_drain_final_group's forced-final fold) is
+    final only via force_final, never via is_result - _is_result is never
+    even consulted for it (see _submit_reduction's docstring). If a
+    RuntimeFailure retry drops force_final (Correctness #9),
+    _submit_reduction falls back to is_result on the identical group and
+    gets the same False it always would, so the retry's eventual success is
+    never recognized as final and result_postprocess never runs."""
+    dataset = {"files": {"a.root": 1, "b.root": 1}}
+    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=10)
+
+    items = [
+        PoolItem(
+            handle=ResultHandle(f"r{i}", f"f{i}"),
+            num_events=1,
+            wall_time_s=0.0,
+            memory_mb=0.0,
+            files=frozenset({f"{c}.root"}),
+            since_checkpoint_time=0.0,
+            since_checkpoint_distance=0,
+            attempts=0,
+        )
+        for i, c in enumerate("ab")
+    ]
+    task = _ReduceTask(group=items, is_final=True, is_checkpoint=True, force_final=True)
+
+    pipeline._handle_reduce_runtime_failure(
+        task, RuntimeFailure(result_id="r", resources={}, std_output=None, traceback="boom")
+    )
+
+    assert len(pipeline._in_flight) == 1
+    retried = next(iter(pipeline._in_flight.values()))
+    assert retried.force_final is True
+    assert retried.is_final is True
+    db.close()
+
+
 def test_reduction_runtime_failure_exhausts_attempts_and_raises(fake_distributor, tmp_path):
     def always_fails(a, b):
         raise ValueError("boom")
@@ -901,6 +962,34 @@ def test_reduction_resource_exhaustion_stops_at_a_custom_minimum_reduction_size(
     with pytest.raises(VineReduceError, match="minimum reduction_size"):
         run_to_completion(pipeline, fake_distributor)
     assert pipeline.reduction_size == 4  # never shrunk below the custom floor
+    db.close()
+
+
+def test_reduction_resource_exhaustion_clamps_to_minimum_instead_of_jumping_below_it(
+    fake_distributor, tmp_path
+):
+    """reduction_size=3 with minimum_reduction_size=2 (both legal) must
+    still try size 2 before giving up - halving 3 -> 1 and giving up
+    without ever trying 2 was Correctness #6."""
+
+    def always_exhausts(a, b):
+        raise MemoryError("simulated resource exhaustion")
+
+    dataset = {"files": {c + ".root": 1 for c in "abc"}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reducer=always_exhausts,
+        reduction_size=3,
+        minimum_reduction_size=2,
+        attempts=5,
+    )
+
+    with pytest.raises(VineReduceError, match="minimum reduction_size"):
+        run_to_completion(pipeline, fake_distributor)
+
+    assert pipeline.reduction_size == 2  # tried the floor, not skipped past it
     db.close()
 
 
