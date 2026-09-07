@@ -63,8 +63,6 @@ def test_coffea_input_to_datasets_converts_file_specs():
 
 
 def test_coffea_input_to_datasets_reads_json_file(tmp_path):
-    import json
-
     preprocessed = {"ds": {"files": {"a.root": {"num_entries": 5}}}}
     path = tmp_path / "preprocessed.json"
     path.write_text(json.dumps(preprocessed))

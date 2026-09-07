@@ -606,7 +606,6 @@ class Pipeline:
             self.pool
             and self.chunks_all_done
             and self.in_flight_count() == 0
-            and len(self.pool) > 0
             and len(self.pool) <= self.reduction_size
         ):
             group, self.pool = self.pool, []
@@ -699,7 +698,6 @@ class Pipeline:
         if attempts_used >= self._attempts:
             if self._give_up_on_file(
                 chunk,
-                kind="processor",
                 attempts=attempts_used,
                 resources_measured=outcome.resources,
                 traceback=outcome.traceback,
@@ -729,7 +727,6 @@ class Pipeline:
         if decision is _ShrinkDecision.GIVE_UP:
             if self._give_up_on_file(
                 chunk,
-                kind="processor",
                 attempts=task.attempts + 1,
                 resources_measured=outcome.resources,
                 traceback=None,
@@ -807,7 +804,6 @@ class Pipeline:
         self,
         chunk: Chunk,
         *,
-        kind: str,
         attempts: int,
         resources_measured: ResourceUsage | None,
         traceback: str | None,
@@ -827,9 +823,9 @@ class Pipeline:
                 FailureRecord(
                     dataset_name=self.dataset_name,
                     filename=url,
-                    kind=kind,
+                    kind="processor",
                     attempts=attempts,
-                    resources_allocated=self._distributor.resources(kind),
+                    resources_allocated=self._distributor.resources("processor"),
                     resources_measured=resources_measured,
                     traceback=traceback,
                 )
