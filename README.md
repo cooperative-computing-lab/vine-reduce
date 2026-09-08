@@ -160,19 +160,16 @@ NanoEvents-reading, awkward-array materialization, and coffea-style
 accumulator merging, while chunking, checkpointing, and restart are
 inherited unchanged from `VineReduce`. See `src/vine_reduce/coffea.py`.
 
-`examples/cortado/vr_cortado.py` is a runnable example built on it,
-adapted from the ["cortado"
+A runnable example built on it, adapted from the ["cortado"
 example](https://github.com/cooperative-computing-lab/dynamic_data_reduction/tree/main/examples/cortado)
-in `dynamic_data_reduction`, the project this one's dynamic map-reduce loop
-descends from: it generates synthetic NanoAOD-like ROOT files for two
-datasets, skims each down to events with at least four leptons, and merges
-the surviving events per dataset with a custom awkward-array-concatenating
-reducer.
-
-```bash
-cd examples/cortado
-pixi run python vr_cortado.py
-```
+in `dynamic_data_reduction` (the project this one's dynamic map-reduce loop
+descends from), lives at
+[`examples/cortado`](https://github.com/cooperative-computing-lab/vine-cms-analysis-stack/tree/main/examples/cortado)
+in the [`vine-cms-analysis-stack`](https://github.com/cooperative-computing-lab/vine-cms-analysis-stack)
+repo, not in this one - see [`examples/README.md`](examples/README.md) for
+why. It generates synthetic NanoAOD-like ROOT files for two datasets, skims
+each down to events with at least four leptons, and merges the surviving
+events per dataset with a custom awkward-array-concatenating reducer.
 
 ## Production use: ttbarEFT
 
@@ -180,7 +177,8 @@ pixi run python vr_cortado.py
 top-quark EFT search that runs its analysis stage through `vine_reduce`
 on top of TaskVine, distributing histogram-filling processors over an
 HTCondor pool.
-[`examples/ttBar/run_processor_with_vr.py`](examples/ttBar/run_processor_with_vr.py)
+[`examples/ttBar`](https://github.com/cooperative-computing-lab/vine-cms-analysis-stack/tree/main/examples/ttBar)
+in `vine-cms-analysis-stack` (see [`examples/README.md`](examples/README.md))
 shows how that integration looked in practice: driving a `ttbarEFT`
 `AnalysisProcessor` per lepton channel through `vine_reduce`. It predates
 the current `VineReduceCoffea`/`TaskVineDistributor` API described above
@@ -191,14 +189,7 @@ Wilson-coefficient/histogram selection, and X509 proxy handling around
 
 ## Development
 
-```bash
-pixi run -e dev pytest tests/ -v   # run tests
-pixi run -e dev black .            # format
-pixi run -e dev flake8             # lint
-```
-
-CI (GitHub Actions and a mirrored GitLab CI pipeline) runs all three on
-every push and pull request.
+STUB
 
 ## License
 
