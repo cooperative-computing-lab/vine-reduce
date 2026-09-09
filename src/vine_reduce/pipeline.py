@@ -1128,6 +1128,7 @@ class Pipeline:
                     "locator": locator,
                 },
                 f,
+                indent=2,
             )
         return path
 
