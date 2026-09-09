@@ -93,8 +93,8 @@ def dist(tmp_path):
         port=0,
         resources_processor={"cores": 1},
         resources_reducer={"cores": 1},
-        checkpoint_dir=str(tmp_path / "checkpoints"),
     ) as distributor:
+        distributor.set_checkpoint_dir(str(tmp_path / "checkpoints"))
         yield distributor
 
 
@@ -280,8 +280,8 @@ def test_constructor_reuses_a_pre_built_manager(tmp_path):
         manager=manager,
         resources_processor={"cores": 1},
         resources_reducer={"cores": 1},
-        checkpoint_dir=str(tmp_path / "checkpoints"),
     ) as dist:
+        dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
         assert dist._manager is manager
 
         with local_worker(manager):
@@ -306,8 +306,8 @@ def test_wait_ignores_tasks_submitted_directly_to_a_shared_manager(tmp_path):
         manager=manager,
         resources_processor={"cores": 1},
         resources_reducer={"cores": 1},
-        checkpoint_dir=str(tmp_path / "checkpoints"),
     ) as dist:
+        dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
         with local_worker(manager):
             foreign_task = vine.PythonTask(count_events, Chunk("a.root", 0, 1))
             manager.submit(foreign_task)
@@ -469,8 +469,8 @@ def test_checkpoint_filenames_never_collide_across_restarts(tmp_path):
         with TaskVineDistributor(
             port=0,
             resources_processor={"cores": 1},
-            checkpoint_dir=checkpoint_dir,
         ) as dist:
+            dist.set_checkpoint_dir(checkpoint_dir)
             with local_worker(dist._manager):
                 submit_chunk(dist, 1, Chunk("a.root", 0, 5), is_checkpoint=True)
                 outcome = _wait(dist)
@@ -486,7 +486,8 @@ def test_checkpoint_filenames_never_collide_across_restarts(tmp_path):
 
 
 def test_shutdown_frees_a_self_built_manager(tmp_path):
-    dist = TaskVineDistributor(port=0, checkpoint_dir=str(tmp_path / "checkpoints"))
+    dist = TaskVineDistributor(port=0)
+    dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
 
     dist.shutdown()
 
@@ -495,7 +496,8 @@ def test_shutdown_frees_a_self_built_manager(tmp_path):
 
 def test_shutdown_leaves_a_caller_supplied_manager_alone(tmp_path):
     manager = vine.Manager(port=0)
-    dist = TaskVineDistributor(manager=manager, checkpoint_dir=str(tmp_path / "checkpoints"))
+    dist = TaskVineDistributor(manager=manager)
+    dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
 
     dist.shutdown()
 

@@ -27,11 +27,7 @@ def double_count_events(chunk):
 
 @pytest.fixture
 def distributor(tmp_path):
-    dist = LocalDistributor(
-        max_workers=2,
-        work_dir=str(tmp_path / "cluster"),
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
+    dist = LocalDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
     yield dist
     dist.shutdown()
 
@@ -329,11 +325,7 @@ def test_zero_capacity_before_any_worker_is_available_does_not_hang(tmp_path, da
             return super().capacity()
 
     input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 3}}})
-    dist = SlowToStartDistributor(
-        max_workers=1,
-        work_dir=str(tmp_path / "cluster"),
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
+    dist = SlowToStartDistributor(max_workers=1, work_dir=str(tmp_path / "cluster"))
     try:
         vr = VineReduce(
             processors={"count": count_events},
@@ -376,11 +368,7 @@ def test_extra_files_and_environment_variables_are_passed_to_the_distributor(
     shipped = tmp_path / "shipped.txt"
     shipped.write_text("hi")
 
-    dist = RecordingDistributor(
-        max_workers=2,
-        work_dir=str(tmp_path / "cluster"),
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
+    dist = RecordingDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
     try:
         vr = VineReduce(
             processors={"count": count_events},

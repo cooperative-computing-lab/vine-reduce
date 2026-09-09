@@ -22,11 +22,8 @@ from helpers import (
 
 @pytest.fixture
 def distributor(tmp_path):
-    dist = LocalDistributor(
-        max_workers=2,
-        work_dir=str(tmp_path / "cluster"),
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-    )
+    dist = LocalDistributor(max_workers=2, work_dir=str(tmp_path / "cluster"))
+    dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
     yield dist
     dist.shutdown()
 
@@ -167,7 +164,8 @@ def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
     """A checkpoint has to survive this process ending, so it can be read back
     on restart - unlike an owned work_dir, which is disposable scratch space
     shutdown() removes (see test_shutdown_removes_owned_work_dir)."""
-    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
+    dist = LocalDistributor(max_workers=2)
+    dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
     checkpoint_id = uuid4().hex
     dist.submit(
         checkpoint_id,
@@ -192,7 +190,8 @@ def test_shutdown_leaves_checkpoint_dir_in_place(tmp_path):
 
 
 def test_shutdown_removes_owned_work_dir(tmp_path):
-    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(tmp_path / "checkpoints"))
+    dist = LocalDistributor(max_workers=2)
+    dist.set_checkpoint_dir(str(tmp_path / "checkpoints"))
     work_dir = dist._work_dir
     submit_chunk(dist, 1, Chunk("a.root", 0, 5))
     dist.wait(timeout=30)
@@ -246,7 +245,8 @@ def test_checkpoint_filenames_never_collide_with_a_leftover_from_a_prior_run(tmp
     leftover_path = checkpoint_dir / "1.pkl.zst"
     serialization.dump("leftover-from-a-prior-run", str(leftover_path))
 
-    dist = LocalDistributor(max_workers=2, checkpoint_dir=str(checkpoint_dir))
+    dist = LocalDistributor(max_workers=2)
+    dist.set_checkpoint_dir(str(checkpoint_dir))
     try:
         checkpoint_paths = []
         for _ in range(2):

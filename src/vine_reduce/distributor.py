@@ -130,6 +130,19 @@ class Distributor(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def set_checkpoint_dir(self, path: str) -> None:
+        """Tell this distributor where to durably write a checkpoint/final
+        result from now on - every checkpoint_path() return value for a
+        result submitted with is_checkpoint=True after this call must fall
+        under `path`. VineReduce owns this directory (it decides the path
+        and is responsible for removing individual checkpoint files under
+        it - see reset_if_dataset_changed), so a distributor should treat
+        `path` as given, not chosen; called once, before any work is
+        submitted, whether or not the distributor was supplied by the
+        caller or built by VineReduce itself."""
+        ...
+
+    @abc.abstractmethod
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """Make local_path (readable from the vine_reduce process) available,
         under remote_path (defaulting to local_path's basename), wherever

@@ -152,6 +152,13 @@ class VineReduce:
         written under, at results_dir/<dataset_name>/<processor_name>/.
         results_dir/size.jsonl also lives here - one line per (processor,
         dataset) pipeline, written as soon as it finishes; see size_log.py.
+    checkpoint_dir: local directory non-final checkpoints (and adopted
+        checkpoints, on restart) are durably written under; defaults to
+        results_dir/checkpoints. VineReduce decides this path (not the
+        distributor) and is the one that deletes an individual checkpoint
+        file when a dataset's definition changes (see db_path below) -
+        the path is simply handed to the distributor, once, via
+        Distributor.set_checkpoint_dir(), before any work is submitted.
     distributor: where processor/reducer calls actually run - a Distributor
         implementation such as TaskVineDistributor. Defaults to a
         LocalDistributor (ProcessPoolExecutor-backed) that compute() creates
@@ -171,11 +178,9 @@ class VineReduce:
     max_chunks_cycle: cap on new chunks submitted per scheduling cycle,
         across all pipelines.
     db_path: path to the sqlite checkpoint database; defaults to
-        results_dir/vine_reduce.db. Non-final checkpoints are the
-        responsibility of the distributor itself (e.g.
-        TaskVineDistributor's own checkpoint_dir constructor argument), not
-        VineReduce - see PLAN.md's "Temporary Results, Checkpoints, and
-        Restart".
+        results_dir/vine_reduce.db. Checkpoint files themselves live under
+        checkpoint_dir (see above) - see PLAN.md's "Temporary Results,
+        Checkpoints, and Restart".
     extra_files: local paths made available, under their basename, wherever
         every processor/reducer call runs - see Distributor.add_file().
     environment_variables: environment variables set for every
@@ -233,6 +238,7 @@ class VineReduce:
     checkpoint_distance: int | None = None
     checkpoint_accumulations: bool = False
     results_dir: str = "results"
+    checkpoint_dir: str | None = None
     distributor: Distributor | None = None
     chunksize: int | dict | None = None
     minimum_chunksize: int | None = None
@@ -257,6 +263,9 @@ class VineReduce:
             )
         with ExitStack() as stack:
             distributor = self._enter_distributor(stack)
+            distributor.set_checkpoint_dir(
+                self.checkpoint_dir or os.path.join(self.results_dir, "checkpoints")
+            )
             for path in self.extra_files:
                 distributor.add_file(path)
             for name, value in self.environment_variables.items():
@@ -293,17 +302,10 @@ class VineReduce:
         """Return `distributor` if the caller supplied one (left running
         afterward for the caller to shut down), otherwise create a
         LocalDistributor and enter it into `stack` so it is shut down again
-        on the way out, however compute() returns. The created
-        LocalDistributor's checkpoint_dir defaults alongside db_path, under
-        results_dir, rather than LocalDistributor's own bare "checkpoints"
-        default - so a checkpoint written by this run is found again next to
-        the checkpoint db that points at it, not wherever the process
-        happened to be started from."""
+        on the way out, however compute() returns."""
         if self.distributor is not None:
             return self.distributor
-        return stack.enter_context(
-            LocalDistributor(checkpoint_dir=os.path.join(self.results_dir, "checkpoints"))
-        )
+        return stack.enter_context(LocalDistributor())
 
     @staticmethod
     def _warn_unprocessed(pipelines: list[Pipeline], failure_log_path: str) -> None:

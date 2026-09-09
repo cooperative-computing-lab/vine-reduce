@@ -69,15 +69,14 @@ class LocalDistributor(Distributor):
         self,
         max_workers: int | None = None,
         work_dir: str | None = None,
-        checkpoint_dir: str = "checkpoints",
     ):
         """max_workers: size of the local process pool; defaults to the
         machine's CPU count. work_dir: directory to write ordinary
         (non-checkpoint) result files into; defaults to a fresh temp
         directory that is removed on shutdown() (a caller-supplied work_dir
-        is left in place). checkpoint_dir: directory to write checkpoint
-        (submit(..., is_checkpoint=True)) result files into; never removed
-        by shutdown() - see the module docstring."""
+        is left in place). Where checkpoint (submit(..., is_checkpoint=True))
+        result files go is set separately, via set_checkpoint_dir() - see the
+        module docstring and the Distributor protocol."""
         self._max_workers = max_workers or os.process_cpu_count() or 1
         self._pool = CloudpickleProcessPoolExecutor(max_workers=self._max_workers)
 
@@ -85,8 +84,7 @@ class LocalDistributor(Distributor):
         self._work_dir = work_dir or tempfile.mkdtemp(prefix="vine_reduce_local_")
         os.makedirs(self._work_dir, exist_ok=True)
 
-        self._checkpoint_dir = checkpoint_dir
-        os.makedirs(self._checkpoint_dir, exist_ok=True)
+        self._checkpoint_dir: str | None = None
 
         self._seq = itertools.count()
         # Heap of (-priority, seq, result_id, func, args, is_checkpoint): negated
@@ -214,6 +212,13 @@ class LocalDistributor(Distributor):
         """The real path a completed (Success) result_id already lives at -
         see submit()."""
         return self._files[result_id]
+
+    def set_checkpoint_dir(self, path: str) -> None:
+        """Directory a checkpoint (submit(..., is_checkpoint=True)) result
+        lands under from now on - see the Distributor protocol docstring.
+        Must be called before any is_checkpoint=True submit()."""
+        self._checkpoint_dir = path
+        os.makedirs(self._checkpoint_dir, exist_ok=True)
 
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
         """No-op: worker subprocesses already share vine_reduce's filesystem

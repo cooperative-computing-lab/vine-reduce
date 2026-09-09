@@ -104,7 +104,6 @@ class TaskVineDistributor(Distributor):
         resources_reducer: dict[str, int] | None = None,
         environment: str | None = None,
         manager: vine.Manager | None = None,
-        checkpoint_dir: str = "checkpoints",
         ssl: bool = True,
     ):
         """port: port (or [min, max] range) the manager listens on, or 0 to
@@ -123,17 +122,18 @@ class TaskVineDistributor(Distributor):
             vine.DaskVine) to use instead of building one from port/name -
             lets vine_reduce's tasks and a caller's own tasks share one
             manager/port and worker pool.
-        checkpoint_dir: local directory (on this process's filesystem, i.e.
-            wherever the manager runs) this distributor writes a result's
-            file to when submit() is called with is_checkpoint=True - see
-            the module docstring and checkpoint_path().
         ssl: whether the manager encrypts its connections to workers, via a
             self-signed cert vine.Manager generates on the fly; ignored when
             manager is given (that manager's own ssl setting, if any,
             applies instead). Workers started with vine.Factory(manager=...)
             pick this up automatically (Factory reads it off the manager);
             Factory started with manager_host_port= instead needs
-            `ssl=True` passed to it too."""
+            `ssl=True` passed to it too.
+
+        Where this distributor writes a result's file when submit() is
+        called with is_checkpoint=True is set separately, via
+        set_checkpoint_dir() - see the module docstring and
+        checkpoint_path()."""
         self._owns_manager = manager is None
         self._manager = (
             manager if manager is not None else vine.Manager(port=port, name=name, ssl=ssl)
@@ -162,8 +162,7 @@ class TaskVineDistributor(Distributor):
             self._manager.declare_poncho(environment, cache=True) if environment else None
         )
 
-        self._checkpoint_dir = checkpoint_dir
-        os.makedirs(self._checkpoint_dir, exist_ok=True)
+        self._checkpoint_dir: str | None = None
 
         # Keyed on the dest_token minted for every result - by submit() for
         # a this-run result, or by adopt_checkpoint() for a restart-seeded
@@ -472,6 +471,13 @@ class TaskVineDistributor(Distributor):
         already wrote the file there as part of retrieving the task's
         outputs, so this is a lookup, not a copy."""
         return self._checkpoint_paths_by_token[_result_token(result_id)]
+
+    def set_checkpoint_dir(self, path: str) -> None:
+        """Directory a checkpoint (submit(..., is_checkpoint=True)) result
+        lands under from now on - see the Distributor protocol docstring.
+        Must be called before any is_checkpoint=True submit()."""
+        self._checkpoint_dir = path
+        os.makedirs(self._checkpoint_dir, exist_ok=True)
 
     def capacity(self) -> int:
         """How many more tasks the manager's connected workers could

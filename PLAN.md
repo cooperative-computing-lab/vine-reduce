@@ -155,11 +155,15 @@ out. What differs is *where* the durable copy lives and how vine_reduce learns i
   `results_dir/<dataset>/<processor>/<processor>__<uuid4>.pkl.zst`, then immediately releases the
   distributor's copy - nothing ever reduces a final result further, so `results_dir` is the only
   durable copy needed from that point on.
-- A **non-final checkpoint**'s durable copy is entirely the distributor's own concern (e.g. each
-  shipped distributor's `checkpoint_dir` constructor argument). vine_reduce only learns where it
-  ended up, via `checkpoint_path(result_id)`, to record in the checkpoint store. The
-  distributor's copy stays live and reusable as a reduction input (so the manager never re-sends
-  a checkpoint it already generated), per invariant 2.
+- A **non-final checkpoint**'s durable copy lives under `checkpoint_dir` - a directory VineReduce
+  itself owns (defaults to `results_dir/checkpoints`) and hands to the distributor via
+  `set_checkpoint_dir(path)`, once, before any work is submitted. VineReduce owns it, rather than
+  each distributor picking its own, because VineReduce needs to read/delete individual checkpoint
+  files directly (e.g. `reset_if_dataset_changed`'s stale-file cleanup) - the path has to be a real,
+  locally-accessible filesystem path, not an opaque distributor-internal handle. The distributor
+  only picks the filename within it, and reports the result back via `checkpoint_path(result_id)`,
+  to record in the checkpoint store. The distributor's copy stays live and reusable as a reduction
+  input (so the manager never re-sends a checkpoint it already generated), per invariant 2.
 
 **Why**
 
@@ -645,9 +649,16 @@ retrieve(result_id, dest_path): copy/materialize the file for a completed (Succe
     rather than assuming Outcome.file is directly readable, keeping the interface correct for a
     distributor that doesn't share a filesystem with vine_reduce.
 path = checkpoint_path(result_id): local, durable on-disk path for a completed (Success)
-    result_id submitted with is_checkpoint=True (or adopted). Unlike retrieve(), the distributor
-    chooses this path itself; vine_reduce calls this for a non-final checkpoint to learn where
+    result_id submitted with is_checkpoint=True (or adopted). The distributor chooses the
+    filename itself, but the directory it falls under is set by VineReduce (see
+    set_checkpoint_dir below); vine_reduce calls this for a non-final checkpoint to learn where
     it ended up, to record in the checkpoint store.
+set_checkpoint_dir(path): tell the distributor where to durably write a checkpoint/final result
+    from now on - every checkpoint_path() return value for a result submitted with
+    is_checkpoint=True after this call must fall under path. VineReduce owns this directory (it
+    decides the path and is responsible for removing individual checkpoint files under it - see
+    reset_if_dataset_changed); called once, before any work is submitted, regardless of whether
+    the distributor was supplied by the caller or built by VineReduce itself.
 add_file(local_path, remote_path=None): make local_path available, under remote_path (default:
     local_path's basename), wherever every call submitted from now on runs. A no-op for a
     distributor whose workers already share vine_reduce's filesystem.
@@ -656,11 +667,11 @@ shutdown(): release whatever resources this distributor owns (worker pools, temp
     ...). Also reachable via `with distributor: ...`.
 ```
 
-- `add_file`/`set_env_var` are called once per entry in `VineReduce.extra_files` /
-  `environment_variables`, at the very start of `compute()`, before any task is submitted - so a
-  caller can hand a processor its supporting files (e.g. a data file read by relative path, an
-  auth token/proxy) and env vars (e.g. `X509_USER_PROXY`) without VineReduce knowing anything
-  distributor-specific.
+- `set_checkpoint_dir` is called first, unconditionally, at the very start of `compute()` -
+  before `add_file`/`set_env_var`, which are then called once per entry in
+  `VineReduce.extra_files` / `environment_variables` - so a caller can hand a processor its
+  supporting files (e.g. a data file read by relative path, an auth token/proxy) and env vars
+  (e.g. `X509_USER_PROXY`) without VineReduce knowing anything distributor-specific.
 
 ## Dataclasses
 
@@ -703,13 +714,17 @@ checkpoint_accumulations bool = False: If True, checkpoint every non-final reduc
 results_dir str = "results": Local directory for final results, one subdirectory per dataset
                                and, within that, one per processor (so multiple processors over
                                the same dataset don't collide). Non-final checkpoints are not
-                               written here - their durable copy is the distributor's own
-                               concern (see "Where a checkpoint lives").
+                               written here - see checkpoint_dir below.
+checkpoint_dir Optional[str]: Local directory non-final checkpoints (and adopted checkpoints, on
+                               restart) are durably written under; defaults to
+                               results_dir/checkpoints, next to the checkpoint store, so
+                               checkpoints survive to the next run of the same results_dir.
+                               VineReduce owns this path (see "Where a checkpoint lives") and
+                               hands it to distributor via set_checkpoint_dir() at the start of
+                               compute() - whether distributor was supplied by the caller or is
+                               the default LocalDistributor.
 distributor Optional[Distributor]: The distributor to use. Defaults to a LocalDistributor that
-                               compute() creates and tears down itself (with checkpoint_dir
-                               defaulted to results_dir/checkpoints, next to the checkpoint
-                               store, so checkpoints survive to the next run of the same
-                               results_dir).
+                               compute() creates and tears down itself.
 chunksize int | dict | None: Target events per chunk, same dict shape as reduction_size. None
                                means one chunk per file. Halved automatically on resource
                                exhaustion, for chunks not yet generated.
@@ -723,7 +738,8 @@ max_chunks_active int = 1000: Cap on chunks in flight (submitted but not yet fin
 max_chunks_cycle int = 100: Cap on new chunks submitted per scheduling cycle, across all
                                pipelines.
 db_path Optional[str]: Path to the checkpoint store's sqlite file; defaults to
-                               results_dir/vine_reduce.db.
+                               results_dir/vine_reduce.db. Checkpoint files themselves live
+                               under checkpoint_dir, not here - see above.
 extra_files List[str] = []: Local paths made available, under their basename, to every
                                processor/reducer call, via add_file() at the start of compute().
 environment_variables Dict[str, str] = {}: Environment variables set for every processor/reducer
@@ -804,13 +820,13 @@ file str: the distributor's opaque handle (an Outcome.file), for use inside a la
   lookup, no copy. Every result's on-disk filename is its own fresh `uuid4().hex`, independent of
   `result_id` - *which directory* it lands in is what depends on `is_checkpoint`: an ordinary
   result lands under `work_dir` (scratch - a fresh temp directory removed on `shutdown()` unless
-  the caller supplied its own), a checkpoint under the constructor's `checkpoint_dir` (default
-  `"checkpoints"`, matching TaskVineDistributor), which `shutdown()` never removes. Minting the
-  filename itself, rather than deriving it from `result_id`, keeps a checkpoint's name safe from
-  collision with a still-live checkpoint from an earlier run regardless of what the caller's
-  `result_id`s look like. The directory split is what makes restart possible: a checkpoint must
-  still exist, at the path recorded in the checkpoint store, the next time the same
-  `results_dir`/`db_path` is used.
+  the caller supplied its own), a checkpoint under whatever `set_checkpoint_dir(path)` was last
+  called with - normally `VineReduce.checkpoint_dir`, set once at the start of `compute()` - which
+  `shutdown()` never removes. Minting the filename itself, rather than deriving it from
+  `result_id`, keeps a checkpoint's name safe from collision with a still-live checkpoint from an
+  earlier run regardless of what the caller's `result_id`s look like. The directory split is what
+  makes restart possible: a checkpoint must still exist, at the path recorded in the checkpoint
+  store, the next time the same `results_dir`/`db_path` is used.
 - `adopt_checkpoint(result_id, path)` - the reference implementation of the protocol method -
   just records `path` under `result_id` (workers share the filesystem, so `path` is usable
   as-is); the seeded item is then released/retrieved/resubmitted through exactly the same code
@@ -845,8 +861,9 @@ file str: the distributor's opaque handle (an Outcome.file), for use inside a la
   the manager or each other, so a real path can't stand in for `Outcome.file`. Every result
   becomes either a `manager.declare_temp()` file, kept at/near the worker that produced it, or -
   when `submit(..., is_checkpoint=True)` - a `manager.declare_file(path, cache=True)` file with
-  `path` a fresh `uuid4().hex` name under the constructor's `checkpoint_dir` (minted independently
-  of `result_id`, for the same cross-run collision reason as LocalDistributor). TaskVine transfers
+  `path` a fresh `uuid4().hex` name under whatever directory `set_checkpoint_dir(path)` was last
+  called with (minted independently of `result_id`, for the same cross-run collision reason as
+  LocalDistributor). TaskVine transfers
   a `declare_file()` output back to the manager unconditionally as soon as the task completes
   (unlike a temp file, which stays remote until fetched), so a checkpoint is already durably on
   local disk by the time `wait()` reports success - `checkpoint_path(result_id)` is a lookup, no
