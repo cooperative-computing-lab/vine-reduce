@@ -1312,7 +1312,7 @@ def test_processor_permanent_failures_abort_once_proportion_exceeded(fake_distri
         processor=processor,
         reduction_size=10,
         attempts=1,
-        failure_proportion=0.015,  # 1/100 tolerated, 2/100 is not
+        failure_proportion=0.25,  # 1/4 tolerated, 2/4 is not
         is_result=lambda num_events, total_time, total_memory: num_events >= 2,
     )
 

@@ -402,12 +402,9 @@ are available). What happens next depends on which kind of call it was:
     released back to the distributor, never pooled), purged from `_retry_chunks`, and skipped by
     both `_next_chunk` and any of its own sibling chunks whose outcome arrives after the fact.
   - The run only aborts (`VineReduceError`) once, for some dataset,
-    `permanently_failed_files / max(files_concluded_so_far, 100) > failure_proportion` - the
-    100-file floor means a single early failure can't spuriously trip a nonzero threshold on a
-    small dataset.
-  - `failure_proportion` defaults to `0`, which reproduces the historical behavior exactly (the
-    first permanent failure gives a ratio of `1/100 = 0.01`, already `> 0`); it must be in
-    `[0, 1)` - a value `< 1` can never trip the check on its own, since the ratio never exceeds 1.
+    `permanently_failed_files / total_files_in_dataset > failure_proportion`, where
+    `total_files_in_dataset` is that dataset's fixed file count (`len(dataset["files"])`.
+  - `failure_proportion` defaults to `0` with first permanent failure stopping the run.
 - **A reducer (reduction) permanent failure**:
   - Always aborts the whole run, unconditionally - `failure_proportion` is never consulted for it.
   - A partially-folded reduction result can't be trusted not to be corrupted, so there is no
@@ -744,8 +741,9 @@ attempts int = 3: Total tries for a single chunk (processor call) or reduction (
 failure_proportion float = 0.0: Only applies to a processor permanent failure - a reducer
                                permanent failure always aborts the run, regardless of this
                                setting. The run aborts once, for some dataset,
-                               permanently_failed_files / max(files_concluded_so_far, 100) is
-                               greater than this value. Must be in [0, 1); 0 (default) aborts on
+                               permanently_failed_files / total_files_in_dataset is greater than
+                               this value, where total_files_in_dataset is that dataset's fixed
+                               file count, known upfront. Must be in [0, 1); 0 (default) aborts on
                                the very first permanent processor failure, matching the
                                historical behavior. See "Failure Tolerance" above.
 ```

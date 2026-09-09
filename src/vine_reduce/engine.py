@@ -209,11 +209,11 @@ class VineReduce:
         the moment it happens and removed from that (processor, dataset)
         pipeline for good - never retried, never pooled. The run only
         aborts once, for some dataset, `permanently_failed_files /
-        max(files_concluded_so_far, 100) > failure_proportion` - the
-        100-file floor means a lone early failure can't spuriously trip a
-        nonzero threshold on a small dataset. Must be in [0, 1). The
-        default, 0, means any permanent processor failure aborts the run
-        immediately: with the 100-file floor, 1/100 = 0.01 is already > 0.
+        total_files_in_dataset > failure_proportion`, where
+        total_files_in_dataset is that dataset's fixed file count (known
+        upfront, not how many have concluded so far). Must be in [0, 1).
+        The default, 0, reproduces the historical behavior: the very first
+        permanent processor failure aborts the run.
         A run that finishes with any file left permanently unprocessed
         prints a warning in red naming failed_files.log.
     """

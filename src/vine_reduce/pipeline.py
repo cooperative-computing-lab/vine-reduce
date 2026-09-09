@@ -27,11 +27,6 @@ from .types import (
     Success,
 )
 
-# Minimum denominator for the permanently-failed-files/files-concluded ratio
-# (see _give_up_on_file) - so a lone early failure can't spuriously trip a
-# nonzero failure_proportion threshold on a small dataset.
-_FAILURE_PROPORTION_FLOOR = 100
-
 
 class VineReduceError(RuntimeError):
     """Raised when a processing or reduction function fails remotely. Carries
@@ -391,12 +386,11 @@ class Pipeline:
 
         # Failure tolerance: files given up on during preprocessing (see
         # _give_up_on_file) are removed from the pool going forward, never
-        # retried, and counted against failure_proportion -
-        # _files_concluded is the proportion's denominator (files that
-        # reached a terminal outcome, successful or not; see
+        # retried, and counted against failure_proportion - whose denominator
+        # is the dataset's total file count (fixed here, at construction; see
         # PLAN.md's "Attempts and Retries").
         self._failed_files: set[str] = set()
-        self._files_concluded = 0
+        self._total_files = len(dataset["files"])
 
         # events_total is fixed at construction; the dataset dict is never
         # mutated after this. The rest of the progress-bar counters live on
@@ -805,7 +799,6 @@ class Pipeline:
         if progress.covered_events >= progress.num_entries:
             self.pool.extend(progress.staged_items)
             del self._files_in_progress[chunk.url]
-            self._files_concluded += 1
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
@@ -850,7 +843,6 @@ class Pipeline:
         abort - the caller raises only when this returns True."""
         url = chunk.url
         self._failed_files.add(url)
-        self._files_concluded += 1
 
         if self._failure_log is not None:
             self._failure_log.log(
@@ -875,7 +867,7 @@ class Pipeline:
                 self._distributor.release_result(item.handle.result_id)
         self._retry_chunks = [t for t in self._retry_chunks if t.chunk.url != url]
 
-        ratio = len(self._failed_files) / max(self._files_concluded, _FAILURE_PROPORTION_FLOOR)
+        ratio = len(self._failed_files) / self._total_files
         return ratio > self._failure_proportion
 
     def _handle_reduce_resource_exhaustion(
