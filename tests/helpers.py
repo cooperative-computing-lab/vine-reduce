@@ -51,6 +51,18 @@ def double_postprocess(x):
     return x * 2
 
 
+def offload_locator_postprocess(x):
+    """A result_postprocess for result_postprocess_offload=True: a
+    JSON-serializable locator standing in for data written elsewhere."""
+    return {"path": f"/offloaded/{x}"}
+
+
+def non_json_postprocess(x):
+    """A result_postprocess returning a value json.dumps can't handle -
+    used to test result_postprocess_offload's locator validation."""
+    return {1, 2, 3}
+
+
 def failing_processor(chunk):
     raise ValueError("boom")
 

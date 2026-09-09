@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
+from vine_reduce.checkpoint_store import _SCHEMA_VERSION, CheckpointStore, checksum_dataset
 
 
 def test_record_and_checkpoints_for_round_trip(tmp_path):
@@ -205,7 +205,7 @@ def test_opening_an_old_schema_db_discards_its_rows_and_stamps_user_version(tmp_
 
     assert store.checkpoints_for("proc", "ds") == []
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 1
+    assert user_version == _SCHEMA_VERSION
     assert "discarding 1 existing checkpoint" in caplog.text
     store.close()
 

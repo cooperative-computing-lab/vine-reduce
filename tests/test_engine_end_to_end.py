@@ -18,7 +18,13 @@ from vine_reduce.local_distributor import LocalDistributor
 from vine_reduce.progress import NullProgressReporter
 from vine_reduce.size_log import SizeLog
 
-from helpers import count_events, read_env_var, sum_reducer
+from helpers import (
+    count_events,
+    non_json_postprocess,
+    offload_locator_postprocess,
+    read_env_var,
+    sum_reducer,
+)
 
 
 def double_count_events(chunk):
@@ -118,6 +124,82 @@ def test_reduction_size_dict_missing_default_raises_clearly(tmp_path, dataset_in
         distributor=distributor,
     )
     with pytest.raises(VineReduceError):
+        vr.compute()
+
+
+def test_result_postprocess_offload_without_result_postprocess_raises_eagerly(
+    tmp_path, dataset_input, distributor
+):
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 3}}})
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+        result_postprocess_offload=True,
+    )
+    with pytest.raises(VineReduceError, match="result_postprocess"):
+        vr.compute()
+
+
+def test_result_postprocess_offload_writes_pointer_file_in_place_of_pickle(
+    tmp_path, dataset_input, distributor
+):
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 7}}})
+    results_dir = str(tmp_path / "results")
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        result_postprocess=offload_locator_postprocess,
+        result_postprocess_offload=True,
+        results_dir=results_dir,
+        distributor=distributor,
+    )
+    vr.compute()
+
+    dataset_dir = os.path.join(results_dir, "numbers", "count")
+    files = os.listdir(dataset_dir)
+    assert len(files) == 1
+    assert files[0].endswith(".pointer.json")
+    with open(os.path.join(dataset_dir, files[0])) as f:
+        envelope = json.load(f)
+    assert envelope == {
+        "offloaded": True,
+        "processor_name": "count",
+        "dataset_name": "numbers",
+        "locator": {"path": "/offloaded/7"},
+    }
+
+    db = CheckpointStore(os.path.join(results_dir, "vine_reduce.db"))
+    try:
+        rows = db.checkpoints_for("count", "numbers")
+        assert len(rows) == 1
+        assert rows[0].is_final
+        assert rows[0].offloaded
+        assert rows[0].path == os.path.join(dataset_dir, files[0])
+    finally:
+        db.close()
+
+
+def test_result_postprocess_offload_rejects_non_json_serializable_locator(
+    tmp_path, dataset_input, distributor
+):
+    input_path = dataset_input({"numbers": {"metadata": {}, "files": {"a.root": 3}}})
+
+    vr = VineReduce(
+        processors={"count": count_events},
+        input=input_path,
+        reducer=sum_reducer,
+        result_postprocess=non_json_postprocess,
+        result_postprocess_offload=True,
+        results_dir=str(tmp_path / "results"),
+        distributor=distributor,
+    )
+    with pytest.raises(VineReduceError, match="JSON-serializable"):
         vr.compute()
 
 

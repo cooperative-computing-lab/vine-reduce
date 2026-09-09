@@ -139,6 +139,18 @@ class VineReduce:
         out, e.g. to convert an accumulator into a plainer shape. Runs
         remotely, as part of the reduction call that produces the final
         result.
+    result_postprocess_offload: if True, result_postprocess's return value is
+        treated as an opaque, JSON-serializable locator describing where the
+        real data already lives (e.g. a worker-local mount or dataset store
+        result_postprocess itself wrote to), not as the result itself.
+        vine_reduce never fetches real result bytes for a final result in
+        this mode - it writes a `{processor_name}__{uuid}.pointer.json` file
+        into results_dir instead of the usual `.pkl.zst`, wrapping the
+        locator with `offloaded`/`processor_name`/`dataset_name`. Global for
+        the whole run, fixed at construction - there is no per-result
+        opt-out. Only meaningful together with result_postprocess; True with
+        result_postprocess=None is a configuration error, raised eagerly by
+        compute().
     checkpoint_time: checkpoint a non-final reduction once at least this
         many seconds of wall time have accumulated in it since its last
         checkpoint. None disables time-based checkpointing.
@@ -234,6 +246,7 @@ class VineReduce:
     minimum_reduction_size: int | None = None
     is_result: Callable[[int, float, float], bool] | None = None
     result_postprocess: Callable[[Any], Any] | None = None
+    result_postprocess_offload: bool = False
     checkpoint_time: float | None = None
     checkpoint_distance: int | None = None
     checkpoint_accumulations: bool = False
@@ -260,6 +273,10 @@ class VineReduce:
         if not 0.0 <= self.failure_proportion < 1.0:
             raise ValueError(
                 f"failure_proportion must be in [0, 1); got {self.failure_proportion!r}"
+            )
+        if self.result_postprocess_offload and self.result_postprocess is None:
+            raise VineReduceError(
+                "result_postprocess_offload=True requires result_postprocess to be set"
             )
         with ExitStack() as stack:
             distributor = self._enter_distributor(stack)
@@ -368,6 +385,7 @@ class VineReduce:
                         reducer=self.reducer,
                         is_result=is_result,
                         result_postprocess=self.result_postprocess,
+                        result_postprocess_offload=self.result_postprocess_offload,
                         chunksize=_resolve_sized_config(self.chunksize, proc_name, dataset_name),
                         minimum_chunksize=minimum_chunksize,
                         reduction_size=reduction_size,

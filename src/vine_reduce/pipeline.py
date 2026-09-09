@@ -6,12 +6,13 @@ PLAN.md for the pooling and checkpointing rules this implements.
 from __future__ import annotations
 
 import enum
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
 from uuid import uuid4
 
-from . import defaults
+from . import defaults, serialization
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor, TaskKind
 from .executor import Executor
@@ -324,6 +325,7 @@ class Pipeline:
         reducer: Callable,
         is_result: Callable[[int, float, float], bool],
         result_postprocess: Callable | None,
+        result_postprocess_offload: bool = False,
         chunksize: int | None,
         minimum_chunksize: int = 1000,
         reduction_size: int,
@@ -353,6 +355,7 @@ class Pipeline:
         self._reducer = reducer
         self._is_result = is_result
         self._result_postprocess = result_postprocess
+        self._result_postprocess_offload = result_postprocess_offload
         self.chunksize = chunksize
         self._minimum_chunksize = minimum_chunksize
         self.reduction_size = reduction_size
@@ -1056,8 +1059,11 @@ class Pipeline:
             return True
         return False
 
-    def _durable_path(self, new_item: PoolItem, is_final: bool) -> str:
-        """Locate or create new_item's durable on-disk copy.
+    def _durable_path(self, new_item: PoolItem, is_final: bool) -> tuple[str, bool]:
+        """Locate or create new_item's durable on-disk copy. Returns
+        (path, offloaded) - offloaded is only ever True for a final result
+        produced under result_postprocess_offload=True (see
+        _write_offload_pointer); every other case is False.
 
         A final result is copied out to vine_reduce's own results_dir and
         its distributor handle released immediately, since nothing will ever
@@ -1068,12 +1074,61 @@ class Pipeline:
         further checkpoint covers this item (via _release_covered).
         """
         if is_final:
-            path = os.path.join(self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst")
-            self._distributor.retrieve(new_item.handle.result_id, path)
+            if self._result_postprocess_offload:
+                path = self._write_offload_pointer(new_item)
+            else:
+                path = os.path.join(
+                    self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst"
+                )
+                self._distributor.retrieve(new_item.handle.result_id, path)
             self._distributor.release_result(new_item.handle.result_id)
             new_item.handle = None
-        else:
-            path = self._distributor.checkpoint_path(new_item.handle.result_id)
+            return path, self._result_postprocess_offload
+        path = self._distributor.checkpoint_path(new_item.handle.result_id)
+        return path, False
+
+    def _write_offload_pointer(self, new_item: PoolItem) -> str:
+        """Writes the pointer file for an offloaded final result (see
+        PLAN_results_dir_rework.md's "Offload case").
+
+        The locator result_postprocess returned already reached the driver
+        through the normal result-transport path, same as any other result
+        (dest_file -> distributor.retrieve() -> serialization.load()) - it
+        is trusted to be small, since offload means the real data was
+        already written elsewhere by the callback itself. Retrieved to a
+        throwaway temp file (never the final path) so a failed validation
+        below leaves nothing behind for a restart to mistake for a real
+        checkpoint.
+        """
+        tmp_path = os.path.join(
+            self._results_dir, f".{self.processor_name}__{uuid4().hex}.offload.tmp"
+        )
+        self._distributor.retrieve(new_item.handle.result_id, tmp_path)
+        try:
+            locator = serialization.load(tmp_path)
+        finally:
+            os.remove(tmp_path)
+
+        try:
+            json.dumps(locator)
+        except TypeError as e:
+            raise VineReduceError(
+                f"result_postprocess for processor {self.processor_name!r}, dataset "
+                f"{self.dataset_name!r} must return a JSON-serializable locator when "
+                f"result_postprocess_offload=True; got {locator!r} ({type(locator).__name__}): {e}"
+            ) from e
+
+        path = os.path.join(self._results_dir, f"{self.processor_name}__{uuid4().hex}.pointer.json")
+        with open(path, "w") as f:
+            json.dump(
+                {
+                    "offloaded": True,
+                    "processor_name": self.processor_name,
+                    "dataset_name": self.dataset_name,
+                    "locator": locator,
+                },
+                f,
+            )
         return path
 
     def _mark_durable(
@@ -1095,7 +1150,7 @@ class Pipeline:
         new_item.since_checkpoint_distance = 0
 
     def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
-        path = self._durable_path(new_item, is_final)
+        path, offloaded = self._durable_path(new_item, is_final)
 
         # Record durably, atomically superseding the rows this replaces: the
         # new row and the superseded rows' deletes are one transaction, so
@@ -1118,6 +1173,7 @@ class Pipeline:
             is_final=is_final,
             path=path,
             supersedes=superseded,
+            offloaded=offloaded,
         )
 
         self._mark_durable(new_item, inputs, row_id, path)

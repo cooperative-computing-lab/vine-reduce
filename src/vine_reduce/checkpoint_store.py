@@ -42,7 +42,14 @@ class CheckpointRecord:
     is_final: whether this is a final result (results_dir) or an
         intermediate checkpoint (wherever the distributor durably stores
         one - e.g. TaskVineDistributor's own checkpoint_dir).
-    path: where the checkpoint's serialized result file lives on disk.
+    path: where the checkpoint's serialized result file lives on disk - for
+        an offloaded final result, this is a pointer file (see `offloaded`)
+        rather than the real data.
+    offloaded: True iff this is a final result produced with
+        result_postprocess_offload=True, so `path` holds a pointer file
+        (locator JSON) rather than the actual result bytes. Always False for
+        a non-final checkpoint. Introspection-only - see
+        PLAN_results_dir_rework.md.
     """
 
     id: int
@@ -54,6 +61,7 @@ class CheckpointRecord:
     memory_mb: float
     is_final: bool
     path: str
+    offloaded: bool = False
 
 
 class CheckpointStore:
@@ -115,7 +123,8 @@ class CheckpointStore:
                 wall_time_s REAL    NOT NULL,
                 memory_mb   REAL    NOT NULL,
                 is_final    INTEGER NOT NULL,
-                path        TEXT    NOT NULL
+                path        TEXT    NOT NULL,
+                offloaded   INTEGER NOT NULL DEFAULT 0
             )
             """)
         self._conn.execute("CREATE INDEX checkpoints_by_pair ON checkpoints(processor, dataset)")
@@ -176,6 +185,7 @@ class CheckpointStore:
         is_final: bool,
         path: str,
         supersedes: Sequence[int] = (),
+        offloaded: bool = False,
     ) -> int:
         """Insert this checkpoint and delete the rows it supersedes, in ONE
         transaction. Returns the new row id."""
@@ -183,9 +193,19 @@ class CheckpointStore:
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO checkpoints"
-                " (processor, dataset, num_events, wall_time_s, memory_mb, is_final, path)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (processor, dataset, num_events, wall_time_s, memory_mb, int(is_final), path),
+                " (processor, dataset, num_events, wall_time_s, memory_mb, is_final, path,"
+                "  offloaded)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    processor,
+                    dataset,
+                    num_events,
+                    wall_time_s,
+                    memory_mb,
+                    int(is_final),
+                    path,
+                    int(offloaded),
+                ),
             )
             row_id = cur.lastrowid
             self._conn.executemany(
@@ -201,7 +221,8 @@ class CheckpointStore:
         """All checkpoint rows (final and intermediate) on record for one
         (processor, dataset) pair."""
         rows = self._conn.execute(
-            "SELECT id, processor, dataset, num_events, wall_time_s, memory_mb, is_final, path"
+            "SELECT id, processor, dataset, num_events, wall_time_s, memory_mb, is_final, path,"
+            "  offloaded"
             " FROM checkpoints WHERE processor = ? AND dataset = ?",
             (processor, dataset),
         ).fetchall()
@@ -221,6 +242,7 @@ class CheckpointStore:
             memory_mb=row["memory_mb"],
             is_final=bool(row["is_final"]),
             path=row["path"],
+            offloaded=bool(row["offloaded"]),
         )
 
     def close(self) -> None:
