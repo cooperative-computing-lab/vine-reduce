@@ -192,7 +192,11 @@ def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
         return int(os.environ["CORES"])
     if distributor_metadata and "cores" in distributor_metadata:
         return distributor_metadata["cores"]
-    return os.process_cpu_count() or 1
+    if hasattr(os, "process_cpu_count"):
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
+    return os.cpu_count() or 1
 
 
 class DaskExecutor(Executor):

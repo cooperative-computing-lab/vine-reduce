@@ -3,14 +3,15 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
-  - awkward=2.8.7
-  - coffea=2025.7.3
-  - fsspec-xrootd=>0.5.1
+  - awkward>=2.8.9
+  - coffea>=2025.10.2
+  - fsspec-xrootd=>0.4.0
   - ndcctools>=7.17.1
-  - python>=3.13
-  - rich=>14.2.0
+  - python>=3.12.11
+  - pyyaml>=5.4.1
+  - rich=>14.1.0
   - uproot=>5.6.6
-  - xrootd=>5.8.4
+  - xrootd=>5.8.1
   - pip
   - setuptools<81
   - zstandard>=0.25.0

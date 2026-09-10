@@ -20,18 +20,20 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12.11"
 dependencies = [
-    "awkward>=2.8.7",
-    "coffea>=2025.7.3",
+    "awkward>=2.8.9",
+    "coffea>=2025.10.2",
     "fsspec>=2026.7.0",
-    "fsspec-xrootd>=0.5.1",
-    "numpy>=2.4.6",
-    "rich>=14.2.0",
+    "fsspec-xrootd>=0.4.0",
+    "numpy>=2.2.6",
+    "pyyaml>=5.4.1",
+    "rich>=14.1.0",
     "uproot>=5.6.6",
-    "xrootd>=5.8.4",
+    "xrootd>=5.8.1",
     "zstandard>=0.25.0",
 ]
 
@@ -57,7 +59,7 @@ where = ["src"]
 
 [tool.black]
 line-length = 100
-target-version = ['py313']
+target-version = ['py312', 'py313']
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -77,17 +79,18 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
-awkward = "==2.8.7"
-coffea = "==2025.7.3"
+awkward = ">=2.8.9"
+coffea = ">=2025.10.2"
 fsspec = ">=2026.7.0"
-fsspec-xrootd = ">=0.5.1"
+fsspec-xrootd = ">=0.4.0"
 ndcctools = ">=7.17.1"
-numpy = ">=2.4.6"
-python = ">=3.13"
-rich = ">=14.2.0"
+numpy = ">=2.2.6"
+python = ">=3.12.11"
+pyyaml = ">=5.4.1"
+rich = ">=14.1.0"
 setuptools = "<81"
 uproot = ">=5.6.6"
-xrootd = ">=5.8.4"
+xrootd = ">=5.8.1"
 pixi-pack = ">=0.7.10,<0.8"
 cloudpickle = ">=3.1.2,<4"
 zstandard = ">=0.25.0,<0.26"

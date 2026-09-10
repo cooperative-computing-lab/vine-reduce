@@ -165,5 +165,11 @@ def test_num_workers_cores_env_var_beats_distributor_metadata(monkeypatch):
 
 def test_num_workers_falls_back_to_machine_cores(monkeypatch):
     monkeypatch.delenv("CORES", raising=False)
-    assert _num_workers(None) == (os.process_cpu_count() or 1)
-    assert _num_workers({}) == (os.process_cpu_count() or 1)
+    if hasattr(os, "process_cpu_count"):
+        expected = os.process_cpu_count() or 1
+    elif hasattr(os, "sched_getaffinity"):
+        expected = len(os.sched_getaffinity(0)) or 1
+    else:
+        expected = os.cpu_count() or 1
+    assert _num_workers(None) == expected
+    assert _num_workers({}) == expected
