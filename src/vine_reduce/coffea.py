@@ -118,7 +118,10 @@ def _make_chunk_to_args(
     the NanoEvents for [chunk.start, chunk.stop). Runs remotely, at the
     worker node handling the chunk. If distributor_metadata reports more than
     one core for the task, the chunk's entries are split into that many
-    steps_per_file so NanoEventsFactory reads them in parallel."""
+    steps_per_file so NanoEventsFactory reads them in parallel.
+
+    events.metadata carries the chunk-level keys coffea's own Runner sets, so
+    a processor written against Runner reads the same values here."""
     uproot_options = dict(uproot_options or {})
 
     def chunk_to_args(
@@ -130,11 +133,24 @@ def _make_chunk_to_args(
 
         cores = (distributor_metadata or {}).get("cores", 1)
 
+        # The chunk-level keys coffea's Runner puts on events.metadata (see
+        # coffea.processor.executor._work_function). "fileuuid" is the one
+        # key of that set we cannot supply: a Chunk carries no uuid.
+        # dataset_metadata is applied last, the way coffea applies a
+        # WorkItem's usermeta last, so a caller can still override these.
+        metadata = {
+            "filename": chunk.url,
+            "treename": object_path,
+            "entrystart": chunk.start,
+            "entrystop": chunk.stop,
+            **dataset_metadata,
+        }
+
         return NanoEventsFactory.from_root(
             {chunk.url: object_path},
             entry_start=chunk.start,
             entry_stop=chunk.stop,
-            metadata=dict(dataset_metadata),
+            metadata=metadata,
             schemaclass=schema,
             uproot_options=uproot_options,
             mode=mode,

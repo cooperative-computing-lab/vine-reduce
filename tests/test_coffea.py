@@ -124,6 +124,71 @@ def test_chunk_to_args_uses_distributor_cores_as_steps_per_file(monkeypatch):
     assert captured["steps_per_file"] == 4
 
 
+def test_chunk_to_args_sets_coffea_chunk_metadata(monkeypatch):
+    vr = VineReduceCoffea(processors={"p": lambda events: events}, input={})
+
+    captured = {}
+
+    def fake_from_root(*args, **kwargs):
+        captured.update(kwargs)
+
+        class _Fake:
+            def events(self):
+                return "events"
+
+        return _Fake()
+
+    monkeypatch.setattr("coffea.nanoevents.NanoEventsFactory.from_root", fake_from_root)
+
+    chunk = Chunk(url="a.root", start=10, stop=20)
+    vr.chunk_to_args(chunk, {"dataset": "signal"}, distributor_metadata=None)
+    assert captured["metadata"] == {
+        "filename": "a.root",
+        "treename": "Events",
+        "entrystart": 10,
+        "entrystop": 20,
+        "dataset": "signal",
+    }
+
+
+def test_chunk_to_args_lets_dataset_metadata_override_chunk_keys(monkeypatch):
+    vr = VineReduceCoffea(processors={"p": lambda events: events}, input={})
+
+    captured = {}
+
+    def fake_from_root(*args, **kwargs):
+        captured.update(kwargs)
+
+        class _Fake:
+            def events(self):
+                return "events"
+
+        return _Fake()
+
+    monkeypatch.setattr("coffea.nanoevents.NanoEventsFactory.from_root", fake_from_root)
+
+    chunk = Chunk(url="a.root", start=0, stop=10)
+    vr.chunk_to_args(chunk, {"filename": "override.root"}, distributor_metadata=None)
+    assert captured["metadata"]["filename"] == "override.root"
+
+
+def test_chunk_to_args_does_not_mutate_dataset_metadata(monkeypatch):
+    vr = VineReduceCoffea(processors={"p": lambda events: events}, input={})
+
+    def fake_from_root(*args, **kwargs):
+        class _Fake:
+            def events(self):
+                return "events"
+
+        return _Fake()
+
+    monkeypatch.setattr("coffea.nanoevents.NanoEventsFactory.from_root", fake_from_root)
+
+    dataset_metadata = {"dataset": "signal"}
+    vr.chunk_to_args(Chunk(url="a.root", start=0, stop=10), dataset_metadata)
+    assert dataset_metadata == {"dataset": "signal"}
+
+
 def test_vine_reduce_coffea_executor_materializes_result():
     vr = VineReduceCoffea(processors={}, input={})
 
