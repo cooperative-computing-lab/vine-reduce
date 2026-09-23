@@ -92,7 +92,8 @@ def coffea_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]
                     "and pass its result as input."
                 )
             files[url] = num_entries
-        datasets[name] = {"metadata": spec.get("metadata", {}), "files": files}
+        # coffea's preprocess() emits "metadata": None for a dataset given none.
+        datasets[name] = {"metadata": spec.get("metadata") or {}, "files": files}
     return datasets
 
 
