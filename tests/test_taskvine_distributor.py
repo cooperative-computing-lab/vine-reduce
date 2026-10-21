@@ -19,7 +19,6 @@ from vine_reduce.defaults import (  # noqa: E402
 from vine_reduce.executor import SimpleExecutor  # noqa: E402
 from vine_reduce.taskvine_distributor import (  # noqa: E402
     TaskVineDistributor,
-    _InFlight,
     _result_token,
 )
 from vine_reduce.types import Chunk, RuntimeFailure, Success  # noqa: E402
@@ -147,7 +146,7 @@ def test_wait_survives_a_corrupted_task_output(monkeypatch, dist):
     wait_for_tag, no real worker needed - see test_wait_returns_none_when_
     nothing_pending for why that's safe here."""
     result_id = uuid4().hex
-    dist._in_flight_by_taskvine_id[123] = _InFlight(result_id=result_id, kind="processor")
+    dist._result_ids_by_taskvine_id[123] = result_id
 
     class _FakeTask:
         id = 123
@@ -298,7 +297,7 @@ def test_wait_ignores_tasks_submitted_directly_to_a_shared_manager(tmp_path):
     # coffea's own dataset_tools.preprocess()). wait() must only ever
     # surface tasks *this* distributor submitted - via the tag set on every
     # task in submit() - or a foreign task finishing first would make
-    # wait() pop an unknown taskvine id from _in_flight_by_taskvine_id and
+    # wait() pop an unknown taskvine id from _result_ids_by_taskvine_id and
     # KeyError.
     manager = vine.Manager(port=0, ssl=True)
 

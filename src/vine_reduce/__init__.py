@@ -1,13 +1,5 @@
-"""VineReduce: a dynamic data reduction framework for data processing. See
-PLAN.md for the full design and the README for usage.
-
-Re-exports the package's public API: VineReduce/VineReduceError (engine.py),
-Distributor (the interface a distributor implements), LocalDistributor and
-TaskVineDistributor (the two Distributor implementations shipped here),
-Executor (the interface an executor implements) and its SimpleExecutor/
-CloudpickleExecutor/DaskExecutor implementations, get_environment/
-UnstagedChanges (remote_environment.py), and the Chunk/Outcome family of
-types shared between vine_reduce and a distributor.
+"""VineReduce: a dynamic data reduction framework. See PLAN.md for the design and the README for
+usage. Re-exports the public API.
 """
 
 import importlib.util
@@ -47,10 +39,8 @@ if TYPE_CHECKING or importlib.util.find_spec("ndcctools") is not None:
 
 
 def __getattr__(name: str):
-    """TaskVineDistributor pulls in ndcctools (a heavy, optional dependency
-    not required for LocalDistributor-based use), so it's imported lazily
-    here rather than at module load time - `import vine_reduce` must not
-    require ndcctools to be installed."""
+    """Lazily import TaskVineDistributor so `import vine_reduce` doesn't require the heavy,
+    optional ndcctools."""
     if name == "TaskVineDistributor":
         from .taskvine_distributor import TaskVineDistributor  # noqa: F811
 

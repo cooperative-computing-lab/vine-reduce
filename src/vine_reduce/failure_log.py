@@ -1,7 +1,5 @@
-"""failed_files.log: a durable, human-readable record of every chunk (or
-reduction) vine_reduce gave up on. Shared across every Pipeline in a run (one
-FailureLog per VineReduce.compute() call) - see Pipeline._give_up_on_chunk
-and Pipeline._give_up_on_reduction, the only callers.
+"""failed_files.log: a durable, human-readable record of every chunk or reduction vine_reduce
+gave up on. One FailureLog is shared by all Pipelines in a VineReduce.compute() call.
 """
 
 from __future__ import annotations
@@ -18,16 +16,12 @@ from .types import ResourceUsage
 class FailureRecord:
     """One permanently-failed file's events, as written to failed_files.log.
 
-    ranges: the [start, stop) event ranges of filename that were given up
-        on - a processor failure's one chunk, or what a failed reduction's
-        group held of the file.
-    kind: which stage gave up on these events.
-    attempts: how many tries were made before giving up.
-    resources_allocated / resources_measured: the configured cap
-        (Distributor.resources(kind)) and the last attempt's actual usage,
-        if the distributor reported one - either may be None.
-    traceback: the last attempt's captured traceback, if any (a
-        ResourceExhaustion carries none).
+    ranges: the [start, stop) event ranges of filename that were given up on.
+    kind: which stage gave up.
+    attempts: how many tries were made.
+    resources_allocated / resources_measured: the configured cap (Distributor.resources(kind))
+        and the last attempt's usage; either may be None.
+    traceback: the last attempt's traceback, if any (a ResourceExhaustion carries none).
     """
 
     dataset_name: str
@@ -41,10 +35,8 @@ class FailureRecord:
 
 
 class FailureLog:
-    """Appends one text block per FailureRecord to `path`, flushing
-    immediately - a permanent failure is written the moment it is found,
-    not batched, so the record survives even if the run aborts right
-    after (see PLAN.md's "Attempts and Retries")."""
+    """Appends one text block per FailureRecord to `path`, written immediately rather than
+    batched so the record survives a run abort (see PLAN.md's "Attempts and Retries")."""
 
     def __init__(self, path: str) -> None:
         self._path = path

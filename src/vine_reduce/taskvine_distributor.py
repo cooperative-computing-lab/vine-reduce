@@ -1,56 +1,26 @@
-"""A Distributor backed by ndcctools.taskvine, for running vine_reduce across
-a real cluster of machines instead of local subprocesses.
+"""A Distributor backed by ndcctools.taskvine, running vine_reduce across a cluster.
 
-Manager-only: this class starts a vine.Manager and nothing else. Worker
-processes (vine_worker, a factory, batch-system submission, ...) are the
-caller's responsibility, same as any other TaskVine application - see
-https://cctools.readthedocs.io/en/latest/taskvine/.
+Manager-only: this starts a vine.Manager; workers (vine_worker, a factory, batch submission) are
+the caller's responsibility.
 
-Bridging the Distributor protocol's plain file-path strings onto TaskVine's
-file model (see distributor.py's docstring on what "file" means) works like
-this: an ordinary (non-checkpoint) result gets a manager.declare_temp() file,
-which TaskVine keeps at/near the worker that produced it rather than pulling
-it back to the manager. A checkpoint or final result (submit(...,
-is_checkpoint=True) - see PLAN.md's "Temporary Results, Checkpoints, and
-Restart") instead gets a manager.declare_file(path, cache=True) file, with
-`path` a fresh name inside checkpoint_dir: TaskVine transfers a
-declare_file() output back to the manager unconditionally as soon as the
-task completes (unlike a temp file, which stays remote until explicitly
-fetched), so by the time wait() reports success the checkpoint already sits
-durably on local disk at `path` - see checkpoint_path(). Either way,
-Outcome.file is not that file's real location but an opaque token this class
-mints from result_id, e.g. "result_3f9a1c...p". When that token later shows up inside another
-submit() call's args (as one of reducer_wrapper's input_files),
-_remap_files recognizes it, attaches the underlying vine.File as a task
-input under a fresh sandbox name, and substitutes that sandbox name into the
-args actually sent to the task - so reducer_wrapper's
-`serialization.load(path)` opens a name that exists in its own sandbox,
-never the manager-side token. For a non-checkpoint (temp) result,
-retrieve() is the only place its bytes are ever pulled to the manager, via
-manager.fetch_file() + File.contents(); for a checkpoint, retrieve() still
-works the same way but the bytes are already local by then.
+Files: Outcome.file is not a real location but an opaque token minted from result_id (see
+_result_token). An ordinary result is a manager.declare_temp() file, which stays on the producing
+worker; retrieve() is the only place its bytes are pulled to the manager. A checkpoint or final
+result (is_checkpoint=True) is a manager.declare_file(path, cache=True) file with `path` inside
+checkpoint_dir; TaskVine transfers such outputs back immediately, so it is durably on local disk by
+the time wait() reports success. When a token appears in a later submit()'s args, _remap_files
+attaches the underlying vine.File as a task input under a fresh sandbox name and substitutes that
+name, so the task opens a file that exists in its own sandbox. An adopted checkpoint
+(adopt_checkpoint) is declared under a token like any other and needs no special-casing.
 
-A restart-seeded checkpoint is adopted via adopt_checkpoint() before it ever
-appears in a submit() call: adoption mints a token and declares the file
-under it exactly like a this-run checkpoint (see adopt_checkpoint below), so
-from then on it flows through the normal token path in _remap_files -
-remapping, release, retrieve - with no special-casing.
-
-Resource exhaustion: monitoring is enabled with watchdog=True, so TaskVine
-itself can kill and report a task that overruns its resource allocation -
-something a plain ProcessPoolExecutor (see local_distributor.py) can't do.
-wait() checks task.successful() first and only trusts the Outcome returned
-by executor_wrapper/reducer_wrapper (a Python-level exception caught inside
-the wrapper) when that's True; otherwise it translates TaskVine's own result
-string into ResourceExhaustion or RuntimeFailure. task.successful() means
-"the wrapper ran to completion and returned an Outcome", not "that Outcome
-was a Success" - a Python-level failure or caught MemoryError still returns
-normally, and dest_file is always written (see defaults.py's _run_and_wrap)
-precisely so TaskVine's own missing-output check can't itself mark such a
-task unsuccessful and discard the real Outcome. task.successful() is False
-only when the wrapper never returned at all: it crashed outright (unhandled
-exception, bug) or the worker process was killed by TaskVine's resource
-watchdog.
+Resource exhaustion: monitoring runs with watchdog=True, so TaskVine itself kills tasks that overrun
+their allocation. wait() trusts the Outcome returned by executor_wrapper/reducer_wrapper only when
+task.successful(), which means "the wrapper returned an Outcome" (even a Python-level failure or
+caught MemoryError), not "that Outcome was a Success". dest_file is always written even on failure
+(see defaults.py's _run_and_wrap) so TaskVine's missing-output check can't mark such a task
+unsuccessful and discard the real Outcome. task.successful() is False only when the wrapper never
+returned (crash, or the worker was killed by the watchdog); wait() then maps TaskVine's result
+string to ResourceExhaustion or RuntimeFailure.
 """
 
 from __future__ import annotations
@@ -58,7 +28,6 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
-from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -67,8 +36,8 @@ import ndcctools.taskvine as vine
 from .distributor import Distributor, TaskKind
 from .types import Outcome, ResourceExhaustion, ResourceUsage, RuntimeFailure, Success
 
-# TaskVine result strings (Task.result) that mean the task was killed for
-# overrunning a resource allocation, as opposed to a genuine execution error.
+# TaskVine result strings (Task.result) meaning the task overran a resource allocation, as opposed
+# to a genuine execution error.
 _RESOURCE_EXHAUSTION_RESULTS = {
     "resource exhaustion",
     "max wall time",
@@ -78,23 +47,13 @@ _RESOURCE_EXHAUSTION_RESULTS = {
 
 
 def _result_token(result_id: str) -> str:
-    """The opaque manager-side name for a result (see module docstring). Derived
-    from result_id rather than stored, so the two can never drift apart."""
+    """The opaque manager-side name for a result, derived from result_id so they can't drift."""
     return f"result_{result_id}.p"
 
 
-@dataclass
-class _InFlight:
-    result_id: str
-    kind: TaskKind
-
-
 class TaskVineDistributor(Distributor):
-    """A Distributor backed by ndcctools.taskvine, running vine_reduce
-    across a cluster of TaskVine workers instead of local subprocesses. See
-    the module docstring for how it bridges the Distributor protocol onto
-    TaskVine's file/task model, and the README's "Packaging an environment
-    for remote workers" for `environment=`."""
+    """Runs calls as TaskVine tasks on a cluster of workers. See the module docstring for the
+    file model and the README's "Packaging an environment for remote workers" for `environment=`."""
 
     def __init__(
         self,
@@ -106,46 +65,26 @@ class TaskVineDistributor(Distributor):
         manager: vine.Manager | None = None,
         ssl: bool = True,
     ):
-        """port: port (or [min, max] range) the manager listens on, or 0 to
-            pick one automatically - see `port` below.
-        name: the manager's TaskVine project name, for workers to find it by
-            name instead of host:port.
-        resources_processor/resources_reducer: per-category resource caps
-            (e.g. {"cores": 1, "memory_mb": 2000, "disk_mb": 4000}) applied
-            to every processor/reducer call respectively, via
-            Manager.set_category_resources_max.
-        environment: path to a packed poncho package tarball (see
-            get_environment() in remote_environment.py) to ship and activate
-            on every worker task; None runs tasks in whatever Python
-            environment the worker itself was started with.
-        manager: an already-constructed vine.Manager (or subclass, e.g.
-            vine.DaskVine) to use instead of building one from port/name -
-            lets vine_reduce's tasks and a caller's own tasks share one
-            manager/port and worker pool.
-        ssl: whether the manager encrypts its connections to workers, via a
-            self-signed cert vine.Manager generates on the fly; ignored when
-            manager is given (that manager's own ssl setting, if any,
-            applies instead). Workers started with vine.Factory(manager=...)
-            pick this up automatically (Factory reads it off the manager);
-            Factory started with manager_host_port= instead needs
-            `ssl=True` passed to it too.
-
-        Where this distributor writes a result's file when submit() is
-        called with is_checkpoint=True is set separately, via
-        set_checkpoint_dir() - see the module docstring and
-        checkpoint_path()."""
+        """port: port (or [min, max] range) the manager listens on, or 0 to pick one.
+        name: the manager's project name, for workers to find it by name instead of host:port.
+        resources_processor/resources_reducer: per-category resource caps (e.g. {"cores": 1,
+            "memory_mb": 2000, "disk_mb": 4000}) applied via Manager.set_category_resources_max.
+        environment: path to a packed poncho tarball (see get_environment() in
+            remote_environment.py) to activate on every task; None uses the worker's own Python.
+        manager: an existing vine.Manager (or subclass, e.g. vine.DaskVine) to use instead of
+            building one, so vine_reduce's tasks and the caller's share a manager and worker pool.
+        ssl: whether the manager encrypts worker connections with a generated self-signed cert;
+            ignored when manager is given. A vine.Factory(manager=...) picks this up
+            automatically; one started with manager_host_port= needs `ssl=True` too.
+        """
         self._owns_manager = manager is None
         self._manager = (
             manager if manager is not None else vine.Manager(port=port, name=name, ssl=ssl)
         )
         self._manager.enable_monitoring(watchdog=True)
 
-        # Every task this distributor submits is tagged with this unique
-        # value, and wait() only ever waits for that tag (via
-        # Manager.wait_for_tag) rather than Manager.wait()/wait_for_tag(None)
-        # - so on a caller-supplied manager= shared with the caller's own
-        # tasks (see manager= above), wait() can never pick up one of the
-        # caller's tasks and KeyError on _in_flight_by_taskvine_id.
+        # Every task is tagged with this and wait() only waits on this tag, so on a shared
+        # manager= it never picks up the caller's own tasks.
         self._tag = f"vine_reduce_{uuid4().hex}"
 
         if self._owns_manager:
@@ -164,38 +103,29 @@ class TaskVineDistributor(Distributor):
 
         self._checkpoint_dir: str | None = None
 
-        # Keyed on the dest_token minted for every result - by submit() for
-        # a this-run result, or by adopt_checkpoint() for a restart-seeded
-        # one - so _remap_files always finds it by simple lookup.
+        # Keyed on the token minted for every result (by submit() or adopt_checkpoint()).
         self._files_by_key: dict[str, vine.File] = {}
         self._checkpoint_paths_by_token: dict[str, str] = {}
-        self._in_flight_by_taskvine_id: dict[int, _InFlight] = {}
+        self._result_ids_by_taskvine_id: dict[int, str] = {}
         self._categories_configured: set[str] = set()
 
-        # Files/env vars added via add_file/set_env_var, attached to every
-        # task submitted from then on - see those methods below.
+        # Attached to every task submitted after add_file/set_env_var.
         self._extra_files: list[tuple[str, vine.File]] = []
         self._extra_env: dict[str, str] = {}
 
-        # Set once wait() returns a task, so the next call drains with
-        # timeout 0 instead of waiting again - lets a burst of already-
-        # finished tasks be picked up back-to-back before falling back to a
-        # real wait.
+        # Set once wait() returns a task, so the next call polls with timeout 0 to pick up a burst
+        # of already-finished tasks before waiting for real.
         self._drain_next_wait = False
 
     @property
     def port(self) -> int:
-        """The manager's actual listening port - useful when `port=0` (or a
-        range) was passed to __init__ and the resolved port is needed to
-        point workers at this manager."""
+        """The manager's actual listening port (resolved when `port=0` or a range was given)."""
         return self._manager.port
 
     @property
     def manager(self) -> vine.Manager:
-        """The underlying vine.Manager - pass this to vine.Factory(manager=...)
-        so it provisions workers against the right host/port and picks up
-        settings (e.g. ssl) straight from the manager, rather than
-        duplicating them via manager_host_port=."""
+        """The underlying vine.Manager; pass it to vine.Factory(manager=...) so the factory picks
+        up host, port, and settings like ssl from it."""
         return self._manager
 
     def submit(
@@ -208,16 +138,10 @@ class TaskVineDistributor(Distributor):
         *args: Any,
         is_checkpoint: bool = False,
     ) -> None:
-        """Submit func(dest_token, *args) as a vine.PythonTask, identified by
-        result_id (see the Distributor protocol docstring), ordered by
-        priority (larger runs first) and grouped under `category` for
-        resource-limit purposes. kind selects resources_processor vs.
-        resources_reducer the first time this category is seen.
-        is_checkpoint declares the result durable (see module docstring):
-        its file becomes a manager.declare_file(cache=True) under
-        checkpoint_dir instead of an ordinary manager.declare_temp(), and
-        its path becomes available via checkpoint_path() once the task
-        succeeds."""
+        """Submit func(dest_token, *args) as a vine.PythonTask. `category` is the TaskVine
+        resource category; kind selects the resource caps the first time it is seen.
+        is_checkpoint makes the result a durable declare_file under checkpoint_dir instead of a
+        declare_temp (see module docstring)."""
         dest_token = _result_token(result_id)
 
         remapped_args, extra_inputs = self._remap_files(args)
@@ -250,49 +174,32 @@ class TaskVineDistributor(Distributor):
 
         taskvine_id = self._manager.submit(task)
         self._files_by_key[dest_token] = result_file
-        self._in_flight_by_taskvine_id[taskvine_id] = _InFlight(result_id=result_id, kind=kind)
+        self._result_ids_by_taskvine_id[taskvine_id] = result_id
 
     def resources(self, kind: TaskKind) -> dict[str, Any] | None:
-        """The configured resources_processor/resources_reducer dict for
-        kind, e.g. {"cores": ...} - see the Distributor protocol docstring.
-        This is the category's cap, not necessarily what a given task
-        actually gets; TaskVine's own allocation, decided at dispatch time,
-        may be less, and takes precedence via the CORES environment variable
-        it sets on the worker (see DaskExecutor's _num_workers)."""
+        """The configured resources_processor/resources_reducer dict for kind. This is the
+        category cap; a task's real allocation may be less and is exposed on the worker via the
+        CORES environment variable (see DaskExecutor's _num_workers)."""
         return self._resources_by_kind.get(kind) or None
 
     def _configure_category(self, category: str, kind: TaskKind) -> None:
-        """Apply resources_processor/resources_reducer to `category` in
-        TaskVine, once, the first time that category is submitted to -
-        category is a resource-allocation grouping in TaskVine, not a
-        per-task setting. Also sets TaskVine's automatic allocation mode for
-        the category, differently per kind: reducers use "max" (allocate the
-        largest resource usage measured so far), processors use "min waste"
-        (adjust allocations to minimize wasted resources across tasks)."""
+        """Once per category, apply the resource caps for `kind` and the automatic allocation
+        mode: "max" for reducers (largest usage measured so far), "min waste" for processors."""
         if category in self._categories_configured:
             return
         caps = self._resources_by_kind[kind]
         limits = ResourceUsage(
             cores=caps.get("cores"), memory_mb=caps.get("memory_mb"), disk_mb=caps.get("disk_mb")
         ).to_rmsummary()
-
-        if kind == TaskKind.REDUCER:
-            self._manager.set_category_mode(category, "max")
-        elif kind == TaskKind.PROCESSOR:
-            self._manager.set_category_mode(category, "min waste")
-        else:
-            raise ValueError(f"unreachable: unknown TaskKind {kind!r}")
-
+        mode = "max" if kind == TaskKind.REDUCER else "min waste"
+        self._manager.set_category_mode(category, mode)
         self._manager.set_category_resources_max(category, limits)
-
         self._categories_configured.add(category)
 
     def _remap_files(self, args: tuple[Any, ...]) -> tuple[list[Any], list[tuple[str, vine.File]]]:
-        """Replace tokens from earlier Success outcomes (this-run or
-        adopted, see adopt_checkpoint) with fresh sandbox names. Tokens only
-        ever appear as bare strings or inside a flat list of strings
-        (reducer_wrapper's input_files), so this only looks one level deep
-        rather than walking arbitrary nested structures."""
+        """Replace result tokens in args with fresh sandbox names and return the vine.Files to
+        attach under them. Tokens only appear as bare strings or in a flat list of strings
+        (reducer_wrapper's input_files), so only one level is searched."""
         extra_inputs: list[tuple[str, vine.File]] = []
 
         def remap_one(value: Any) -> Any:
@@ -311,21 +218,16 @@ class TaskVineDistributor(Distributor):
         return remapped, extra_inputs
 
     def wait(self, timeout: float | None = None) -> Outcome | None:
-        """Block until a submitted task finishes, returning its Outcome
-        (Success/RuntimeFailure/ResourceExhaustion, translated from
-        TaskVine's own result string when the task didn't run its Python
-        function to completion), or None if timeout elapses first.
-        If timeout is None, a default of 5 seconds is used - except right
-        after a previous wait() returned a task, when timeout is forced to 0
-        to drain any other already-finished tasks before waiting again."""
+        """Block until a task finishes and return its Outcome, or None on timeout. A timeout of
+        None means 5 seconds, except right after a previous wait() returned a task, when it is 0
+        to drain already-finished tasks."""
         if self._drain_next_wait:
             vine_timeout = 0
         elif timeout is None:
             vine_timeout = 5
         else:
-            # TaskVine's C API only accepts an integer number of seconds;
-            # round up so a small positive float still waits at least that
-            # long instead of truncating to 0 ("return immediately").
+            # TaskVine only accepts whole seconds; round up so a small positive timeout doesn't
+            # truncate to 0 ("return immediately").
             vine_timeout = max(0, math.ceil(timeout))
 
         task = self._manager.wait_for_tag(self._tag, vine_timeout)
@@ -335,18 +237,14 @@ class TaskVineDistributor(Distributor):
 
         self._drain_next_wait = True
 
-        entry = self._in_flight_by_taskvine_id.pop(task.id)
-        result_id = entry.result_id
+        result_id = self._result_ids_by_taskvine_id.pop(task.id)
         allocated = self._allocated_from_task(task)
 
         if task.successful():
             raw = task.output
             if not isinstance(raw, Outcome):
-                # cloudpickle.load of the task's output failed on the
-                # manager side; PythonTask.output then hands back the
-                # exception object it raised, not an Outcome - task.successful()
-                # is True here (see the module docstring), so this is not a
-                # reason to let wait() itself raise.
+                # Loading the task's output failed on the manager side, so PythonTask.output is
+                # the exception, not an Outcome. Report it rather than let wait() raise.
                 self.release_result(result_id)
                 return RuntimeFailure(
                     result_id=result_id,
@@ -359,22 +257,13 @@ class TaskVineDistributor(Distributor):
                 raw, result_id=result_id, std_output=task.std_output, resources_allocated=allocated
             )
             if not isinstance(outcome, Success):
-                # The wrapper ran to completion but reported a Python-level
-                # failure/exhaustion (see defaults.py's _run_and_wrap) -
-                # dest_file exists (it's always written, even on failure, so
-                # TaskVine doesn't itself report "output missing" and
-                # discard this very outcome) but is just a placeholder,
-                # and vine_reduce only ever calls release_result() for a
-                # Success - so drop it here, or it would leak for the rest
-                # of the run.
+                # A Python-level failure/exhaustion: dest_file is just a placeholder, and
+                # release_result() is only called for a Success, so drop it here or it leaks.
                 self.release_result(result_id)
             return outcome
 
-        # task.successful() is False here (see the module docstring) - there's
-        # no result to hand back, and vine_reduce only ever calls
-        # release_result() for a Success - so drop the file declared for it
-        # here, or it would leak for the rest of the run (a resource-
-        # exhausted chunk, say, is simply retried).
+        # The wrapper never returned, so there is no result. Drop the declared file here since
+        # release_result() is only called for a Success.
         self.release_result(result_id)
         resources = self._measured_from_task(task)
         if task.result in _RESOURCE_EXHAUSTION_RESULTS:
@@ -393,24 +282,20 @@ class TaskVineDistributor(Distributor):
         )
 
     def _measured_from_task(self, task: vine.Task) -> ResourceUsage:
-        """Usage actually measured for this task, or an all-zero placeholder
-        if TaskVine has no resource_monitor data for it (e.g. it crashed
-        before monitoring even started)."""
-        measured = self._rmsummary_to_dict(task.resources_measured)
-        if measured is None:
+        """Usage measured for this task, or all zeros if TaskVine has no monitor data for it."""
+        summary = task.resources_measured
+        if summary is None:
             return ResourceUsage(cores=0.0, memory_mb=0.0, wall_time_s=0.0)
-        return ResourceUsage(**measured)
+        return ResourceUsage(
+            cores=summary.cores or 0.0,
+            memory_mb=summary.memory or 0.0,
+            wall_time_s=(summary.wall_time or 0) / 1e6,
+        )
 
     def _allocated_from_task(self, task: vine.Task) -> dict[str, Any] | None:
-        """What TaskVine actually allocated this task on its latest attempt
-        - may differ from the category's static resources_processor/
-        resources_reducer cap once automatic resource allocation ("max"
-        mode - see _configure_category) starts adapting per task from
-        measured history. None if TaskVine has no allocation info for it
-        at all, so the caller falls back to that static cap (see Pipeline.
-        _report_task). Individual fields with no known allocation (e.g.
-        wall_time_s, which isn't a cap TaskVine tracks) are simply omitted
-        rather than reported as a misleading zero."""
+        """What TaskVine allocated on this task's latest attempt, which automatic allocation may
+        make differ from the category cap. None if unknown; fields with no known allocation are
+        omitted rather than reported as zero."""
         summary = task.resources_allocated
         if summary is None:
             return None
@@ -423,23 +308,9 @@ class TaskVineDistributor(Distributor):
             allocated["wall_time_s"] = summary.wall_time / 1e6
         return allocated
 
-    @staticmethod
-    def _rmsummary_to_dict(summary: Any) -> dict[str, Any] | None:
-        if summary is None:
-            return None
-        return {
-            "cores": summary.cores or 0.0,
-            "memory_mb": summary.memory or 0.0,
-            "wall_time_s": (summary.wall_time or 0) / 1e6,
-        }
-
     def release_result(self, result_id: str) -> None:
-        """Undeclare the vine.File backing a completed (Success) result_id,
-        letting TaskVine reclaim its storage on the worker(s) holding it,
-        and remove its checkpoint_dir mirror from local disk, if it has one
-        (see submit's is_checkpoint) - either because a further checkpoint
-        has superseded it, or because a final result was safely retrieved
-        elsewhere and no longer needs this durable copy."""
+        """Undeclare the vine.File for result_id so TaskVine reclaims worker storage, and delete
+        its durable checkpoint_dir copy if it has one."""
         token = _result_token(result_id)
         file = self._files_by_key.pop(token, None)
         if file is not None:
@@ -452,64 +323,46 @@ class TaskVineDistributor(Distributor):
                 pass
 
     def adopt_checkpoint(self, result_id: str, path: str) -> str:
-        """Register an existing durable checkpoint file at `path` under
-        result_id, as if it were a completed Success result submitted with
-        is_checkpoint=True - see the Distributor protocol docstring. Mints a
-        token from result_id the same way submit() does, declares `path`
-        under that token (cache=True, same as a this-run checkpoint), and
-        records it in _checkpoint_paths_by_token - from then on the adopted
-        item flows through every existing code path (remapping, release,
-        retrieve) with no special cases. Returns the token."""
+        """Declare `path` under result_id's token exactly as a this-run checkpoint would be.
+        Returns the token."""
         token = _result_token(result_id)
         self._files_by_key[token] = self._manager.declare_file(path, cache=True)
         self._checkpoint_paths_by_token[token] = path
         return token
 
     def checkpoint_path(self, result_id: str) -> str:
-        """Local, durable on-disk path for a completed (Success) result_id
-        that was submitted with is_checkpoint=True - see submit(). TaskVine
-        already wrote the file there as part of retrieving the task's
-        outputs, so this is a lookup, not a copy."""
+        """A lookup, not a copy: TaskVine already wrote the file there when retrieving outputs."""
         return self._checkpoint_paths_by_token[_result_token(result_id)]
 
     def set_checkpoint_dir(self, path: str) -> None:
-        """Directory a checkpoint (submit(..., is_checkpoint=True)) result
-        lands under from now on - see the Distributor protocol docstring.
-        Must be called before any is_checkpoint=True submit()."""
+        """Directory checkpoint results land under from now on. Must precede any
+        is_checkpoint=True submit()."""
         self._checkpoint_dir = path
         os.makedirs(self._checkpoint_dir, exist_ok=True)
 
     def capacity(self) -> int:
-        """How many more tasks the manager's connected workers could
-        currently run, per TaskVine's own Manager.hungry()."""
+        """How many more tasks the connected workers could run now, per Manager.hungry()."""
         return self._manager.hungry()
 
     def retrieve(self, result_id: str, dest_path: str) -> None:
-        """Pull the result file for a completed (Success) result_id back to
-        the manager and write it to dest_path."""
+        """Fetch the result file to the manager and write it to dest_path."""
         file = self._files_by_key[_result_token(result_id)]
         self._manager.fetch_file(file)
         with open(dest_path, "wb") as f:
             f.write(file.contents())
 
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
-        """Declare local_path once, and attach it as an input - under
-        remote_path, defaulting to local_path's basename - to every task
-        submitted from now on."""
+        """Attach local_path, as remote_path (default: its basename), to every later task."""
         remote_name = remote_path or os.path.basename(local_path)
         self._extra_files.append((remote_name, self._manager.declare_file(local_path)))
 
     def set_env_var(self, name: str, value: str) -> None:
-        """Set an environment variable on every task submitted from now on."""
+        """Set an environment variable on every later task."""
         self._extra_env[name] = value
 
     def shutdown(self) -> None:
-        """Workers are owned by the caller, not this distributor, so there is
-        nothing to do about them. The vine.Manager itself, though, is this
-        distributor's own to close if it built it (manager= was not passed
-        to __init__): drop this class's reference to it so its listening
-        port is freed right away, rather than only whenever the whole
-        TaskVineDistributor object eventually gets garbage collected. A
-        caller-supplied manager is left alone - it is the caller's to close."""
+        """Workers belong to the caller. If this distributor built the manager, drop it so its
+        port is freed now rather than at garbage collection; a caller-supplied manager is left
+        alone."""
         if self._owns_manager:
             self._manager = None

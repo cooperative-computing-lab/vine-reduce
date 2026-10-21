@@ -23,7 +23,15 @@ from typing import Any, Callable, Iterator
 
 from . import serialization
 from .executor import Executor
-from .types import Chunk, Outcome, ResourceExhaustion, ResourceUsage, RuntimeFailure, Success
+from .types import (
+    UNMEASURED,
+    Chunk,
+    Outcome,
+    ResourceExhaustion,
+    ResourceUsage,
+    RuntimeFailure,
+    Success,
+)
 
 
 def default_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any]:
@@ -37,21 +45,12 @@ def default_input_to_datasets(input_data: str | dict[str, Any]) -> dict[str, Any
 
 
 def default_datasets_to_chunks(
-    dataset: dict[str, Any],
-    current_chunksize: Callable[[], int | None],
-    skip_files: set[str] | None = None,
+    dataset: dict[str, Any], current_chunksize: Callable[[], int | None]
 ) -> Iterator[Chunk]:
-    """Yields Chunks per file, in file order. `current_chunksize` is polled
-    once per file (not once per chunk), so a file already being split still
-    finishes at the size it started with, but the next file picks up any
-    chunksize change made since - this is how chunksize halving on resource
-    exhaustion takes effect for chunks not yet generated. A chunksize of
-    None means one chunk per file (all of its events). Files in skip_files
-    (already covered by a checkpoint) are not chunked again."""
-    skip_files = skip_files or set()
+    """Yields Chunks per file, in file order. current_chunksize() is polled
+    once per file, so a chunksize halving (on resource exhaustion) applies
+    from the next file on. None means one chunk per file."""
     for url, num_entries in dataset["files"].items():
-        if url in skip_files:
-            continue
         chunksize = current_chunksize()
         step = chunksize if chunksize is not None else num_entries
         start = 0
@@ -81,12 +80,6 @@ def _measure(fn: Callable[[], Any]) -> tuple[Any, ResourceUsage]:
     return result, ResourceUsage(cores=1, memory_mb=memory_mb, wall_time_s=wall_time_s)
 
 
-def _unmeasured_resources() -> ResourceUsage:
-    """Placeholder usage for a call that failed before _measure could report
-    anything real."""
-    return ResourceUsage(cores=1, memory_mb=0, wall_time_s=0)
-
-
 def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> Outcome:
     """Runs `run`, measuring resources, and serializes its result to dest_file
     on success. Shared tail for executor_wrapper and reducer_wrapper.
@@ -105,12 +98,12 @@ def _run_and_wrap(dest_file: str, run: Callable[[], Any]) -> Outcome:
         serialization.dump(result, dest_file)
     except MemoryError:
         serialization.dump(None, dest_file)
-        return ResourceExhaustion(result_id="", resources=_unmeasured_resources(), std_output=None)
+        return ResourceExhaustion(result_id="", resources=UNMEASURED, std_output=None)
     except Exception:
         serialization.dump(None, dest_file)
         return RuntimeFailure(
             result_id="",
-            resources=_unmeasured_resources(),
+            resources=UNMEASURED,
             std_output=None,
             traceback=traceback_module.format_exc(),
         )

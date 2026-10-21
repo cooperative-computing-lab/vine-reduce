@@ -1,9 +1,7 @@
-"""Sqlite-backed record of checkpoints and final results.
-
-Used so an interrupted run can be restarted without redoing work: on
-startup, vine_reduce reads the checkpoint rows for each (processor, dataset)
-and skips any files they already cover. See "Temporary Results, Checkpoints,
-and Restart" in PLAN.md.
+"""Sqlite-backed record of checkpoints and final results, so an interrupted run can restart
+without redoing work: on startup the checkpoint rows for each (processor, dataset) are read and
+restart doesn't reprocess events they already cover. See "Temporary Results, Checkpoints, and
+Restart" in PLAN.md.
 """
 
 from __future__ import annotations
@@ -23,35 +21,23 @@ _SCHEMA_VERSION = 2
 
 
 def checksum_dataset(dataset: dict[str, Any]) -> str:
-    """A stable hash of a dataset's contents, used to detect when a
-    dataset's definition has changed since the last run (see
-    CheckpointStore.reset_if_dataset_changed)."""
+    """Stable hash of a dataset's contents, to detect definition changes between runs."""
     encoded = json.dumps(dataset, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
 class CheckpointRecord:
-    """One row of the `checkpoints` table, joined with its `checkpoint_files`.
+    """One row of `checkpoints`, joined with its `checkpoint_files`.
 
-    id: row id (sqlite primary key).
-    processor / dataset: the (processor, dataset) pair this checkpoint
-        belongs to.
-    covers: the event ranges, per dataset file URL, whose data this
-        checkpoint's result represents - possibly only part of a file.
-    num_events / wall_time_s / memory_mb: totals accumulated into this
-        checkpoint's result.
-    is_final: whether this is a final result (results_dir) or an
-        intermediate checkpoint (wherever the distributor durably stores
-        one - e.g. TaskVineDistributor's own checkpoint_dir).
-    path: where the checkpoint's serialized result file lives on disk - for
-        an offloaded final result, this is a pointer file (see `offloaded`)
-        rather than the real data.
-    offloaded: True iff this is a final result produced with
-        result_postprocess_offload=True, so `path` holds a pointer file
-        (locator JSON) rather than the actual result bytes. Always False for
-        a non-final checkpoint. Introspection-only - see
-        PLAN_results_dir_rework.md.
+    covers: event ranges, per dataset file URL, that this checkpoint's result represents
+        (possibly part of a file).
+    num_events / wall_time_s / memory_mb: totals accumulated into the result.
+    is_final: a final result (results_dir) rather than an intermediate checkpoint (the
+        distributor's durable storage).
+    path: the serialized result file, or a pointer file (locator JSON) if `offloaded`.
+    offloaded: a final result produced with result_postprocess_offload=True; always False for
+        non-final checkpoints. Introspection-only.
     """
 
     id: int
@@ -67,18 +53,14 @@ class CheckpointRecord:
 
 
 class CheckpointStore:
-    """Sqlite-backed record of checkpoints and final results for every
-    (processor, dataset) pair, used to resume an interrupted run without
-    redoing finished work. See the module docstring."""
+    """Sqlite-backed checkpoint/final-result records for every (processor, dataset) pair."""
 
     def __init__(self, db_path: str):
         """Opens (creating if needed) the sqlite database at db_path."""
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
-        # This DB is a work-resumption aid, not a record that must survive a
-        # power loss: on crash, a checkpoint just fails to record and the
-        # work it covered is redone. Skipping the fsync makes that trade for
-        # write throughput, since correctness doesn't depend on durability.
+        # Resumption aid only: if a crash loses a record, its work is just redone, so skip the
+        # fsync for write throughput.
         self._conn.execute("PRAGMA synchronous = OFF")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._ensure_schema()
@@ -88,10 +70,8 @@ class CheckpointStore:
         if user_version == _SCHEMA_VERSION:
             return
 
-        # Either a brand-new db (nothing to discard, so stay silent) or one
-        # written by an incompatible/old schema (discard it and warn - the
-        # same "discard, don't try to reconcile" trade reset_if_dataset_changed
-        # already makes for a single dataset, extended here to the whole db).
+        # Brand-new db (nothing to discard, stay silent) or an incompatible schema version
+        # (discard everything and warn, rather than reconcile).
         discarded = self._count_existing_checkpoints()
         self._conn.execute("DROP TABLE IF EXISTS checkpoint_files")
         self._conn.execute("DROP TABLE IF EXISTS checkpoints")
@@ -147,13 +127,9 @@ class CheckpointStore:
             """)
 
     def reset_if_dataset_changed(self, dataset: str, checksum: str) -> list[str]:
-        """Compares checksum to what's on record for dataset. If different (or
-        not on record yet), records it, discards any checkpoints on file for
-        that dataset (they no longer apply), and returns the discarded rows'
-        result file paths - this only touches the database, so it's the
-        caller's job to unlink those files (otherwise a changed dataset's old
-        final result sits in results_dir next to the new one forever). Empty
-        (falsy) when the checksum matches and nothing was discarded."""
+        """If checksum differs from the one on record for dataset (or none exists), record it and
+        delete the dataset's checkpoints. Returns the discarded rows' result file paths, which
+        the caller must unlink (only the database is touched); empty if the checksum matched."""
         row = self._conn.execute(
             "SELECT checksum FROM dataset_checksums WHERE dataset = ?", (dataset,)
         ).fetchone()
@@ -191,8 +167,8 @@ class CheckpointStore:
         supersedes: Sequence[int] = (),
         offloaded: bool = False,
     ) -> int:
-        """Insert this checkpoint and delete the rows it supersedes, in ONE
-        transaction. Returns the new row id."""
+        """Insert a checkpoint and delete the rows it supersedes, in one transaction. Returns the
+        new row id."""
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO checkpoints"
@@ -226,8 +202,7 @@ class CheckpointStore:
         return row_id
 
     def checkpoints_for(self, processor: str, dataset: str) -> list[CheckpointRecord]:
-        """All checkpoint rows (final and intermediate) on record for one
-        (processor, dataset) pair."""
+        """All checkpoint rows (final and intermediate) for one (processor, dataset)."""
         rows = self._conn.execute(
             "SELECT id, processor, dataset, num_events, wall_time_s, memory_mb, is_final, path,"
             "  offloaded"

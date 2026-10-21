@@ -1,12 +1,8 @@
 """Shared data types passed between vine_reduce and a distributor.
 
-See PLAN.md for the full design. `Outcome` and its variants are the public,
-distributor-facing result of a submitted call. executor_wrapper/reducer_wrapper
-construct these directly on the worker side, with result_id="" and
-std_output=None (neither is known there); a distributor is responsible for
-filling in the result_id it gave the call at submit() time (and std_output/
-resources_allocated, when it has them) via dataclasses.replace() before
-handing the Outcome back from wait() (see distributor.py).
+Worker-side wrappers build an `Outcome` with result_id="" and std_output=None; the distributor
+fills those in (and resources_allocated, if known) with dataclasses.replace() before returning it
+from wait().
 """
 
 from __future__ import annotations
@@ -36,11 +32,8 @@ class Chunk:
 
 @dataclass(frozen=True)
 class ResourceUsage:
-    """Usage measured (or allocated) for one processor/reducer call, in
-    vine_reduce's own units. A field is None when this distributor/
-    measurement doesn't report that resource - e.g. no distributor
-    measures disk_mb yet (size.jsonl's own docstring anticipates one
-    eventually will); wall_time_s is never a cap, only ever measured."""
+    """Usage measured (or allocated) for one call, in vine_reduce's units. A field is None when
+    not reported (e.g. disk_mb); wall_time_s is only ever measured, never a cap."""
 
     cores: float | None = None
     memory_mb: float | None = None
@@ -48,48 +41,25 @@ class ResourceUsage:
     disk_mb: float | None = None
 
     def to_rmsummary(self) -> dict[str, float]:
-        """This usage's non-None fields under TaskVine's RMSummary
-        attribute names (cores/memory/disk) - see
-        TaskVineDistributor._configure_category, which builds a
-        ResourceUsage from its configured resource cap to get this."""
-        return self._renamed({"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"})
+        """Non-None fields under TaskVine's RMSummary names (cores/memory/disk)."""
+        names = {"cores": self.cores, "memory": self.memory_mb, "disk": self.disk_mb}
+        return {name: value for name, value in names.items() if value is not None}
 
-    def to_size_row(self) -> dict[str, float]:
-        """This usage's non-None fields under size.jsonl's column names
-        (see size_log.py) - see pipeline.py's _update_resource_max, the
-        only caller."""
-        return self._renamed({"cores": "cores", "memory_mb": "memory", "disk_mb": "disk"})
 
-    def _renamed(self, key_map: dict[str, str]) -> dict[str, float]:
-        result = {}
-        for internal_key, output_key in key_map.items():
-            value = getattr(self, internal_key)
-            if value is not None:
-                result[output_key] = value
-        return result
+UNMEASURED = ResourceUsage(cores=1, memory_mb=0, wall_time_s=0)
+"""Placeholder usage for a synthesized outcome of a call that failed before measurement."""
 
 
 @dataclass(frozen=True)
 class Outcome:
     """Base class for the result of a submitted call, as reported by a distributor.
 
-    result_id: the id passed to Distributor.submit() for this call.
-    resources: usage reported for the call - see each Distributor
-        implementation for exactly which fields it fills in.
-    resources_allocated: what the distributor actually gave this call, if it
-        knows and reports that (e.g. TaskVineDistributor, from
-        task.resources_allocated - TaskVine's automatic resource allocation
-        can adapt this per task from measured history, so it may differ
-        from the category's static resources_processor/resources_reducer
-        cap). None when a distributor has no such per-call figure (e.g.
-        LocalDistributor, or a TaskVine task with no resource_monitor data)
-        - the caller then falls back to that static default (see Pipeline.
-        _report_task).
-    std_output: whatever the call printed to stdout, if the distributor is
-        able to capture it (e.g. TaskVineDistributor, from task.std_output)
-        and None otherwise (e.g. LocalDistributor, which runs in a plain
-        ProcessPoolExecutor worker with no separate stdout capture). Used
-        for debug printing on failure - see progress.py's TaskReporter.
+    result_id: the id passed to Distributor.submit().
+    resources: usage reported for the call (which fields are filled depends on the distributor).
+    resources_allocated: what the distributor actually gave the call, if it reports that; it can
+        differ from the static per-category cap. None means the caller falls back to that cap.
+    std_output: the call's stdout if the distributor can capture it, else None; used for debug
+        printing on failure.
     """
 
     result_id: str
@@ -100,32 +70,28 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Success(Outcome):
-    """The call finished normally. `file` is the distributor's own handle
-    for the result (a local path, or an opaque token - see distributor.py's
-    module docstring), to be passed to Distributor.retrieve()."""
+    """The call finished normally. `file` is the distributor's own handle for the result (a
+    local path or an opaque token)."""
 
     file: str
 
 
 @dataclass(frozen=True)
 class RuntimeFailure(Outcome):
-    """The call raised an exception. `traceback` is the remote traceback,
-    formatted as text, for surfacing in a local VineReduceError."""
+    """The call raised an exception. `traceback` is the formatted remote traceback."""
 
     traceback: str
 
 
 @dataclass(frozen=True)
 class ResourceExhaustion(Outcome):
-    """The call was killed for exceeding its resource allocation (memory,
-    wall time, disk). Carries no extra fields beyond result_id/resources."""
+    """The call was killed for exceeding its resource allocation (memory, wall time, disk)."""
 
 
 @dataclass(frozen=True)
 class ResultHandle:
-    """A completed result as the distributor knows it: result_id for
-    release_result/retrieve/checkpoint_path, and file - the distributor's own
-    opaque handle (Outcome.file) - for use inside a later submit()'s args."""
+    """A completed result: result_id for release_result/retrieve/checkpoint_path, and the
+    distributor's handle `file` (Outcome.file) for use in a later submit()'s args."""
 
     result_id: str
     file: str

@@ -35,217 +35,86 @@ __all__ = ["VineReduce", "VineReduceError"]
 _IDLE_POLL_INTERVAL_S = 0.5
 
 
-def _resolve_sized_config(
-    config: int | dict | None, processor_name: str, dataset_name: str
-) -> int | None:
-    """Most-specific-wins lookup for chunksize/reduction_size: a per-dataset
-    entry beats a per-processor entry, which beats the "default" entry."""
-    if config is None or isinstance(config, int):
-        return config
-    if dataset_name in config.get("datasets", {}):
-        return config["datasets"][dataset_name]
-    if processor_name in config.get("processors", {}):
-        return config["processors"][processor_name]
-    return config.get("default")
-
-
-def _resolve_reduction_size(config: int | dict, processor_name: str, dataset_name: str) -> int:
-    """Like _resolve_sized_config, but for reduction_size specifically: unlike
-    chunksize, reduction_size has no meaningful "unset" value, so a dict config
-    missing a "default" (and no matching per-processor/per-dataset entry) is a
-    configuration error, not a silent None - and the resolved size must be
-    usable as a fold width (>= 2)."""
-    resolved = _resolve_sized_config(config, processor_name, dataset_name)
-    if resolved is None or resolved < 2:
-        raise VineReduceError(
-            f"reduction_size for processor {processor_name!r}, dataset {dataset_name!r} "
-            f"resolved to {resolved!r}; it must be an int >= 2. Check the reduction_size "
-            f'dict has a "default" entry or a matching "processors"/"datasets" override.'
-        )
-    return resolved
-
-
-def _resolve_minimum_reduction_size(minimum_reduction_size: int | None, reduction_size: int) -> int:
-    """Clamps VineReduce.minimum_reduction_size for one (processor, dataset)
-    pair's already-resolved reduction_size: None defaults to 2, anything
-    below 2 is raised to 2, and anything above reduction_size itself is
-    capped at reduction_size (a floor can never exceed the size it bounds)."""
-    if minimum_reduction_size is None:
-        minimum_reduction_size = 2
-    return min(max(2, minimum_reduction_size), reduction_size)
-
-
-def _resolve_minimum_chunksize(minimum_chunksize: int | None) -> int:
-    """Clamps VineReduce.minimum_chunksize: None defaults to 1000, anything
-    below 1 is raised to 1 (a chunk can never shrink below a single
-    event)."""
-    if minimum_chunksize is None:
-        minimum_chunksize = 1000
-    return max(1, minimum_chunksize)
-
-
 @dataclass
 class VineReduce:
-    """Drives a dynamic data reduction computation over one or more datasets: for
-    each (processor, dataset) pair, splits every dataset file into chunks,
-    runs `processor` over each chunk remotely (map), then repeatedly folds
-    pooled outputs together with `reducer` (reduce) until a final result
-    covers the whole dataset. Call compute() to run it. See the README's
-    Quick Start and PLAN.md for the full design.
+    """Drives a dynamic data reduction over one or more datasets: for each
+    (processor, dataset) pair, splits files into chunks, runs `processor` on
+    each chunk remotely (map), and folds pooled outputs with `reducer` until
+    final results cover the dataset. Call compute() to run it. See the README
+    and PLAN.md.
 
-    processors: {name: processor_fn} - one Pipeline is built per
-        (processor, dataset) pair. processor_fn receives whatever
-        chunk_to_args returns for a chunk and runs remotely, at the
-        execution site chosen by `executor`.
-    input: the dataset description passed to input_to_datasets - by default
-        (see defaults.default_input_to_datasets) either an already-parsed
-        dict of shape {dataset_name: {"metadata": {...}, "files": {url:
-        num_entries}}}, or a path to a json file holding that dict.
-    input_to_datasets: parses `input` into that dataset dict shape; defaults
-        to defaults.default_input_to_datasets. Runs locally.
-    datasets_to_chunks: splits one dataset's files into Chunks; defaults to
-        defaults.default_datasets_to_chunks. Runs locally.
-    chunk_to_args: turns a Chunk into whatever argument `processor` expects
-        (e.g. opening the file and reading events); defaults to
-        defaults.default_chunk_to_args, which passes the Chunk through
-        unchanged. Runs remotely.
-    executor: an Executor instance (submit/map/shutdown, named after
-        concurrent.futures.Executor) that runs `processor(args)` at the
-        execution site - see executor.py for SimpleExecutor (default),
-        CloudpickleExecutor, and DaskExecutor. Configured once here, then
-        cloudpickled into every remote call. Runs remotely.
-    reducer: folds two processor outputs (or two partial reductions)
-        together; must be commutative, associative, and distributive over a
-        dataset's chunks. Defaults to defaults.default_reducer (`a += b`).
-        Runs remotely.
-    reduction_size: how many pooled items a reduction call folds together at
-        once. Either a plain int, or a dict of shape
-        {"default": int, "processors": {name: int}, "datasets": {name: int}}
-        for per-processor/per-dataset overrides (most specific wins).
-        Halved automatically (down to minimum_reduction_size) on resource
-        exhaustion.
-    minimum_reduction_size: the floor reduction_size is halved down to on
-        resource exhaustion, below which a further ResourceExhaustion raises
-        immediately instead of shrinking further (see attempts's docstring).
-        None (the default) means 2. A value below 2 is raised to 2; a value
-        above the (possibly per-processor/per-dataset) resolved
-        reduction_size is capped at that reduction_size.
-    is_result: given (num_events, total_wall_time_s, total_memory_mb) for a
-        pooled group, returns whether it counts as a final result for that
-        (processor, dataset) pair. Defaults to a check that the group covers
-        every event in the dataset (see defaults.make_default_is_result).
-        Runs locally.
-    result_postprocess: applied to a final result just before it's written
-        out, e.g. to convert an accumulator into a plainer shape. Runs
-        remotely, as part of the reduction call that produces the final
-        result.
-    result_postprocess_offload: if True, result_postprocess's return value is
-        treated as an opaque, JSON-serializable locator describing where the
-        real data already lives (e.g. a worker-local mount or dataset store
-        result_postprocess itself wrote to), not as the result itself.
-        vine_reduce never fetches real result bytes for a final result in
-        this mode - it writes a `{processor_name}__{uuid}.pointer.json` file
-        into results_dir instead of the usual `.pkl.zst`, wrapping the
-        locator with `offloaded`/`processor_name`/`dataset_name`. Global for
-        the whole run, fixed at construction - there is no per-result
-        opt-out. Only meaningful together with result_postprocess; True with
-        result_postprocess=None is a configuration error, raised eagerly by
-        compute().
-    checkpoint_time: checkpoint a non-final reduction once at least this
-        many seconds of wall time have accumulated in it since its last
-        checkpoint. None disables time-based checkpointing.
-    checkpoint_distance: checkpoint a non-final reduction once some ancestor
-        in the group being folded has gone at least this many accumulations
-        (reductions) without being checkpointed. None disables
-        distance-based checkpointing.
-    checkpoint_accumulations: if True, checkpoint every non-final reduction
-        result, regardless of checkpoint_time/checkpoint_distance.
-    results_dir: directory final, per-(processor, dataset) results are
-        written under, at results_dir/<dataset_name>/<processor_name>/.
-        results_dir/size.jsonl also lives here - one line per (processor,
-        dataset) pipeline, written as soon as it finishes; see size_log.py.
-    checkpoint_dir: local directory non-final checkpoints (and adopted
-        checkpoints, on restart) are durably written under; defaults to
-        results_dir/checkpoints. VineReduce decides this path (not the
-        distributor) and is the one that deletes an individual checkpoint
-        file when a dataset's definition changes (see db_path below) -
-        the path is simply handed to the distributor, once, via
-        Distributor.set_checkpoint_dir(), before any work is submitted.
-    distributor: where processor/reducer calls actually run - a Distributor
-        implementation such as TaskVineDistributor. Defaults to a
-        LocalDistributor (ProcessPoolExecutor-backed) that compute() creates
-        and tears down itself; a distributor passed in here is left running
-        for the caller to shut down.
-    chunksize: target number of events per chunk. Either a plain int, or a
-        dict of the same {"default"/"processors"/"datasets"} shape as
-        reduction_size. None means one chunk per file. Halved automatically
-        on resource exhaustion, taking effect for chunks not yet generated.
-    minimum_chunksize: the floor chunksize is halved down to on resource
-        exhaustion, below which a further ResourceExhaustion gives up on the
-        chunk for this run instead of shrinking further (see attempts's
-        docstring). None (the default) means 1000. A value below 1 is raised
-        to 1.
-    max_chunks_active: cap on chunks in flight (submitted but not yet
-        finished) across all pipelines at once.
-    max_chunks_cycle: cap on new chunks submitted per scheduling cycle,
-        across all pipelines.
-    db_path: path to the sqlite checkpoint database; defaults to
-        results_dir/vine_reduce.db. Checkpoint files themselves live under
-        checkpoint_dir (see above) - see PLAN.md's "Temporary Results,
-        Checkpoints, and Restart".
-    extra_files: local paths made available, under their basename, wherever
-        every processor/reducer call runs - see Distributor.add_file().
-    environment_variables: environment variables set for every
-        processor/reducer call - see Distributor.set_env_var().
-    progress: whether to show the live status bars (events, processing,
-        reductions, datasets - four per processor) and print one debug line
-        per finished processor/reducer task, with its resource usage and
-        success/failure status (plus its captured stdout, if any, on
-        failure). See progress.py. Defaults to True; set False for a quiet
-        run, e.g. under a test harness or a non-interactive batch log.
-    attempts: how many times a single chunk (processor call) or reduction
-        (reducer call) is tried, total, before giving up - counting both a
-        RuntimeFailure (the call raised) and a ResourceExhaustion (the call
-        was killed for exceeding its allocation) against the same budget.
-        attempts=1 means no retries. A halving of chunksize/reduction_size
-        resets the budget for the smaller unit it produces (a fresh start,
-        not a strike against it); once a chunk/reduction is already below
-        minimum size (minimum_chunksize / minimum_reduction_size) a further
-        ResourceExhaustion raises immediately, since there is no smaller
-        size left to retry at. Once the budget for a specific chunk is
-        exhausted, that chunk is dropped for this run while the other chunks
-        of its file carry on (see failure_proportion); once the budget for a
-        reduction is exhausted, VineReduceError is raised and the whole run
-        stops, unconditionally - see
-        Pipeline._handle_chunk_outcome/_handle_reduce_outcome.
-    failure_proportion: only applies to a processor permanent failure (a
-        chunk that exhausted `attempts`) - a reducer permanent failure
-        always stops the run, regardless of this setting, since a
-        partially-folded reduction can't be trusted not to be corrupted.
-        A chunk that permanently fails is logged to failed_files.log
-        (dataset, filename, event range, resources allocated/measured, last
-        traceback) the moment it happens and dropped for this run: the rest
-        of its file is still processed, so the file's results have a hole.
-        A restart retries it. The run only aborts once, for some dataset,
-        `permanently_failed_events / total_events_in_dataset >
-        failure_proportion`, where total_events_in_dataset is the sum of the
-        dataset's num_entries (known upfront, not how many have concluded
-        so far). Must be in [0, 1). The default, 0, reproduces the
-        historical behavior: the very first permanent processor failure
-        aborts the run.
-        A run that finishes with any chunk left permanently unprocessed
-        prints a warning in red naming failed_files.log.
+    "Locally"/"remotely" below say where a callable runs.
+
+    processors: {name: fn}; one Pipeline per (processor, dataset). fn receives
+        whatever chunk_to_args returns. Remote.
+    input: passed to input_to_datasets; by default a dict
+        {dataset: {"metadata": {...}, "files": {url: num_entries}}} or a path
+        to a json file holding one.
+    input_to_datasets: parses `input` into that shape. Local.
+    datasets_to_chunks: (dataset, current_chunksize) -> Chunks. Local.
+    chunk_to_args: (chunk, dataset_metadata, distributor_metadata) -> the
+        processor's argument; default passes the Chunk through. Remote.
+    executor: runs processor(args) at the execution site (see executor.py);
+        cloudpickled into every call. Remote.
+    reducer: folds two outputs; must be commutative and associative.
+        Default `a += b`. Remote.
+    reduction_size: items folded per reduction call; an int or
+        {"default": n, "processors": {name: n}, "datasets": {name: n}} (most
+        specific wins). Must resolve to >= 2. Halved on resource exhaustion,
+        down to minimum_reduction_size (clamped to [2, reduction_size]).
+    is_result: (num_events, total_wall_time_s, total_memory_mb) of a group ->
+        whether its reduction is a final result. Default: the group covers
+        the whole dataset. Local.
+    result_postprocess: applied to a final result inside the reduction that
+        produces it. Remote.
+    result_postprocess_offload: result_postprocess returns a JSON-serializable
+        locator of data it stored elsewhere; a `<processor>__<uuid>.pointer.json`
+        is written to results_dir instead of the result. Requires
+        result_postprocess.
+    checkpoint_time: checkpoint a reduction once its group carries at least
+        this many seconds of wall time since the last checkpoint. None: off.
+    checkpoint_distance: checkpoint a reduction once some item in its group
+        has gone this many folds without a checkpoint; 0 checkpoints every
+        reduction. None: off.
+    checkpoint_accumulations: checkpoint every reduction; same as
+        checkpoint_distance=0.
+    results_dir: final results go to results_dir/<dataset>/<processor>/;
+        size.jsonl (see size_log.py) also lives here.
+    checkpoint_dir: where durable checkpoints are written (default
+        results_dir/checkpoints); handed to Distributor.set_checkpoint_dir().
+    distributor: where calls run. Default: a LocalDistributor created and
+        shut down by compute(); a supplied one is left running.
+    chunksize: events per chunk, same int-or-dict shape as reduction_size;
+        None means one chunk per file. Halved on resource exhaustion, down
+        to minimum_chunksize (at least 1); affects chunks not yet generated.
+    max_chunks_active: cap on chunks in flight across all pipelines.
+    max_chunks_cycle: cap on chunks submitted per scheduling cycle.
+    db_path: sqlite checkpoint database; default results_dir/vine_reduce.db.
+    extra_files / environment_variables: made available to every call (see
+        Distributor.add_file/set_env_var).
+    progress: show live status bars and one line per finished task.
+    attempts: tries per chunk or reduction, counting failures and resource
+        exhaustions alike. Halving the size gives the smaller unit a fresh
+        budget; exhaustion at the minimum size gives up at once. A chunk that
+        gives up is dropped (see failure_proportion); a reduction that gives
+        up raises VineReduceError.
+    failure_proportion: in [0, 1). Chunks that give up are logged to
+        ./failed_files.log and left as holes (a restart retries them); the
+        run aborts once a dataset's given-up events exceed this fraction of
+        its total events. Default 0: the first failure aborts.
     """
 
     processors: dict[str, Callable[[Any], Any]]
     input: str | dict[str, Any]
-    input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] | None = None
-    datasets_to_chunks: Callable | None = None
+    input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] = (
+        defaults.default_input_to_datasets
+    )
+    datasets_to_chunks: Callable = defaults.default_datasets_to_chunks
     chunk_to_args: Callable = defaults.default_chunk_to_args
     executor: Executor = field(default_factory=SimpleExecutor)
     reducer: Callable = defaults.default_reducer
     reduction_size: int | dict = 10
-    minimum_reduction_size: int | None = None
+    minimum_reduction_size: int = 2
     is_result: Callable[[int, float, float], bool] | None = None
     result_postprocess: Callable[[Any], Any] | None = None
     result_postprocess_offload: bool = False
@@ -256,7 +125,7 @@ class VineReduce:
     checkpoint_dir: str | None = None
     distributor: Distributor | None = None
     chunksize: int | dict | None = None
-    minimum_chunksize: int | None = None
+    minimum_chunksize: int = 1000
     max_chunks_active: int = 1000
     max_chunks_cycle: int = 100
     db_path: str | None = None
@@ -266,12 +135,12 @@ class VineReduce:
     attempts: int = 3
     failure_proportion: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.checkpoint_accumulations:
+            self.checkpoint_distance = 0
+
     def compute(self) -> None:
-        """Run the computation to completion: build one Pipeline per
-        (processor, dataset) pair (resuming from any checkpoints already on
-        disk) and drive them until every pipeline has a final result. If
-        `distributor` was not supplied, a LocalDistributor is created for
-        this call and shut down again before returning."""
+        """Run to completion, resuming from any checkpoints on disk."""
         if not 0.0 <= self.failure_proportion < 1.0:
             raise ValueError(
                 f"failure_proportion must be in [0, 1); got {self.failure_proportion!r}"
@@ -281,7 +150,11 @@ class VineReduce:
                 "result_postprocess_offload=True requires result_postprocess to be set"
             )
         with ExitStack() as stack:
-            distributor = self._enter_distributor(stack)
+            distributor = (
+                self.distributor
+                if self.distributor is not None
+                else stack.enter_context(LocalDistributor())
+            )
             distributor.set_checkpoint_dir(
                 self.checkpoint_dir or os.path.join(self.results_dir, "checkpoints")
             )
@@ -290,15 +163,12 @@ class VineReduce:
             for name, value in self.environment_variables.items():
                 distributor.set_env_var(name, value)
 
-            input_to_datasets = self.input_to_datasets or defaults.default_input_to_datasets
-            datasets_to_chunks = self.datasets_to_chunks or defaults.default_datasets_to_chunks
-
             os.makedirs(self.results_dir, exist_ok=True)
             db = stack.enter_context(
                 CheckpointStore(self.db_path or os.path.join(self.results_dir, "vine_reduce.db"))
             )
 
-            datasets = input_to_datasets(self.input)
+            datasets = self.input_to_datasets(self.input)
             for name, dataset in datasets.items():
                 discarded_paths = db.reset_if_dataset_changed(name, checksum_dataset(dataset))
                 for path in discarded_paths:
@@ -312,25 +182,14 @@ class VineReduce:
             failure_log = FailureLog(failure_log_path)
             size_log = SizeLog(os.path.join(self.results_dir, "size.jsonl"))
             pipelines = self._build_pipelines(
-                datasets, distributor, db, datasets_to_chunks, reporter, failure_log, size_log
+                datasets, distributor, db, reporter, failure_log, size_log
             )
             self._run(pipelines, distributor, reporter)
             self._warn_unprocessed(pipelines, failure_log_path)
 
-    def _enter_distributor(self, stack: ExitStack) -> Distributor:
-        """Return `distributor` if the caller supplied one (left running
-        afterward for the caller to shut down), otherwise create a
-        LocalDistributor and enter it into `stack` so it is shut down again
-        on the way out, however compute() returns."""
-        if self.distributor is not None:
-            return self.distributor
-        return stack.enter_context(LocalDistributor())
-
     @staticmethod
     def _warn_unprocessed(pipelines: list[Pipeline], failure_log_path: str) -> None:
-        """Print a red warning naming `failure_log_path` if any pipeline
-        ended this run with chunks permanently skipped (see
-        failure_proportion's docstring above)."""
+        """Warn in red if any chunk was given up on this run."""
         failed = [chunk for p in pipelines for chunk in p.failed_chunks]
         if failed:
             events = sum(chunk.num_events for chunk in failed)
@@ -345,68 +204,32 @@ class VineReduce:
         datasets: dict[str, Any],
         distributor: Distributor,
         db: CheckpointStore,
-        datasets_to_chunks: Callable,
         reporter: ProgressReporter | NullProgressReporter,
         failure_log: FailureLog,
         size_log: SizeLog,
     ) -> list[Pipeline]:
-        num_processors = len(self.processors)
-        num_datasets = len(datasets)
-        total_slots = num_processors * num_datasets
-        pipelines: list[Pipeline] = []
-        for proc_index, (proc_name, processor) in enumerate(self.processors.items()):
-            for dataset_index, (dataset_name, dataset) in enumerate(datasets.items()):
-                # Earlier processors get better (larger) priority than later ones;
-                # within the same processor, earlier datasets get better priority
-                # than later ones. Reductions always outrank every processing call,
-                # at any processor/dataset priority level - see PLAN.md's
-                # "Priorities".
-                rank = proc_index * num_datasets + dataset_index
-                process_priority = total_slots - rank
-                reduce_priority = process_priority + total_slots
-                is_result = self.is_result or defaults.make_default_is_result(
-                    sum(dataset["files"].values())
-                )
-                reduction_size = _resolve_reduction_size(
-                    self.reduction_size, proc_name, dataset_name
-                )
-                minimum_reduction_size = _resolve_minimum_reduction_size(
-                    self.minimum_reduction_size, reduction_size
-                )
-                minimum_chunksize = _resolve_minimum_chunksize(self.minimum_chunksize)
-                pipelines.append(
-                    Pipeline(
-                        processor_name=proc_name,
-                        processor=processor,
-                        dataset_name=dataset_name,
-                        dataset=dataset,
-                        distributor=distributor,
-                        db=db,
-                        datasets_to_chunks=datasets_to_chunks,
-                        chunk_to_args=self.chunk_to_args,
-                        executor=self.executor,
-                        reducer=self.reducer,
-                        is_result=is_result,
-                        result_postprocess=self.result_postprocess,
-                        result_postprocess_offload=self.result_postprocess_offload,
-                        chunksize=_resolve_sized_config(self.chunksize, proc_name, dataset_name),
-                        minimum_chunksize=minimum_chunksize,
-                        reduction_size=reduction_size,
-                        minimum_reduction_size=minimum_reduction_size,
-                        checkpoint_time=self.checkpoint_time,
-                        checkpoint_distance=self.checkpoint_distance,
-                        checkpoint_accumulations=self.checkpoint_accumulations,
-                        results_dir=self.results_dir,
-                        process_priority=process_priority,
-                        reduce_priority=reduce_priority,
-                        attempts=self.attempts,
-                        failure_proportion=self.failure_proportion,
-                        failure_log=failure_log,
-                        size_log=size_log,
-                        task_reporter=reporter,
-                    )
-                )
-        return pipelines
+        """One Pipeline per (processor, dataset), in descending priority:
+        earlier processors, then earlier datasets, rank higher, and every
+        reduction outranks every processing call (see PLAN.md's
+        "Priorities")."""
+        total_slots = len(self.processors) * len(datasets)
+        pairs = [(p, d) for p in self.processors for d in datasets]
+        return [
+            Pipeline(
+                self,
+                processor_name=proc_name,
+                dataset_name=dataset_name,
+                dataset=datasets[dataset_name],
+                distributor=distributor,
+                db=db,
+                process_priority=total_slots - rank,
+                reduce_priority=2 * total_slots - rank,
+                failure_log=failure_log,
+                size_log=size_log,
+                task_reporter=reporter,
+            )
+            for rank, (proc_name, dataset_name) in enumerate(pairs)
+        ]
 
     def _run(
         self,
@@ -438,20 +261,15 @@ class VineReduce:
                     self.max_chunks_cycle,
                 ),
             )
-            # _build_pipelines emits pipelines in descending process_priority
-            # order already (outer loop over processors, highest first), and
-            # `remaining` is a priority-order-preserving filter of that list,
-            # so no re-sort is needed here.
+            # pipelines are already in descending priority (see _build_pipelines).
             for pipeline in remaining:
                 if budget <= 0:
                     break
                 budget -= pipeline.feed(budget)
 
             if not any(p.in_flight_count for p in pipelines):
-                # Nothing submitted this cycle and nothing pending from before;
-                # waiting now would block forever. Sleep briefly rather than
-                # busy-spinning re-checking distributor.capacity() (e.g. while
-                # waiting for a TaskVine worker to connect), then re-check state.
+                # Nothing in flight, so wait() would block forever; e.g. no
+                # TaskVine worker has connected yet. Poll without spinning.
                 time.sleep(_IDLE_POLL_INTERVAL_S)
                 continue
 

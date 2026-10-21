@@ -244,12 +244,9 @@ class VineReduceCoffea(VineReduce):
     input_to_datasets: Callable[[str | dict[str, Any]], dict[str, Any]] = coffea_input_to_datasets
 
     def __post_init__(self) -> None:
-        """Builds chunk_to_args/executor from the fields above, the way a
-        user of plain VineReduce would pass them in directly. These two
-        VineReduce fields are computed from this class's own fields (schema,
-        mode, object_path, uproot_options, processor_args), so passing
-        chunk_to_args= or executor= explicitly would silently be discarded -
-        raise instead so the mistake isn't hidden."""
+        """Builds chunk_to_args/executor from this class's own fields. Passing
+        either explicitly raises rather than being silently discarded."""
+        super().__post_init__()
         if self.chunk_to_args is not defaults.default_chunk_to_args:
             raise ValueError(
                 "VineReduceCoffea computes chunk_to_args itself from schema/"
@@ -268,37 +265,14 @@ class VineReduceCoffea(VineReduce):
 
     @staticmethod
     def preprocess_cache(
-        fileset: dict[str, Any],
-        cache_file: str | Path,
-        step_size: None | int = None,
-        align_clusters: bool = False,
-        recalculate_steps: bool = False,
-        files_per_batch: int = 1,
-        skip_bad_files: bool = False,
-        file_exceptions: Any = (OSError,),
-        save_form: bool = False,
-        scheduler: None | Callable | str = None,
-        uproot_options: dict[str, Any] | None = None,
-        step_size_safety_factor: float = 0.5,
-        allow_empty_datasets: bool = False,
+        fileset: dict[str, Any], cache_file: str | Path, **preprocess_kwargs: Any
     ) -> dict[str, Any]:
-        """Runs coffea's own dataset_tools.preprocess() on fileset, caching
-        the result at cache_file so unchanged filesets don't get
-        re-preprocessed on every run.
-
-        cache_file is a jsonl file: its first line is a header dict holding
-        a checksum of fileset, and its second line is the preprocessed
-        fileset (coffea's "available" return value - the files it was able
-        to fully probe). If cache_file exists and its checksum matches
-        fileset's, preprocess() is skipped and the cached result is
-        returned as-is. Otherwise (no cache, stale checksum, or a corrupt
-        cache file) preprocess() is run and cache_file is (re)written.
-
-        All other arguments are forwarded to coffea.dataset_tools.preprocess
-        unchanged - see its docs. Returns coffea's rich per-file dict shape
-        (not vine_reduce's flat shape); pass the result as input to
-        coffea_input_to_datasets (e.g. via VineReduceCoffea's default
-        input_to_datasets)."""
+        """Runs coffea.dataset_tools.preprocess(fileset, **preprocess_kwargs),
+        caching its "available" result in cache_file so an unchanged fileset
+        isn't preprocessed again. cache_file is jsonl: a header with
+        fileset's checksum, then the preprocessed fileset. A missing, stale or
+        corrupt cache is recomputed and rewritten. The result is coffea's own
+        per-file shape - pass it as VineReduceCoffea's input."""
         checksum = checksum_dataset(fileset)
         cached = _read_preprocess_cache(cache_file, checksum)
         if cached is not None:
@@ -306,19 +280,6 @@ class VineReduceCoffea(VineReduce):
 
         from coffea.dataset_tools import preprocess
 
-        available, _updated = preprocess(
-            fileset,
-            step_size=step_size,
-            align_clusters=align_clusters,
-            recalculate_steps=recalculate_steps,
-            files_per_batch=files_per_batch,
-            skip_bad_files=skip_bad_files,
-            file_exceptions=file_exceptions,
-            save_form=save_form,
-            scheduler=scheduler,
-            uproot_options=uproot_options or {},
-            step_size_safety_factor=step_size_safety_factor,
-            allow_empty_datasets=allow_empty_datasets,
-        )
+        available, _updated = preprocess(fileset, **preprocess_kwargs)
         _write_preprocess_cache(cache_file, checksum, available)
         return available

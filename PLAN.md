@@ -90,27 +90,24 @@
 
 **Rule**
 
-1. **A checkpoint's inputs can be freed once it is durable.** When a reduction's output is
-   checkpointed (or becomes a final result), everything folded into it is no longer needed for
-   recovery and is released. A non-final checkpoint's *own* copy is not released then: it stays
-   live as a possible input to later reductions, and is released only once a further checkpoint
-   covers it.
-2. **An uncheckpointed accumulation's inputs are freed only when something downstream is
-   checkpointed** - recursively through its lineage, stopping at prior checkpoints (whose own
-   lineages were already freed when they were checkpointed, per invariant 1).
+1. **A reduction's inputs are released only when the reduction is a checkpoint.** A successful
+   uncheckpointed fold releases nothing: its inputs (and their own unreleased lineage) are kept
+   so a lost uncheckpointed result can still be recovered by re-folding them. When a fold that
+   is a checkpoint (or final result) succeeds and is durable, its whole lineage is released.
+2. **A checkpoint is released only once a later checkpoint supersedes it.** A checkpointed input
+   keeps its store row and durable file until something downstream of it is checkpointed. A
+   non-final checkpoint's live copy also stays usable as an input to later reductions until then.
 
 **Mechanics** (all in `src/vine_reduce/pipeline.py`)
 
-- Invariant 1: `_checkpoint` releases a checkpoint's inputs only after durability is established
-  (final: `retrieve()` into `results_dir` returned; non-final: the distributor made the copy
-  durable at submit time per the `is_checkpoint=True` contract) and after the checkpoint store's
-  atomic `record(...)` committed.
-- Invariant 2: a reduction's output keeps its whole input group alive as `PoolItem.inputs`; the
-  *only* place anything is released is `_checkpoint`, via `_release_covered` - a walk that frees
-  an item and descends into its `inputs` exactly while the item is not itself checkpointed. The
-  walk uses an explicit stack, not recursion, so an arbitrarily long uncheckpointed chain cannot
-  hit Python's recursion limit, and it clears `handle`/`inputs` as it goes, making double-release
-  structurally impossible.
+- Each `PoolItem` carries `lineage`, a flat list of every item folded into it since its inputs
+  were last checkpointed: a fold's lineage is its group plus each group item's own lineage (a
+  checkpointed item's lineage is always empty). `_handle_reduce_success` releases nothing.
+- `_checkpoint` is the only place a lineage is released: it supersedes the rows of the lineage's
+  checkpointed items in its atomic `record(...)`, then releases the whole lineage, only after
+  durability is established (final: `retrieve()` into `results_dir` returned; non-final: the
+  distributor made the copy durable at submit time per the `is_checkpoint=True` contract).
+- `_release` clears an item's handle, making double release impossible.
 
 ### When a checkpoint is taken
 
@@ -126,8 +123,8 @@ threshold left as None disables that trigger):
   reduction folds without being checkpointed. Distance is tracked per pooled item: 0 for a fresh
   chunk result, `max(group) + 1` whenever a group is folded; the trigger uses the *max* across the
   group, not a sum.
-- `checkpoint_accumulations=True`: checkpoint every non-final reduction outright, regardless of
-  the thresholds.
+  `checkpoint_distance=0` checkpoints every reduction.
+- `checkpoint_accumulations=True` is the same as `checkpoint_distance=0`.
 
 **Why**
 
@@ -248,10 +245,9 @@ Store semantics:
 2. The run is finished iff the final rows cover every event `[0, num_entries)` of every dataset
    file; partial rows are then moot and ignored.
 3. Otherwise every partial (non-final) row is replayed as a pool item.
-4. Events a replayed row covers are never processed again: a file the replayed rows cover
-   entirely is in `skip_files` (not chunked at all), and chunks of a file they cover only in part
-   are trimmed to the uncovered events, so the file resumes where it left off whatever chunk
-   boundaries this run's `datasets_to_chunks` picks.
+4. Events a replayed row covers are never processed again: chunks are trimmed to the uncovered
+   events (a fully covered file yields nothing), so a file resumes where it left off whatever
+   chunk boundaries this run's `datasets_to_chunks` picks.
 5. Permanent failures are not persisted. A range that failed in an earlier run is uncovered, so a
    restart processes it again with a fresh `attempts` budget. If the earlier run had already
    produced its final result(s), the refilled ranges drain into an **additional** final result
@@ -260,12 +256,11 @@ Store semantics:
 **Mechanics**
 
 - `_seed_from_checkpoints` executes the plan above.
-- `RestartPlan` carries `skip_files: set[str]` (files fully covered) and
-  `covered: dict[str, Ranges]` (union of every replayed row's `covers`).
+- `RestartPlan` carries `covered: dict[str, Ranges]` (union of every replayed row's `covers`).
 - `Pipeline._trim_covered` wraps the `datasets_to_chunks` generator, replacing each chunk by
   `uncovered_chunks(chunk, covered[url])`. Trimmed sub-chunks may be smaller than
   `minimum_chunksize`; that floor only bounds halving, so this is allowed. The user's
-  `datasets_to_chunks` keeps its `skip_files` signature and never sees `covered`.
+  `datasets_to_chunks` never sees `covered`.
 - Every replayed **partial** row is handed to the distributor via
   `adopt_checkpoint(result_id, row.path)` - `result_id` freshly minted by vine_reduce itself, same
   as for `submit()` - which registers the on-disk file as if it were a completed Success result of
@@ -283,17 +278,14 @@ Store semantics:
 
 **Rule**
 
-A distributor-side result is only ever released once a checkpoint covers it - never merely
-because it was folded into a later reduction (invariants 1 and 2). Concretely, when
-`_checkpoint` runs for a new item:
+A result is released only when `_checkpoint` runs for an item whose lineage holds it
+(invariants 1 and 2):
 
 1. Locate/create the durable copy (final: retrieve into `results_dir`, release the distributor's
    copy, drop the handle; non-final: look up `checkpoint_path`, keep the handle live).
-2. `record(...)` the new row, atomically deleting the rows of any inputs that were themselves
-   checkpoints (they are superseded).
-3. Call `_release_covered` on every input: free it and its whole not-yet-checkpointed lineage,
-   stopping at items that are themselves checkpoints. Then clear the new item's `inputs` and
-   reset its since-checkpoint counters.
+2. `record(...)` the new row, atomically deleting the rows of the checkpoints in the item's
+   `lineage` (they are superseded).
+3. Release the whole lineage, clear it, and reset the new item's since-checkpoint counters.
 
 - `release_result` is the *only* release channel, and its contract (a hard protocol requirement,
   not an implementation detail) is that it also removes a checkpoint's durable on-disk copy - for
@@ -323,14 +315,15 @@ handle Optional[ResultHandle]: the item's live distributor identity - handle.fil
 num_events / wall_time_s / memory_mb: totals accumulated into this item.
 covers Coverage: per dataset file URL, the [start, stop) event ranges this item
                                represents - possibly only part of a file.
-since_checkpoint_time float: wall time accumulated since this lineage was last checkpointed.
-since_checkpoint_distance int: reduction folds since this lineage was last checkpointed.
+since_checkpoint_time float: wall time accumulated since this item's inputs were last
+                               checkpointed.
+since_checkpoint_distance int: reduction folds since this item's inputs were last checkpointed.
 checkpoint Optional[CheckpointRef]: the durable identity (store row_id + on-disk path), present
                                iff the item is durable.
-inputs List[PoolItem]: the items folded together to produce this one (empty for a chunk's
-                               output). Kept so a lost, not-yet-durable item can be recovered by
-                               re-folding its inputs instead of recomputing from scratch;
-                               cleared once a checkpoint covers it (invariant 2).
+lineage List[PoolItem]: every item folded into this one since its inputs were last
+                               checkpointed, flattened through uncheckpointed folds. Kept so a
+                               lost uncheckpointed item can be recovered; released (checkpoints
+                               superseded) once this item is checkpointed (invariants 1 and 2).
 attempts int: how many failed reduction attempts this item has survived while in its current
                                grouping, for the `attempts` retry budget (see "Attempts and
                                Retries"). 0 for a freshly produced item (a raw chunk's output, or a
@@ -443,8 +436,9 @@ are available). What happens next depends on which kind of call it was:
   - Every file folded into the failing group is logged with the ranges the group held of it
     (from the group's `covers`; there is no attempt to attribute the
     failure to one specific input with any precision - the run is stopping anyway), and the
-    group's own distributor-held results are released (`Pipeline._release_covered`, the same
-    cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
+    group's uncheckpointed items and lineage are released before the `VineReduceError`
+    propagates.
+    Checkpoints in the group keep their files, since nothing superseded their rows.
 
 If a run finishes with at least one chunk left permanently unprocessed, a warning is printed in red
 giving the number of failed chunks and events and naming `failed_files.log`. The dataset's final
@@ -716,8 +710,9 @@ shutdown(): release whatever resources this distributor owns (worker pools, temp
 VineReduce:
 processors Dict[str, Callable]: Mapping from processor names to processing functions.
 input str | dict: pathname to the input description, or an already-parsed dict of that shape.
-input_to_datasets Optional[Callable]: Convert input into the dictionary of datasets.
-datasets_to_chunks Optional[Callable]: Generate chunks per dataset. Reset per processor.
+input_to_datasets Callable = default_input_to_datasets: Convert input into the dictionary of datasets.
+datasets_to_chunks Callable = default_datasets_to_chunks: (dataset, current_chunksize) ->
+                               Chunks. Reset per processor.
 chunk_to_args Callable: Instantiate chunks.
 executor Executor = SimpleExecutor(): Call processor on instantiated chunks. See "Executors" below.
 reducer Callable = default_reducer: Function to merge two results together.
@@ -725,10 +720,10 @@ reduction_size int | dict = 10: Results to reduce together in a single reduction
                                plain int, or {"default": int, "processors": {name: int},
                                "datasets": {name: int}} for per-processor/per-dataset overrides
                                (most specific wins). Must resolve to an int >= 2.
-minimum_reduction_size int | None = None: The floor reduction_size is halved down to on resource
+minimum_reduction_size int = 2: The floor reduction_size is halved down to on resource
                                exhaustion, below which a further ResourceExhaustion raises
                                immediately instead of shrinking further (see "Attempts and
-                               Retries"). None means 2. A value below 2 is raised to 2; a value
+                               Retries"). A value below 2 is raised to 2; a value
                                above the (possibly per-processor/per-dataset) resolved
                                reduction_size is capped at that reduction_size.
 is_result Optional[Callable] = None: is_result(num_events, total_time, total_memory) decides
@@ -736,13 +731,12 @@ is_result Optional[Callable] = None: is_result(num_events, total_time, total_mem
                                being reduced. Default: True only once all events of the dataset
                                are consumed.
 result_postprocess Optional[Callable] = None: Applied to final results.
-checkpoint_time Optional[float]: Wall time (seconds), per reduction lineage, that triggers a
-                               checkpoint.
-checkpoint_distance Optional[int]: Accumulations (reduction folds) since a lineage was last
-                               checkpointed that trigger a checkpoint - fires once some ancestor
-                               in the group being folded has gone this many uncheckpointed.
-checkpoint_accumulations bool = False: If True, checkpoint every non-final reduction result,
-                               regardless of checkpoint_time/checkpoint_distance.
+checkpoint_time Optional[float]: Wall time (seconds) since the group's inputs were last
+                               checkpointed that triggers a checkpoint.
+checkpoint_distance Optional[int]: Accumulations (reduction folds) without a checkpoint that
+                               trigger one - fires once some item in the group being folded has
+                               gone this many uncheckpointed. 0 checkpoints every reduction.
+checkpoint_accumulations bool = False: Same as checkpoint_distance=0.
 results_dir str = "results": Local directory for final results, one subdirectory per dataset
                                and, within that, one per processor (so multiple processors over
                                the same dataset don't collide). Non-final checkpoints are not
@@ -760,11 +754,10 @@ distributor Optional[Distributor]: The distributor to use. Defaults to a LocalDi
 chunksize int | dict | None: Target events per chunk, same dict shape as reduction_size. None
                                means one chunk per file. Halved automatically on resource
                                exhaustion, for chunks not yet generated.
-minimum_chunksize int | None = None: The floor chunksize is halved down to on resource
+minimum_chunksize int = 1000: The floor chunksize is halved down to on resource
                                exhaustion, below which a further ResourceExhaustion gives up on
                                the chunk's file for good instead of shrinking further (see
-                               "Attempts and Retries"). None means 1000. A value below 1 is
-                               raised to 1.
+                               "Attempts and Retries"). A value below 1 is raised to 1.
 max_chunks_active int = 1000: Cap on chunks in flight (submitted but not yet finished) across
                                all pipelines at once.
 max_chunks_cycle int = 100: Cap on new chunks submitted per scheduling cycle, across all

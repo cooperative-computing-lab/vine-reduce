@@ -1,27 +1,14 @@
-"""Implementations of the pipeline's `executor` step: the object
-executor_wrapper (see defaults.py) calls to actually run processor(args).
-All of these run remotely, at the execution site chosen by the distributor.
+"""Pipeline `executor` step: the object executor_wrapper (defaults.py) calls to run
+processor(args) at the remote execution site.
 
-An executor implements the Executor protocol below - submit/shutdown, named
-after concurrent.futures.Executor. It is configured once, in the
-vine_reduce process, and cloudpickled into every remote call, so an executor
-must always be picklable: any live resource (e.g. a process pool) is created
-lazily on first submit and dropped before pickling (see
-CloudpickleExecutor.__getstate__).
+An executor is configured once locally and cloudpickled into every remote call, so it must always
+be picklable: live resources (e.g. a process pool) are created lazily on first submit and dropped
+in __getstate__.
 
-SimpleExecutor is the default: it just calls processor(args) directly, in
-the same process running executor_wrapper.
-
-CloudpickleExecutor and DaskExecutor are alternatives:
-  - CloudpickleExecutor runs processor(args) in its own subprocess (via
-    CloudpickleProcessPoolExecutor), so a crash or memory leak in processor
-    doesn't take down the worker task itself.
-  - DaskExecutor expects processor(args) to return a dask-delayed object
-    (or dask array/dataframe) and computes it at the execution site, using
-    dask's "processes" scheduler backed by CloudpickleProcessPoolExecutor -
-    so tasks inside the dask graph may be closures/lambdas too, same as
-    CloudpickleExecutor. dask is not a vine_reduce dependency; it must
-    already be installed wherever this executor actually runs.
+SimpleExecutor (default) calls processor(args) in the process running executor_wrapper.
+CloudpickleExecutor runs it in a subprocess, so a crash or leak doesn't take down the worker
+task. DaskExecutor computes a dask-delayed result with dask's "processes" scheduler; dask is not
+a dependency and must be installed at the execution site.
 """
 
 from __future__ import annotations
@@ -36,17 +23,10 @@ import cloudpickle
 
 
 class Executor(abc.ABC):
-    """The interface VineReduce needs from an executor. An executor runs
-    fn(*args) at the execution site chosen by the distributor. It is
-    configured once, in the vine_reduce process, and cloudpickled into every
-    remote call (as part of executor_wrapper's arguments), so implementations
-    must be picklable at all times - any live resource (e.g. a process pool)
-    must be created lazily at submit time and dropped before pickling.
-    executor_wrapper uses the fresh deserialized copy for exactly one call:
-    `with executor: executor.submit(...).result()`. Concrete implementations
-    (see SimpleExecutor, CloudpickleExecutor, DaskExecutor below) subclass
-    this and only need to provide submit()/shutdown() - __enter__/__exit__
-    are inherited from here."""
+    """Interface for running fn(*args) at the execution site. Instances are cloudpickled into each
+    remote call and used for exactly one call (`with executor: executor.submit(...).result()`),
+    so they must be picklable at all times: create live resources lazily at submit time and drop
+    them before pickling. Subclasses implement submit() and shutdown()."""
 
     @abc.abstractmethod
     def submit(
@@ -56,18 +36,13 @@ class Executor(abc.ABC):
         *args: Any,
         metadata: dict[str, dict[str, Any] | None] | None = None,
     ) -> Future:
-        """Run fn(*args) and return a Future for its result. metadata holds
-        the same three dicts chunk_to_args receives, keyed "dataset" /
-        "distributor" / "executor" - dataset metadata, per-task resource
-        info from the distributor (e.g. "cores"), and free-form executor
-        config."""
+        """Run fn(*args) and return a Future for its result. metadata has the same "dataset",
+        "distributor" (e.g. "cores") and "executor" dicts that chunk_to_args receives."""
         ...
 
     @abc.abstractmethod
     def shutdown(self, wait: bool = True) -> None:
-        """Release whatever resources this executor owns (e.g. a process
-        pool). Also reachable via `with executor: ...`, which calls this on
-        exit."""
+        """Release owned resources (e.g. a process pool); called on `with` exit."""
         ...
 
     def __enter__(self) -> "Executor":
@@ -78,8 +53,7 @@ class Executor(abc.ABC):
 
 
 def _completed_future(fn: Callable[..., Any], *args: Any) -> Future:
-    """Runs fn(*args) inline and wraps its outcome in an already-done
-    Future, the way a synchronous Executor.submit reports its result."""
+    """Run fn(*args) inline and return an already-done Future holding its result or exception."""
     future: Future = Future()
     future.set_running_or_notify_cancel()
     try:
@@ -90,9 +64,8 @@ def _completed_future(fn: Callable[..., Any], *args: Any) -> Future:
 
 
 class SimpleExecutor(Executor):
-    """Calls fn(*args) directly, in the same process/task running
-    executor_wrapper. The default `executor` for VineReduce. Ignores all
-    three metadata dicts. Stateless, so trivially picklable."""
+    """Calls fn(*args) directly in the process running executor_wrapper. The default executor;
+    ignores metadata and holds no state."""
 
     def submit(
         self,
@@ -104,9 +77,8 @@ class SimpleExecutor(Executor):
         return _completed_future(self._call, fn, *args)
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
-        """Hook for subclasses (see coffea.py's CoffeaExecutor) to change how
-        fn is invoked or its result post-processed, without re-implementing
-        the Future/exception plumbing above."""
+        """Hook for subclasses (e.g. CoffeaExecutor) to change how fn is invoked or its result
+        post-processed."""
         return fn(*args)
 
     def shutdown(self, wait: bool = True) -> None:
@@ -114,40 +86,29 @@ class SimpleExecutor(Executor):
 
 
 def _run_cloudpickled(payload: bytes) -> Any:
-    """Runs in the subprocess. cloudpickle (unlike stdlib pickle) can
-    serialize closures and lambdas, so fn may be either."""
+    """Subprocess entry point; cloudpickle lets fn be a closure or lambda."""
     fn, args, kwargs = cloudpickle.loads(payload)
     return fn(*args, **kwargs)
 
 
 class CloudpickleProcessPoolExecutor(ProcessPoolExecutor):
-    """A ProcessPoolExecutor that cloudpickles fn/args/kwargs before they
-    cross into the subprocess, so submit() accepts closures and lambdas,
-    which stdlib pickle (what ProcessPoolExecutor normally relies on)
-    cannot handle. The internal engine behind CloudpickleExecutor and
-    DaskExecutor below."""
+    """ProcessPoolExecutor that cloudpickles fn/args/kwargs so closures and lambdas can be
+    submitted. The engine behind CloudpickleExecutor and DaskExecutor."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs, mp_context=mp.get_context("fork"))
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
-        """Like ProcessPoolExecutor.submit, but fn/args/kwargs may be
-        closures or lambdas."""
+        """Like ProcessPoolExecutor.submit, but fn/args/kwargs may be closures or lambdas."""
         payload = cloudpickle.dumps((fn, args, kwargs))
         return super().submit(_run_cloudpickled, payload)
 
 
 class CloudpickleExecutor(Executor):
-    """Runs each fn(*args) in its own subprocess (via
-    CloudpickleProcessPoolExecutor), isolating a crash or memory leak in fn
-    from the worker task running executor_wrapper. fn may be a closure or
-    lambda. The pool is created lazily on first submit and dropped
-    before pickling (see __getstate__), so a configured (even
-    previously-used) instance always pickles cleanly; shutdown() tears the
-    pool down. max_workers=1 (default) runs one call at a time; a larger
-    value only matters if something submits more than once to the same
-    instance before shutdown - executor_wrapper itself never does, so within
-    VineReduce max_workers>1 has no effect."""
+    """Runs each fn(*args) in a subprocess, isolating crashes and memory leaks from the worker
+    task. fn may be a closure or lambda. The pool is created lazily and dropped in __getstate__,
+    so instances always pickle cleanly. executor_wrapper submits once per instance, so
+    max_workers>1 has no effect within VineReduce."""
 
     def __init__(self, max_workers: int = 1) -> None:
         self.max_workers = max_workers
@@ -181,13 +142,10 @@ class CloudpickleExecutor(Executor):
 
 
 def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
-    """The task's actual core allocation, preferring the CORES environment
-    variable - set by the execution site itself (e.g. TaskVine's worker) at
-    dispatch time, so it reflects what was really handed to this task, which
-    may be less than any configured cap. Falls back to
-    distributor_metadata["cores"] - a static default the distributor can
-    report ahead of dispatch (e.g. TaskVineDistributor's configured category
-    cap) - then every core on the machine, if neither is available."""
+    """Cores available to the task. The CORES environment variable (set by the execution site at
+    dispatch, e.g. TaskVine's worker) takes precedence because it reflects the real allocation,
+    which may be below any configured cap. Then distributor_metadata["cores"] (the distributor's
+    static cap), then every core on the machine."""
     if "CORES" in os.environ:
         return int(os.environ["CORES"])
     if distributor_metadata and "cores" in distributor_metadata:
@@ -200,15 +158,10 @@ def _num_workers(distributor_metadata: dict[str, Any] | None) -> int:
 
 
 class DaskExecutor(Executor):
-    """For an fn that returns a dask-delayed object (or dask
-    array/dataframe): calls fn(*args), then computes the result at the
-    execution site, on dask's "processes" scheduler backed by a
-    CloudpickleProcessPoolExecutor created (and torn down) per call, with one
-    subprocess per core allocated to this task - num_workers from the
-    constructor if given, else the distributor/environment/machine core
-    count (see _num_workers). dask is not a vine_reduce dependency; it must already be
-    installed wherever this executor actually runs. Holds no state between
-    calls, so trivially picklable; shutdown() is a no-op."""
+    """Computes the dask-delayed object (or dask array/dataframe) returned by fn(*args) at the
+    execution site, on dask's "processes" scheduler backed by a per-call
+    CloudpickleProcessPoolExecutor of num_workers processes (default: see _num_workers).
+    Stateless; shutdown() is a no-op."""
 
     def __init__(self, num_workers: int | None = None) -> None:
         self.num_workers = num_workers

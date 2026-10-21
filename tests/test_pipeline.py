@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from vine_reduce import defaults, serialization
+from vine_reduce import VineReduce, defaults, serialization
 from vine_reduce.checkpoint_store import CheckpointRecord, CheckpointStore
 from vine_reduce.executor import SimpleExecutor
 from vine_reduce.failure_log import FailureLog
@@ -57,7 +57,6 @@ def make_pipeline(
     minimum_chunksize=1,
     checkpoint_time=None,
     checkpoint_distance=None,
-    checkpoint_accumulations=False,
     db=None,
     dataset_name="ds",
     is_result=None,
@@ -68,38 +67,37 @@ def make_pipeline(
     datasets_to_chunks=None,
 ):
     db = db or CheckpointStore(str(tmp_path / "db.sqlite"))
-    total_events = sum(dataset["files"].values())
-    return (
-        Pipeline(
-            processor_name="proc",
-            processor=processor,
-            dataset_name=dataset_name,
-            dataset=dataset,
-            distributor=fake_distributor,
-            db=db,
-            datasets_to_chunks=datasets_to_chunks or defaults.default_datasets_to_chunks,
-            chunk_to_args=defaults.default_chunk_to_args,
-            executor=SimpleExecutor(),
-            reducer=reducer,
-            is_result=is_result or defaults.make_default_is_result(total_events),
-            result_postprocess=None,
-            chunksize=chunksize,
-            minimum_chunksize=minimum_chunksize,
-            reduction_size=reduction_size,
-            minimum_reduction_size=minimum_reduction_size,
-            checkpoint_time=checkpoint_time,
-            checkpoint_distance=checkpoint_distance,
-            checkpoint_accumulations=checkpoint_accumulations,
-            results_dir=str(tmp_path / "results"),
-            process_priority=1,
-            reduce_priority=2,
-            attempts=attempts,
-            failure_proportion=failure_proportion,
-            failure_log=failure_log,
-            size_log=size_log,
-        ),
-        db,
+    config = VineReduce(
+        processors={"proc": processor},
+        input={dataset_name: dataset},
+        datasets_to_chunks=datasets_to_chunks or defaults.default_datasets_to_chunks,
+        executor=SimpleExecutor(),
+        reducer=reducer,
+        reduction_size=reduction_size,
+        minimum_reduction_size=minimum_reduction_size,
+        is_result=is_result,
+        checkpoint_time=checkpoint_time,
+        checkpoint_distance=checkpoint_distance,
+        results_dir=str(tmp_path / "results"),
+        chunksize=chunksize,
+        minimum_chunksize=minimum_chunksize,
+        progress=False,
+        attempts=attempts,
+        failure_proportion=failure_proportion,
     )
+    pipeline = Pipeline(
+        config,
+        processor_name="proc",
+        dataset_name=dataset_name,
+        dataset=dataset,
+        distributor=fake_distributor,
+        db=db,
+        process_priority=1,
+        reduce_priority=2,
+        failure_log=failure_log,
+        size_log=size_log,
+    )
+    return pipeline, db
 
 
 def run_to_completion(pipeline, distributor, max_cycles=1000):
@@ -160,7 +158,7 @@ def test_under_covering_chunker_finishes_with_a_short_result(fake_distributor, t
     """datasets_to_chunks is trusted: a file it under-covers still finishes,
     with a result covering only what was chunked."""
 
-    def under_covering_datasets_to_chunks(dataset, current_chunksize, skip_files=None):
+    def under_covering_datasets_to_chunks(dataset, current_chunksize):
         # Yields a chunk covering only 3 of a.root's 5 declared events.
         yield Chunk("a.root", 0, 3)
 
@@ -295,19 +293,19 @@ def test_checkpoint_distance_threshold_persists_and_supersedes_intermediates(
     db.close()
 
 
-def test_checkpoint_accumulations_checkpoints_every_intermediate_reduction(
+def test_checkpoint_distance_zero_checkpoints_every_intermediate_reduction(
     fake_distributor, tmp_path
 ):
     dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
     pipeline, db = make_pipeline(
-        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_accumulations=True
+        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_distance=0
     )
     checkpoint_calls = []
     original_checkpoint = pipeline._checkpoint
 
-    def spy_checkpoint(new_item, inputs, is_final):
+    def spy_checkpoint(new_item, is_final):
         checkpoint_calls.append(is_final)
-        original_checkpoint(new_item, inputs, is_final)
+        original_checkpoint(new_item, is_final)
 
     pipeline._checkpoint = spy_checkpoint
 
@@ -330,7 +328,7 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
     released (invariant #1)."""
     dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
     pipeline, db = make_pipeline(
-        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_accumulations=True
+        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_distance=0
     )
 
     released = spy(fake_distributor, "release_result")
@@ -339,10 +337,10 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
     intermediate_items = []
     original_checkpoint = pipeline._checkpoint
 
-    def spy_checkpoint(new_item, inputs, is_final):
+    def spy_checkpoint(new_item, is_final):
         before = len(released)
         before_retrieved = len(retrieved)
-        original_checkpoint(new_item, inputs, is_final)
+        original_checkpoint(new_item, is_final)
         newly_released = released[before:]
         if is_final:
             # nothing reduces a final result further, so it's fully detached
@@ -385,52 +383,141 @@ def test_intermediate_checkpoint_keeps_its_cluster_copy_until_superseded(
     db.close()
 
 
-def test_uncheckpointed_fold_keeps_every_ancestor_until_a_later_checkpoint_covers_them(
-    fake_distributor, tmp_path
-):
-    """With no checkpoint thresholds set at all, only the final reduction is a
-    checkpoint - a.root+b.root and c.root+d.root each fold into a non-final,
-    non-checkpointed intermediate result first. None of the four raw chunk
-    results (nor the two intermediate fold results) may be released at those
-    intermediate folds: if the intermediate result is lost before anything
-    checkpoints it, its inputs are the only way to recover it without
-    recomputing everything. They should all be released together, in one
-    shot, once the final reduction folds them in and checkpoints - covering
-    the whole lineage recursively, not just its immediate inputs."""
+def test_uncheckpointed_fold_keeps_its_lineage_until_a_later_checkpoint(fake_distributor, tmp_path):
+    """With no checkpoint thresholds and reduction_size=2, the four chunk
+    results fold as ((a+b)+c)+d: two uncheckpointed intermediates, then the
+    final result. Nothing may be released at the intermediate folds: if an
+    intermediate is lost
+    before anything checkpoints it, its inputs are the only way to recover
+    it. The whole lineage is released together once the final fold
+    checkpoints."""
     dataset = {"files": {"a.root": 1, "b.root": 1, "c.root": 1, "d.root": 1}}
     pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2)
 
     released = spy(fake_distributor, "release_result")
+    released_after_each_fold = []
+    lineage_sizes = []
+    original_success = pipeline._handle_reduce_success
 
-    def count_lineage(item):
-        return len(item.inputs) + sum(count_lineage(child) for child in item.inputs)
+    def spy_success(task, outcome):
+        lineage_sizes.append(sum(1 + len(item.lineage) for item in task.group))
+        original_success(task, outcome)
+        released_after_each_fold.append(len(released))
 
-    checkpoint_calls = []
-    original_checkpoint = pipeline._checkpoint
-
-    def spy_checkpoint(new_item, inputs, is_final):
-        # nothing should have been released before this - the sole -
-        # checkpoint call fires.
-        assert released == []
-        # the final fold's lineage must cover the whole tree: the two
-        # intermediate folds' own inputs, plus the four raw chunk results
-        # each of them was still carrying - none released until now.
-        assert count_lineage(new_item) == 6
-        checkpoint_calls.append(is_final)
-        original_checkpoint(new_item, inputs, is_final)
-
-    pipeline._checkpoint = spy_checkpoint
+    pipeline._handle_reduce_success = spy_success
 
     run_to_completion(pipeline, fake_distributor)
 
     assert final_value(pipeline) == 4
-    # only the final reduction ever checkpoints - the two intermediate folds
-    # (a+b, c+d) do not cross any threshold.
-    assert checkpoint_calls == [True]
-    # everything is released in that one checkpoint: the 6 ancestors plus the
-    # final result's own cluster copy.
-    assert len(released) == 7
+    # each fold's lineage grows by the previous intermediate plus one chunk;
+    # the final's six are released along with its own cluster copy.
+    assert lineage_sizes == [2, 4, 6]
+    assert released_after_each_fold == [0, 0, 7]
     assert len(set(released)) == 7
+    assert os.listdir(str(tmp_path / "cluster")) == []
+    db.close()
+
+
+def test_checkpoint_carried_through_an_uncheckpointed_fold_is_superseded_by_the_final(
+    fake_distributor, tmp_path
+):
+    """a.root restarts as an adopted checkpoint A; b.root/c.root are processed
+    fresh into B and C. reduction_size=2 folds A+B into an uncheckpointed X
+    (distance 2 is not reached), then X+C into the final. A must keep its row
+    and file through the X fold, and the final must supersede A's row and
+    release A, B, X and C, leaving one final row and no files behind."""
+    dataset = {"files": {"a.root": 5, "b.root": 5, "c.root": 5}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    file_a = checkpoint_dir / "a.pkl.zst"
+    serialization.dump(5, str(file_a))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers={"a.root": ((0, 5),)},
+        num_events=5,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=False,
+        path=str(file_a),
+    )
+
+    pipeline, _ = make_pipeline(
+        fake_distributor, tmp_path, dataset, reduction_size=2, checkpoint_distance=2, db=db
+    )
+    released = spy(fake_distributor, "release_result")
+    folds = []
+    original_success = pipeline._handle_reduce_success
+
+    def spy_success(task, outcome):
+        original_success(task, outcome)
+        folds.append(task.is_final)
+        if not task.is_final:
+            # the X fold: nothing released, A's row and file still in place.
+            assert released == []
+            assert os.path.exists(str(file_a))
+            assert len(db.checkpoints_for("proc", "ds")) == 1
+            (x,) = pipeline.pool[-1:]
+            assert not x.is_checkpointed
+            assert [item.is_checkpointed for item in x.lineage] == [True, False]
+
+    pipeline._handle_reduce_success = spy_success
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert folds == [False, True]
+    assert final_value(pipeline) == 15
+    # A, B, X, C and the final's own cluster copy.
+    assert len(released) == len(set(released)) == 5
+    rows = db.checkpoints_for("proc", "ds")
+    assert len(rows) == 1
+    assert rows[0].is_final is True
+    assert os.listdir(str(checkpoint_dir)) == []
+    assert os.listdir(str(tmp_path / "cluster")) == []
+    db.close()
+
+
+def test_events_safe_never_drops_while_a_checkpoint_is_folded_or_carried(
+    fake_distributor, tmp_path
+):
+    """An adopted checkpoint A (a.root) leaves the pool when A+B is submitted
+    and then lives only in the uncheckpointed X's lineage, but its row and
+    file survive throughout, so events_safe must stay at A's events until
+    the final covers everything."""
+    dataset = {"files": {"a.root": 5, "b.root": 5, "c.root": 5}}
+    db = CheckpointStore(str(tmp_path / "db.sqlite"))
+    file_a = tmp_path / "a.pkl.zst"
+    serialization.dump(5, str(file_a))
+    db.record(
+        processor="proc",
+        dataset="ds",
+        covers={"a.root": ((0, 5),)},
+        num_events=5,
+        wall_time_s=1.0,
+        memory_mb=1.0,
+        is_final=False,
+        path=str(file_a),
+    )
+    pipeline, _ = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=2, db=db)
+    assert pipeline.events_safe == 5
+
+    observed = []
+    original_handle = pipeline.handle_outcome
+
+    def spy_handle(outcome):
+        observed.append(pipeline.events_safe)
+        original_handle(outcome)
+        observed.append(pipeline.events_safe)
+
+    pipeline.handle_outcome = spy_handle
+
+    run_to_completion(pipeline, fake_distributor)
+
+    assert final_value(pipeline) == 15
+    assert observed == sorted(observed)
+    assert set(observed) == {5, 15}
     db.close()
 
 
@@ -474,7 +561,7 @@ def test_restart_seeded_checkpoint_is_adopted_used_and_released_when_superseded(
     pipeline, _ = make_pipeline(fake_distributor, tmp_path, dataset, reduction_size=10, db=db)
 
     assert adopted_paths == [str(seeded_file)]
-    assert pipeline._skip_files == {"a.root"}
+    assert pipeline._covered == {"a.root": ((0, 5),)}
     assert len(pipeline.pool) == 1
     seeded_item = pipeline.pool[0]
     assert seeded_item.handle is not None
@@ -573,38 +660,6 @@ def test_chunk_output_joins_the_pool_as_soon_as_it_succeeds(fake_distributor, tm
     db.close()
 
 
-def test_release_covered_frees_deep_lineage_without_recursion(fake_distributor, tmp_path):
-    """Invariant #2's walk must survive an arbitrarily long uncheckpointed
-    chain: a lineage thousands of levels deep is released exactly once per
-    item, with no RecursionError (pins the iterative, explicit-stack walk)."""
-    dataset = {"files": {"a.root": 1}}
-    pipeline, db = make_pipeline(fake_distributor, tmp_path, dataset)
-
-    released: list[str] = []
-    fake_distributor.release_result = released.append
-
-    depth = 5000  # far beyond Python's default recursion limit
-    item = None
-    for result_id in range(1, depth + 1):
-        item = PoolItem(
-            handle=ResultHandle(result_id, f"file_{result_id}"),
-            num_events=1,
-            wall_time_s=0.0,
-            memory_mb=0.0,
-            covers={"a.root": ((0, 1),)},
-            since_checkpoint_time=0.0,
-            since_checkpoint_distance=0,
-            inputs=[item] if item is not None else [],
-        )
-
-    pipeline._release_covered(item)
-
-    assert sorted(released) == list(range(1, depth + 1))  # each exactly once
-    assert item.handle is None
-    assert item.inputs == []
-    db.close()
-
-
 def _restart_row(row_id, covers, *, is_final, path="/tmp/x.pkl"):
     """A checkpoint row; covers is a list of whole 5-event files, or an
     explicit {url: ranges} mapping."""
@@ -632,17 +687,21 @@ def test_plan_restart_all_final_rows_means_finished_with_no_pool():
     assert plan.finished is True
     assert plan.final_rows == rows
     assert plan.pool_rows == []
-    assert plan.skip_files == {"a.root", "b.root"}
+    assert plan.covered == {"a.root": ((0, 5),), "b.root": ((0, 5),)}
 
 
-def test_plan_restart_mixed_rows_skip_the_union_of_what_they_cover():
+def test_plan_restart_mixed_rows_cover_the_union_of_what_they_cover():
     final = _restart_row(1, ["a.root"], is_final=True)
     partial = _restart_row(2, ["b.root", "c.root"], is_final=False)
     plan = plan_restart([final, partial], {f"{c}.root": 5 for c in "abcd"})
     assert plan.finished is False
     assert plan.final_rows == [final]
     assert plan.pool_rows == [partial]
-    assert plan.skip_files == {"a.root", "b.root", "c.root"}  # d.root still to do
+    assert plan.covered == {
+        "a.root": ((0, 5),),
+        "b.root": ((0, 5),),
+        "c.root": ((0, 5),),
+    }  # d.root still to do
 
 
 def test_plan_restart_partials_are_moot_when_finals_cover_everything():
@@ -652,7 +711,7 @@ def test_plan_restart_partials_are_moot_when_finals_cover_everything():
     assert plan.finished is True
     assert plan.final_rows == [final]
     assert plan.pool_rows == []
-    assert plan.skip_files == {"a.root", "b.root"}
+    assert plan.covered == {"a.root": ((0, 5),), "b.root": ((0, 5),)}
 
 
 def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distributor, tmp_path):
@@ -666,7 +725,7 @@ def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distribut
         tmp_path,
         dataset,
         reduction_size=2,
-        checkpoint_accumulations=True,
+        checkpoint_distance=0,
         db=db,
     )
     for _ in range(1000):
@@ -701,7 +760,7 @@ def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distribut
         tmp_path,
         dataset,
         reduction_size=2,
-        checkpoint_accumulations=True,
+        checkpoint_distance=0,
         db=db,
     )
     run_to_completion(pipeline2, distributor2)
@@ -713,20 +772,19 @@ def test_two_run_restart_never_resubmits_checkpoint_covered_files(fake_distribut
     db.close()
 
 
-def test_plan_restart_part_of_a_file_is_not_skipped_and_its_ranges_are_kept():
+def test_plan_restart_keeps_the_ranges_of_part_of_a_file():
     partial = _restart_row(1, {"a.root": ((0, 2),)}, is_final=False)
     plan = plan_restart([partial], {"a.root": 4})
     assert plan.finished is False
     assert plan.pool_rows == [partial]
-    assert plan.skip_files == set()
     assert plan.covered == {"a.root": ((0, 2),)}
 
 
-def test_plan_restart_rows_that_together_cover_a_file_skip_it():
+def test_plan_restart_merges_rows_that_together_cover_a_file():
     first = _restart_row(1, {"a.root": ((0, 2),)}, is_final=False)
     second = _restart_row(2, {"a.root": ((2, 4),)}, is_final=True)
     plan = plan_restart([first, second], {"a.root": 4})
-    assert plan.skip_files == {"a.root"}
+    assert plan.covered == {"a.root": ((0, 4),)}
     assert plan.finished is False  # only the final row's half is final
 
 
@@ -735,14 +793,14 @@ def test_plan_restart_finals_covering_only_part_of_a_file_are_not_finished():
     plan = plan_restart([final], {"a.root": 4})
     assert plan.finished is False
     assert plan.final_rows == [final]
-    assert plan.skip_files == set()
+    assert plan.covered == {"a.root": ((0, 2),)}
 
 
 def test_plan_restart_zero_entry_file_counts_as_covered():
     final = _restart_row(1, ["a.root", "b.root"], is_final=True)
     plan = plan_restart([final], {"a.root": 5, "b.root": 5, "empty.root": 0})
     assert plan.finished is True
-    assert plan.skip_files == {"a.root", "b.root", "empty.root"}
+    assert plan.covered == {"a.root": ((0, 5),), "b.root": ((0, 5),)}
 
 
 def _spy_submitted_chunks(distributor) -> list[Chunk]:
@@ -776,7 +834,7 @@ def test_restart_after_a_checkpoint_holding_part_of_a_file_resumes_that_file(
         dataset,
         chunksize=2,
         reduction_size=2,
-        checkpoint_accumulations=True,
+        checkpoint_distance=0,
         db=db,
     )
     for _ in range(1000):
@@ -804,7 +862,7 @@ def test_restart_after_a_checkpoint_holding_part_of_a_file_resumes_that_file(
         dataset,
         chunksize=1,
         reduction_size=2,
-        checkpoint_accumulations=True,
+        checkpoint_distance=0,
         db=db,
     )
     run_to_completion(pipeline2, distributor2)
@@ -896,7 +954,7 @@ _CRASH_DATASET = {"files": {"a.root": 7, "b.root": 3, "c.root": 5}}
 
 @pytest.mark.parametrize(
     "checkpointing",
-    [{"checkpoint_accumulations": True}, {"checkpoint_distance": 2}],
+    [{"checkpoint_distance": 0}, {"checkpoint_distance": 2}],
     ids=["every-fold", "distance-2"],
 )
 def test_crash_after_any_outcome_then_restart_covers_every_event_exactly_once(
@@ -939,6 +997,12 @@ def test_crash_after_any_outcome_then_restart_covers_every_event_exactly_once(
         _run_until(restarted, restarted._distributor, 10_000)
         assert restarted.finished, k
         _assert_finals_tile_dataset(restarted, _CRASH_DATASET)
+        # every partial row was superseded; only the finals remain on file.
+        rows = db.checkpoints_for("proc", "ds")
+        assert all(row.is_final for row in rows), k
+        assert len(rows) == len(restarted.final_results), k
+        for row in rows:
+            assert os.path.exists(row.path), k
         db.close()
 
 
@@ -963,7 +1027,7 @@ def test_restart_refills_a_failed_chunk_into_one_extra_final_result(fake_distrib
         processor=processor,
         chunksize=2,
         reduction_size=2,
-        checkpoint_accumulations=True,
+        checkpoint_distance=0,
         attempts=1,
         failure_proportion=0.5,
         db=db,
@@ -1494,9 +1558,8 @@ def test_reducer_permanent_failure_keeps_deep_checkpointed_lineage_on_disk(
     checkpointed item A; b.root/c.root are processed fresh into B and C.
     reduction_size=2 folds A+B into X first - a non-final, non-checkpointed
     reduction, since no checkpoint thresholds are set - then X+C is
-    attempted and fails permanently. _release_covered must stop at A
-    (reached through X's uncheckpointed lineage) rather than deleting its
-    durable file while its DB row survives."""
+    attempted and fails permanently. A (carried in X's lineage)
+    must keep its durable file, since its DB row survives."""
     dataset = {"files": {"a.root": 5, "b.root": 5, "c.root": 5}}
     db = CheckpointStore(str(tmp_path / "db.sqlite"))
 
@@ -1697,4 +1760,25 @@ def test_reducer_permanent_failure_logs_group_files_and_ignores_failure_proporti
     assert "a.root" in contents
     assert "b.root" in contents
     assert "reducer" in contents
+    db.close()
+
+
+def test_minimum_sizes_are_clamped(fake_distributor, tmp_path):
+    dataset = {"files": {"a.root": 5}}
+    pipeline, db = make_pipeline(
+        fake_distributor,
+        tmp_path,
+        dataset,
+        reduction_size=10,
+        minimum_reduction_size=0,
+        minimum_chunksize=-5,
+    )
+    assert pipeline._minimum_reduction_size == 2
+    assert pipeline._minimum_chunksize == 1
+    db.close()
+
+    pipeline, db = make_pipeline(
+        fake_distributor, tmp_path, dataset, reduction_size=10, minimum_reduction_size=20
+    )
+    assert pipeline._minimum_reduction_size == 10
     db.close()

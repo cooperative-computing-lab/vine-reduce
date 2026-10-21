@@ -8,15 +8,14 @@ from __future__ import annotations
 import enum
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Protocol
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Iterator, NoReturn, Protocol
 from uuid import uuid4
 
 from . import defaults, serialization
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor, TaskKind
-from .event_ranges import Coverage, Ranges, uncovered_chunks, union_coverage
-from .executor import Executor
+from .event_ranges import Coverage, Ranges, covers_all, uncovered_chunks, union_coverage
 from .failure_log import FailureLog, FailureRecord
 from .size_log import SizeLog, SizeRecord
 from .types import (
@@ -29,6 +28,9 @@ from .types import (
     Success,
 )
 
+if TYPE_CHECKING:
+    from .engine import VineReduce
+
 
 class VineReduceError(RuntimeError):
     """Raised when a processing or reduction function fails remotely. Carries
@@ -36,9 +38,9 @@ class VineReduceError(RuntimeError):
 
 
 class ReportKind(enum.StrEnum):
-    """Which stage - or checkpoint/result role - a reported TaskReport
-    belongs to. A superset of TaskKind: also covers reduce tasks that are
-    checkpoints, final results, or the forced-final drain group."""
+    """What a reported task was: a processor call, or a reduction that is a
+    plain accumulation, a checkpoint, a final result, or the forced-final
+    drain group."""
 
     PROCESSOR = "processor"
     REDUCER = "reducer"
@@ -55,10 +57,8 @@ class OutcomeStatus(enum.StrEnum):
 
 @dataclass(frozen=True)
 class TaskReport:
-    """One finished processor/reducer task, handed to a TaskReporter right
-    when its Outcome is examined - before Pipeline acts on it (pooling a
-    chunk's output, folding a reduction, retrying, or raising on failure).
-    See progress.py's ProgressReporter for the status display this feeds."""
+    """One finished processor/reducer task, reported before Pipeline acts on
+    its Outcome. See progress.py's ProgressReporter."""
 
     processor_name: str
     dataset_name: str
@@ -72,20 +72,44 @@ class TaskReport:
 
 
 class TaskReporter(Protocol):
-    """What a Pipeline needs to surface its finished tasks - see
-    progress.py's ProgressReporter (the rich-based implementation) and
-    NullProgressReporter (used when VineReduce(progress=False))."""
+    """What a Pipeline reports finished tasks to - see progress.py's
+    ProgressReporter and NullProgressReporter."""
 
     def report(self, task: TaskReport) -> None:
-        """Called once per finished processor/reducer task, regardless of
-        outcome (success, resource exhaustion, or failure)."""
+        """Called once per finished task, whatever its outcome."""
         ...
 
 
+def _resolve_sized_config(
+    config: int | dict | None, processor_name: str, dataset_name: str
+) -> int | None:
+    """Most-specific-wins lookup for chunksize/reduction_size: a "datasets"
+    entry beats a "processors" entry, which beats "default"."""
+    if config is None or isinstance(config, int):
+        return config
+    if dataset_name in config.get("datasets", {}):
+        return config["datasets"][dataset_name]
+    if processor_name in config.get("processors", {}):
+        return config["processors"][processor_name]
+    return config.get("default")
+
+
+def _resolve_reduction_size(config: int | dict, processor_name: str, dataset_name: str) -> int:
+    """Like _resolve_sized_config, but reduction_size has no "unset" value:
+    it must resolve to an int >= 2."""
+    resolved = _resolve_sized_config(config, processor_name, dataset_name)
+    if resolved is None or resolved < 2:
+        raise VineReduceError(
+            f"reduction_size for processor {processor_name!r}, dataset {dataset_name!r} "
+            f"resolved to {resolved!r}; it must be an int >= 2. Check the reduction_size "
+            f'dict has a "default" entry or a matching "processors"/"datasets" override.'
+        )
+    return resolved
+
+
 def _truncate_name(name: str, width: int = 20) -> str:
-    """Shorten a long name (e.g. a dataset file URL) for display, keeping
-    only its last `width` characters - e.g. ".../xyz/ffff.root" - so a
-    single task-status line doesn't get lost under a long path."""
+    """Keep only the last `width` characters of a long name (e.g. a file URL)
+    for display."""
     return name if len(name) <= width else "..." + name[-width:]
 
 
@@ -98,13 +122,10 @@ def _status_of(outcome: Outcome) -> OutcomeStatus:
 
 
 def _update_resource_max(maxes: dict[str, float], resources: ResourceUsage) -> None:
-    """Folds one Success outcome's measured resources into a running
-    {"cores"/"memory"/"disk": peak} dict - see SizeRecord.processing/
-    reduction. Only called for Success outcomes (see Pipeline._handle_chunk_
-    outcome/_handle_reduce_outcome) - a killed/failed task's numbers aren't
-    trusted as a genuine peak."""
-    for output_key, value in resources.to_size_row().items():
-        maxes[output_key] = max(maxes.get(output_key, value), value)
+    """Fold one Success's measured resources into a running per-resource peak
+    (see SizeRecord). Failed tasks' numbers are not trusted as peaks."""
+    for key, value in resources.to_rmsummary().items():
+        maxes[key] = max(maxes.get(key, value), value)
 
 
 class _ShrinkDecision(enum.Enum):
@@ -114,19 +135,14 @@ class _ShrinkDecision(enum.Enum):
 
 
 def _shrink_decision(unit_size: int, current_size: int, floor: int) -> _ShrinkDecision:
-    """The shared exhaustion-retry rule for both chunk and reduce tasks:
-    unit_size is the size this task was actually tried at (chunk.num_events,
-    or len(group) for a reduction); current_size is the pipeline's live
+    """The exhaustion-retry rule shared by chunk and reduce tasks. unit_size
+    is the size the task was tried at; current_size is the live
     chunksize/reduction_size.
-      - unit_size > current_size: a sibling's exhaustion already shrank
-        current_size further while this task was still in flight, so it was
-        never actually tried at current_size - not evidence it's too big.
-        REPOOL: re-pool unshrunk, to be re-split down to current_size next
-        time it's retried.
-      - current_size <= floor: already at the minimum size and still
-        exhausted - GIVE_UP.
-      - otherwise: SHRINK - current_size should be halved (clamped to
-        floor)."""
+      - REPOOL: unit_size > current_size - a sibling already shrank
+        current_size while this task was in flight, so this is no evidence
+        current_size is too big. Retry unshrunk; it is re-split on retry.
+      - GIVE_UP: already at the floor.
+      - SHRINK: halve current_size (clamped to the floor)."""
     if unit_size > current_size:
         return _ShrinkDecision.REPOOL
     if current_size <= floor:
@@ -134,10 +150,13 @@ def _shrink_decision(unit_size: int, current_size: int, floor: int) -> _ShrinkDe
     return _ShrinkDecision.SHRINK
 
 
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'s' if count != 1 else ''}"
+
+
 @dataclass(frozen=True)
 class CheckpointRef:
-    """The durable identity of a checkpointed item: its store row and the
-    on-disk path recorded there. Present iff the item is durable."""
+    """A durable item's checkpoint store row and on-disk path."""
 
     row_id: int
     path: str
@@ -145,44 +164,27 @@ class CheckpointRef:
 
 @dataclass
 class PoolItem:
-    """A result this pipeline is holding: a chunk's output, a reduction's
-    output, a restart-seeded checkpoint, or a final result.
+    """A result this pipeline holds: a chunk's output, a reduction's output,
+    a restart-seeded checkpoint, or a final result.
 
-    handle: the item's live distributor identity - handle.file is what goes
-        into a later submit()'s args, handle.result_id is what
-        release_result/retrieve/checkpoint_path take. None only once nothing
-        will ever need the distributor's copy again: a final result safely
-        copied into results_dir, a released item, or a restart-seeded final
-        row (a final result is never resubmitted, so it never gets a handle).
-        A non-final checkpoint keeps its handle live so it can still be
-        folded into a later reduction without the manager re-sending it.
-    num_events / wall_time_s / memory_mb: totals accumulated into this item.
-    covers: the event ranges, per dataset file URL, this item represents -
-        possibly only part of a file.
-    since_checkpoint_time: wall time accumulated since this item (or one of
-        its inputs) was last checkpointed - reset to 0 whenever a checkpoint
-        is written (see Pipeline._checkpoint).
-    since_checkpoint_distance: number of reductions folded into this item's
-        lineage since it (or one of its inputs) was last checkpointed - 0 for
-        a fresh chunk result, max(group)+1 whenever a group is folded, reset
-        to 0 whenever a checkpoint is written (see Pipeline._checkpoint).
-    checkpoint: the item's durable identity (store row id + on-disk path),
-        once checkpointed. None while the item is not durable.
-    inputs: the items folded together to produce this one (empty for a raw
-        chunk's output). Kept around so that, if this item is lost before
-        anything checkpoints it, it can be recovered by re-folding its
-        inputs instead of recomputing everything from scratch - see
-        Pipeline._release_covered, which frees this whole lineage once a
-        durable checkpoint finally covers it, clearing `inputs` as it goes
-        (a checkpointed item's own durable copy is backup enough, so there
-        is nothing left in its lineage still worth holding onto).
-    attempts: how many failed reduction attempts this item has survived
-        while in its current grouping, for the `attempts` retry budget (see
-        Pipeline._handle_reduce_outcome). 0 for a freshly produced item (a
-        raw chunk's output, or a fresh fold result) - a RuntimeFailure on a
-        reduction this item is part of raises it towards `attempts`, while a
-        ResourceExhaustion resets it back to 0 (a smaller reduction_size is
-        a fresh start, not a strike against the budget).
+    handle: live distributor identity (file goes into submit() args,
+        result_id into release_result/retrieve/checkpoint_path). None once
+        the distributor's copy is never needed again: a final result copied
+        into results_dir, a released item, or a restart-seeded final row.
+    num_events / wall_time_s / memory_mb: totals folded into this item.
+    covers: event ranges, per file URL, this item represents.
+    since_checkpoint_time / since_checkpoint_distance: wall time and number
+        of folds since this item's inputs were last checkpointed. Both reset
+        to 0 by _checkpoint; they drive _checkpoint_due.
+    checkpoint: set once the item is durable.
+    lineage: every item folded into this one since its inputs were last
+        checkpointed (flat; an uncheckpointed input contributes its own
+        lineage too). Kept so TaskVine can recover a lost uncheckpointed
+        result; released, and the checkpointed ones' rows superseded, once
+        this item is itself checkpointed.
+    attempts: failed reduction attempts in the current grouping. A
+        RuntimeFailure raises it; a ResourceExhaustion resets it to 0, since a
+        smaller reduction_size is a fresh start.
     """
 
     handle: ResultHandle | None
@@ -193,7 +195,7 @@ class PoolItem:
     since_checkpoint_time: float
     since_checkpoint_distance: int
     checkpoint: CheckpointRef | None = None
-    inputs: list[PoolItem] = field(default_factory=list)
+    lineage: list[PoolItem] = field(default_factory=list)
     attempts: int = 0
 
     @property
@@ -203,73 +205,45 @@ class PoolItem:
 
 @dataclass(frozen=True)
 class RestartPlan:
-    """What plan_restart decided a restart should do with the checkpoint
-    rows on file - see plan_restart for the rules."""
+    """What plan_restart decided to do with the checkpoint rows on file."""
 
     finished: bool
     final_rows: list[CheckpointRecord]
     pool_rows: list[CheckpointRecord]  # empty when finished (partials are moot)
-    skip_files: set[str]  # files fully covered by the replayed rows
     covered: dict[str, Ranges]  # what the replayed rows cover, per file
 
 
 def next_result_id() -> str:
-    """A fresh result_id for submit()/adopt_checkpoint() - unique for the
-    lifetime of the distributor (see Distributor.submit)."""
+    """A fresh result_id, unique for the lifetime of the distributor."""
     return uuid4().hex
 
 
 def plan_restart(rows: list[CheckpointRecord], dataset_sizes: dict[str, int]) -> RestartPlan:
-    """The restart rules, stated once:
+    """The restart rules:
     1. Every final row is replayed as a final result.
     2. The run is finished iff the final rows cover every event of every
        dataset file; partial rows are then moot and ignored.
     3. Otherwise every partial row is replayed as a pool item.
-    4. The events the replayed rows cover are not processed again: a file
-       they cover entirely is skipped, and chunks of a file they cover in
-       part are trimmed to the events left (see Pipeline._trim_covered)."""
+    4. Events the replayed rows cover are not processed again (see
+       Pipeline._trim_covered)."""
     final_rows = [row for row in rows if row.is_final]
     partial_rows = [row for row in rows if not row.is_final]
 
     finalized = union_coverage(row.covers for row in final_rows)
-    if _fully_covers(finalized, dataset_sizes):
-        return RestartPlan(
-            finished=True,
-            final_rows=final_rows,
-            pool_rows=[],
-            skip_files=set(dataset_sizes),
-            covered=finalized,
-        )
-
-    covered = union_coverage(row.covers for row in rows)
+    if covers_all(finalized, dataset_sizes):
+        return RestartPlan(finished=True, final_rows=final_rows, pool_rows=[], covered=finalized)
     return RestartPlan(
         finished=False,
         final_rows=final_rows,
         pool_rows=partial_rows,
-        skip_files={
-            url for url in dataset_sizes if _is_whole(covered.get(url, ()), dataset_sizes[url])
-        },
-        covered=covered,
+        covered=union_coverage(row.covers for row in rows),
     )
-
-
-def _is_whole(ranges: Ranges, size: int) -> bool:
-    """Whether ranges cover all `size` events of a file (a 0-entry file is always covered)."""
-    return size == 0 or ranges == ((0, size),)
-
-
-def _fully_covers(coverage: Coverage, dataset_sizes: dict[str, int]) -> bool:
-    return all(_is_whole(coverage.get(url, ()), size) for url, size in dataset_sizes.items())
 
 
 @dataclass
 class _ChunkTask:
     chunk: Chunk
     attempts: int = 0
-
-    @property
-    def size(self) -> int:
-        return self.chunk.num_events
 
 
 @dataclass
@@ -280,19 +254,14 @@ class _ReduceTask:
     force_final: bool = False
 
     @property
-    def size(self) -> int:
-        return len(self.group)
-
-    @property
     def attempts(self) -> int:
         return max((item.attempts for item in self.group), default=0)
 
 
 @dataclass
 class ProgressCounters:
-    """Progress-bar counters for one pipeline, read directly by progress.py -
-    cumulative across the whole run, not reset on retry, so its totals
-    estimate has a stable ratio to extrapolate from."""
+    """Progress-bar counters for one pipeline, read directly by progress.py.
+    Cumulative over the whole run (never reset on retry)."""
 
     events_completed: int = 0
     events_failed: int = 0
@@ -306,15 +275,9 @@ class ProgressCounters:
 
     @classmethod
     def summed(cls, pipelines: "list[Pipeline]") -> "ProgressCounters":
-        total = cls()
-        for pipeline in pipelines:
-            for field_name in total.__dataclass_fields__:
-                setattr(
-                    total,
-                    field_name,
-                    getattr(total, field_name) + getattr(pipeline.counters, field_name),
-                )
-        return total
+        return cls(
+            **{f.name: sum(getattr(p.counters, f.name) for p in pipelines) for f in fields(cls)}
+        )
 
 
 class Pipeline:
@@ -323,69 +286,50 @@ class Pipeline:
 
     def __init__(
         self,
+        config: VineReduce,
         *,
         processor_name: str,
-        processor: Callable[[Any], Any],
         dataset_name: str,
         dataset: dict[str, Any],
         distributor: Distributor,
         db: CheckpointStore,
-        datasets_to_chunks: Callable[[dict, Callable[[], int | None], set[str]], Iterator[Chunk]],
-        chunk_to_args: Callable,
-        executor: Executor,
-        reducer: Callable,
-        is_result: Callable[[int, float, float], bool],
-        result_postprocess: Callable | None,
-        result_postprocess_offload: bool = False,
-        chunksize: int | None,
-        minimum_chunksize: int = 1000,
-        reduction_size: int,
-        minimum_reduction_size: int = 2,
-        checkpoint_time: float | None,
-        checkpoint_distance: int | None,
-        checkpoint_accumulations: bool,
-        results_dir: str,
         process_priority: int,
         reduce_priority: int,
-        attempts: int = 3,
-        failure_proportion: float = 0.0,
         failure_log: FailureLog | None = None,
         size_log: SizeLog | None = None,
         task_reporter: TaskReporter | None = None,
     ):
+        """config supplies every setting shared across pipelines; per-pair
+        sizes (chunksize, reduction_size and their floors) and is_result are
+        resolved from it here."""
+        self._config = config
         self.processor_name = processor_name
         self.dataset_name = dataset_name
-        self._processor = processor
+        self._processor = config.processors[processor_name]
         self._dataset = dataset
         self._dataset_metadata = dataset.get("metadata", {})
         self._distributor = distributor
         self._db = db
-        self._datasets_to_chunks = datasets_to_chunks
-        self._chunk_to_args = chunk_to_args
-        self._executor = executor
-        self._reducer = reducer
-        self._is_result = is_result
-        self._result_postprocess = result_postprocess
-        self._result_postprocess_offload = result_postprocess_offload
-        self.chunksize = chunksize
-        self._minimum_chunksize = minimum_chunksize
-        self.reduction_size = reduction_size
-        self._minimum_reduction_size = minimum_reduction_size
-        self._checkpoint_time = checkpoint_time
-        self._checkpoint_distance = checkpoint_distance
-        self._checkpoint_accumulations = checkpoint_accumulations
-        self._results_dir = os.path.join(results_dir, dataset_name, processor_name)
+        self.events_total = sum(dataset["files"].values())
+        self._is_result = config.is_result or defaults.make_default_is_result(self.events_total)
+        self.chunksize = _resolve_sized_config(config.chunksize, processor_name, dataset_name)
+        self._minimum_chunksize = max(1, config.minimum_chunksize)
+        self.reduction_size = _resolve_reduction_size(
+            config.reduction_size, processor_name, dataset_name
+        )
+        self._minimum_reduction_size = min(
+            max(2, config.minimum_reduction_size), self.reduction_size
+        )
+        self._results_dir = os.path.join(config.results_dir, dataset_name, processor_name)
         self._process_priority = process_priority
         self._reduce_priority = reduce_priority
-        self._attempts = attempts
-        self._failure_proportion = failure_proportion
+        self._process_category = f"{processor_name}:{dataset_name}:process"
+        self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
         self._failure_log = failure_log
         self._size_log = size_log
         self._size_logged = False
         self._processing_max: dict[str, float] = {}
         self._reduction_max: dict[str, float] = {}
-        self._process_category = f"{processor_name}:{dataset_name}:process"
-        self._reduce_category = f"{processor_name}:{dataset_name}:reduce"
         self._task_reporter = task_reporter
 
         self.pool: list[PoolItem] = []
@@ -394,29 +338,21 @@ class Pipeline:
         self._in_flight: dict[str, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
-        self._skip_files: set[str] = set()
         self._covered: dict[str, Ranges] = {}
         self.finished = False
+        # Events in checkpoint rows not yet superseded (see events_safe).
+        self._events_safe = 0
 
-        # Failure tolerance: chunks given up on (see _give_up_on_chunk) leave
-        # a hole in their file's results and count, by their events, against
-        # failure_proportion - whose denominator is events_total.
+        # Chunks given up on (see _give_up_on_chunk); their events count
+        # against failure_proportion, whose denominator is events_total.
         self._failed_chunks: list[Chunk] = []
         self._failed_events = 0
-
-        # events_total is fixed at construction; the dataset dict is never
-        # mutated after this. It is also failure_proportion's denominator.
-        # The rest of the progress-bar counters live on self.counters (see
-        # ProgressCounters), read directly by progress.py.
-        self.events_total = sum(dataset["files"].values())
         self.counters = ProgressCounters()
 
         self._seed_from_checkpoints()
         if self.finished:
-            # Already fully covered by checkpoints from a previous run -
-            # refresh_finished (the usual trigger for _log_size_once) is
-            # never reached for a pipeline that starts out finished, since
-            # the scheduling loop skips it outright (see VineReduce._run).
+            # The scheduling loop skips a pipeline that starts out finished,
+            # so refresh_finished never gets to log its size row.
             self._log_size_once()
         else:
             os.makedirs(self._results_dir, exist_ok=True)
@@ -425,9 +361,7 @@ class Pipeline:
 
     @staticmethod
     def _seeded_item(row: CheckpointRecord, handle: ResultHandle | None) -> PoolItem:
-        """A PoolItem replaying one checkpoint row from a previous run. The
-        since-checkpoint counters start at zero: the row IS a checkpoint, so
-        nothing has accumulated on top of it yet."""
+        """A PoolItem replaying one checkpoint row from a previous run."""
         return PoolItem(
             handle=handle,
             num_events=row.num_events,
@@ -440,69 +374,46 @@ class Pipeline:
         )
 
     def _seed_from_checkpoints(self) -> None:
-        """Restart support: replay the checkpoint rows on file (per
-        plan_restart's rules) as final results and pool items, and record
-        which events they already cover so chunk generation skips files they
-        cover entirely and trims the chunks of files they cover in part. A
-        replayed pool item is adopted by the distributor (adopt_checkpoint),
-        so from here on it is indistinguishable from a result this run
-        produced itself: same handle for resubmission, same release_result
-        for cleanup. A replayed final row gets no handle - a final result is
-        never resubmitted."""
+        """Replay the checkpoint rows on file per plan_restart. Pool rows are
+        adopted by the distributor, so they behave exactly like results of
+        this run; final rows get no handle, as they are never resubmitted."""
         rows = self._db.checkpoints_for(self.processor_name, self.dataset_name)
         plan = plan_restart(rows, self._dataset["files"])
         self.final_results = [self._seeded_item(row, handle=None) for row in plan.final_rows]
-        self._skip_files = plan.skip_files
         self._covered = plan.covered
         self.finished = plan.finished
         for row in plan.pool_rows:
             result_id = next_result_id()
             file = self._distributor.adopt_checkpoint(result_id, row.path)
-            handle = ResultHandle(result_id, file)
-            self.pool.append(self._seeded_item(row, handle=handle))
+            self.pool.append(self._seeded_item(row, handle=ResultHandle(result_id, file)))
+        self._events_safe = sum(row.num_events for row in (*plan.final_rows, *plan.pool_rows))
 
-    # -- progress-bar counters -----------------------------------------------
-    # self.counters (see ProgressCounters) is a plain public attribute -
-    # progress.py reads it directly and sums it (via ProgressCounters.summed)
-    # across every pipeline sharing a processor_name for its four aggregate
-    # bars (see ProgressReporter). Only the derived counts below need actual
-    # logic.
+    # -- state queries -------------------------------------------------------
 
     @property
     def events_safe(self) -> int:
-        """Events whose result is durably checkpointed right now - i.e.
-        covered by a PoolItem or final result with is_checkpointed True, and
-        so would survive a crash/restart without recomputation. See
-        PoolItem.is_checkpointed and Pipeline._checkpoint."""
-        return sum(item.num_events for item in self.pool if item.is_checkpointed) + sum(
-            item.num_events for item in self.final_results
-        )
+        """Events whose result is durably checkpointed right now, i.e. would
+        survive a restart without recomputation. Never decreases: a checkpoint
+        only ever supersedes checkpoints whose events it covers."""
+        return self._events_safe
 
     @property
     def failed_chunks(self) -> frozenset[Chunk]:
-        """Chunks permanently given up on during processing - see
-        _give_up_on_chunk. Does not include chunks caught up in a reducer
-        permanent failure, since that always aborts the whole run instead
-        (see _give_up_on_reduction)."""
+        """Chunks permanently given up on (see _give_up_on_chunk)."""
         return frozenset(self._failed_chunks)
 
     @property
     def in_flight_count(self) -> int:
-        """How many chunk/reduce tasks this pipeline currently has submitted
-        and not yet resolved."""
         return len(self._in_flight)
 
     def owns(self, result_id: str) -> bool:
-        """Whether result_id was submitted by this pipeline (as opposed to
-        another pipeline sharing the same distributor)."""
+        """Whether result_id is one of this pipeline's in-flight tasks."""
         return result_id in self._in_flight
 
     def refresh_finished(self) -> None:
-        """Set `finished` if there is nothing left to do. Called after every
-        outcome, and by the scheduling loop each cycle - the latter catches a
-        pipeline that is done without ever producing an outcome to react to,
-        e.g. an empty dataset, or one covered by seeded checkpoints for every
-        file but not yet marked finished at construction."""
+        """Set `finished` if there is nothing left to do. Also called by the
+        scheduling loop each cycle, to catch a pipeline that finishes without
+        any outcome to react to (e.g. an empty dataset)."""
         if not self.finished:
             self.finished = self.chunks_all_done and not self.pool and self.in_flight_count == 0
             if self.finished:
@@ -510,23 +421,24 @@ class Pipeline:
 
     @property
     def chunks_all_done(self) -> bool:
-        """Whether chunk generation is exhausted and no chunk task (fresh or
-        retry) is pending or in flight - i.e. nothing more will ever be
-        added to the pool from chunk processing."""
+        """Whether nothing more will ever be added to the pool from chunk
+        processing: generation exhausted, no retry pending or in flight."""
         return (
             self._generator_exhausted
             and not self._retry_chunks
             and not any(isinstance(t, _ChunkTask) for t in self._in_flight.values())
         )
 
+    # -- chunk processing ------------------------------------------------------
+
     def feed(self, budget: int) -> int:
-        """Submit up to `budget` new chunk-processing tasks. Returns how many
-        were actually submitted."""
+        """Submit up to `budget` chunk-processing tasks; return how many were
+        submitted."""
         if self.finished or budget <= 0:
             return 0
         if self._generator is None:
             self._generator = self._trim_covered(
-                self._datasets_to_chunks(self._dataset, lambda: self.chunksize, self._skip_files)
+                self._config.datasets_to_chunks(self._dataset, lambda: self.chunksize)
             )
 
         submitted = 0
@@ -539,23 +451,19 @@ class Pipeline:
         return submitted
 
     def _trim_covered(self, chunks: Iterator[Chunk]) -> Iterator[Chunk]:
-        """chunks cut down to the events no restart-seeded row covers yet - a
-        file the rows cover in part resumes where they left off, whatever
-        chunk boundaries this run's datasets_to_chunks picks."""
+        """chunks cut down to the events no restart-seeded row covers yet,
+        whatever chunk boundaries this run's datasets_to_chunks picks."""
         for chunk in chunks:
             yield from uncovered_chunks(chunk, self._covered.get(chunk.url, ()))
 
     def _next_chunk(self) -> _ChunkTask | None:
-        """The next chunk to submit (with the attempts already used against
-        it) - retries first, then freshly generated ones - or None when
-        there is nothing left to submit right now."""
+        """The next chunk to submit - retries first, then fresh ones - or None
+        if there is nothing to submit right now."""
         if self._retry_chunks:
             task = self._retry_chunks.pop()
             chunk, attempts_used = task.chunk, task.attempts
-            # A retry chunk may predate the last chunksize halving; re-split it
-            # so we actually retry at the smaller size, not the size that just
-            # failed. A split is a fresh start for both pieces - see
-            # PoolItem.attempts's docstring for the equivalent reduction rule.
+            # A retry may predate the last chunksize halving: split it so it
+            # is retried at the smaller size. Both pieces start fresh.
             if self.chunksize is not None and chunk.num_events > self.chunksize:
                 split_point = chunk.start + self.chunksize
                 self._retry_chunks.append(_ChunkTask(Chunk(chunk.url, split_point, chunk.stop), 0))
@@ -587,8 +495,8 @@ class Pipeline:
                 "distributor": self._distributor.resources(TaskKind.PROCESSOR),
                 "executor": None,
             },
-            self._chunk_to_args,
-            self._executor,
+            self._config.chunk_to_args,
+            self._config.executor,
         )
         self._in_flight[result_id] = task
         self.counters.proc_tasks_submitted += 1
@@ -603,14 +511,10 @@ class Pipeline:
             self._submit_reduction(group)
 
     def maybe_drain_final_group(self) -> None:
-        """If nothing more can ever arrive in the pool, reduce whatever's left
-        as one last group, however small, and make it final unconditionally,
-        via _submit_reduction's force_final=True: this skips is_result
-        entirely, since by construction this is the last group this
-        (processor, dataset) pipeline will ever form - nothing else can ever
-        arrive to give is_result a different group to judge, so asking it at
-        all could only either agree (redundant) or deadlock forever
-        resubmitting the same no-op fold."""
+        """Once nothing more can ever arrive in the pool, reduce whatever is
+        left as one last group, forced final. is_result is skipped: no other
+        group will ever exist for it to judge, so it could only agree or
+        deadlock resubmitting the same fold."""
         if (
             self.pool
             and self.chunks_all_done
@@ -621,11 +525,8 @@ class Pipeline:
             self._submit_reduction(group, force_final=True)
 
     def _submit_reduction(self, group: list[PoolItem], force_final: bool = False) -> None:
-        """Submit a reduction task folding together the pooled items in
-        group, deciding whether it's final (and so whether to checkpoint it)
-        and tracking it in _in_flight. force_final forces is_final=True and
-        skips consulting is_result altogether - see maybe_drain_final_group,
-        the only place that decides to pass it."""
+        """Submit a reduction of group, deciding up front whether it is final
+        (force_final skips is_result) and whether to checkpoint it."""
         num_events = sum(item.num_events for item in group)
         total_time = sum(item.wall_time_s for item in group)
         total_memory = sum(item.memory_mb for item in group)
@@ -642,10 +543,10 @@ class Pipeline:
             self._reduce_category,
             TaskKind.REDUCER,
             defaults.reducer_wrapper,
-            self._reducer,
+            self._config.reducer,
             [item.handle.file for item in group],
             is_final,
-            self._result_postprocess,
+            self._config.result_postprocess,
             is_checkpoint=is_checkpoint,
         )
         self._in_flight[result_id] = _ReduceTask(
@@ -656,19 +557,40 @@ class Pipeline:
         )
         self.counters.reduce_tasks_submitted += 1
 
+    def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
+        """Whether the reduction about to be submitted should be checkpointed,
+        from its group's summed time and max distance since the last
+        checkpoint (see PLAN.md's "When a checkpoint is taken")."""
+        checkpoint_time = self._config.checkpoint_time
+        checkpoint_distance = self._config.checkpoint_distance
+        return (checkpoint_time is not None and since_checkpoint_time >= checkpoint_time) or (
+            checkpoint_distance is not None and since_checkpoint_distance >= checkpoint_distance
+        )
+
     # -- outcome handling ------------------------------------------------------
+
+    def handle_outcome(self, outcome: Outcome) -> None:
+        """React to the Outcome of one of this pipeline's tasks: pool a
+        chunk's output, fold a reduction's output into the pool or
+        final_results, or retry (halving chunksize/reduction_size on
+        ResourceExhaustion). Raises VineReduceError once retries run out -
+        for a chunk only if that also trips failure_proportion, for a
+        reduction always."""
+        task = self._in_flight.pop(outcome.result_id)
+        if isinstance(task, _ChunkTask):
+            self._handle_chunk_outcome(task, outcome)
+        else:
+            self._handle_reduce_outcome(task, outcome)
+        self.refresh_finished()
 
     def _report_task(self, kind: ReportKind, description: str, outcome: Outcome) -> None:
         if self._task_reporter is None:
             return
         resources_allocated = outcome.resources_allocated
         if resources_allocated is None:
-            # The distributor didn't report a per-call allocation.
-            # Fall back to what was requested at submit time.
-            distributor_kind = (
-                TaskKind.PROCESSOR if kind == ReportKind.PROCESSOR else TaskKind.REDUCER
-            )
-            resources_allocated = self._distributor.resources(distributor_kind)
+            # No per-call allocation reported; fall back to the static cap.
+            task_kind = TaskKind.PROCESSOR if kind == ReportKind.PROCESSOR else TaskKind.REDUCER
+            resources_allocated = self._distributor.resources(task_kind)
         self._task_reporter.report(
             TaskReport(
                 processor_name=self.processor_name,
@@ -683,23 +605,38 @@ class Pipeline:
             )
         )
 
-    def handle_outcome(self, outcome: Outcome) -> None:
-        """React to the Outcome of one of this pipeline's own chunk/reduce
-        tasks: pool a chunk's output, fold a reduction's output into
-        final_results or back into the pool, or retry (halving
-        chunksize/reduction_size on ResourceExhaustion). VineReduceError is
-        only raised once retries are exhausted - a chunk's RuntimeFailure or
-        minimum-size ResourceExhaustion raises only if that also trips
-        failure_proportion (see _give_up_on_chunk); a reduction's always
-        raises once its attempts run out, since a reducer permanent failure
-        always stops the run. Updates `finished` once nothing is left to
-        do."""
-        task = self._in_flight.pop(outcome.result_id)
-        if isinstance(task, _ChunkTask):
-            self._handle_chunk_outcome(task, outcome)
+    def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
+        chunk = task.chunk
+        self._report_task(
+            ReportKind.PROCESSOR,
+            f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]",
+            outcome,
+        )
+        if isinstance(outcome, RuntimeFailure):
+            self._handle_chunk_runtime_failure(task, outcome)
+        elif isinstance(outcome, ResourceExhaustion):
+            self._handle_chunk_resource_exhaustion(task, outcome)
         else:
-            self._handle_reduce_outcome(task, outcome)
-        self.refresh_finished()
+            assert isinstance(outcome, Success)
+            self._handle_chunk_success(task, outcome)
+
+    def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
+        chunk = task.chunk
+        self.counters.proc_tasks_completed += 1
+        self.counters.events_completed += chunk.num_events
+        _update_resource_max(self._processing_max, outcome.resources)
+        wall_time_s = outcome.resources.wall_time_s or 0.0
+        self.pool.append(
+            PoolItem(
+                handle=ResultHandle(outcome.result_id, outcome.file),
+                num_events=chunk.num_events,
+                wall_time_s=wall_time_s,
+                memory_mb=outcome.resources.memory_mb or 0.0,
+                covers={chunk.url: ((chunk.start, chunk.stop),)},
+                since_checkpoint_time=wall_time_s,
+                since_checkpoint_distance=0,
+            )
+        )
 
     def _record_chunk_failure(self, chunk: Chunk) -> None:
         self.counters.proc_tasks_failed += 1
@@ -709,21 +646,21 @@ class Pipeline:
         chunk = task.chunk
         attempts_used = task.attempts + 1
         self._record_chunk_failure(chunk)
-        if attempts_used >= self._attempts:
-            if self._give_up_on_chunk(
-                chunk,
-                attempts=attempts_used,
-                resources_measured=outcome.resources,
-                traceback=outcome.traceback,
-            ):
-                raise VineReduceError(
-                    f"processor {self.processor_name!r} failed on "
-                    f"{chunk.url}[{chunk.start}:{chunk.stop}] after {attempts_used} "
-                    f"attempt{'s' if attempts_used != 1 else ''} (attempts={self._attempts}):\n"
-                    f"{outcome.traceback}"
-                )
+        if attempts_used < self._config.attempts:
+            self._retry_chunks.append(_ChunkTask(chunk, attempts_used))
             return
-        self._retry_chunks.append(_ChunkTask(chunk, attempts_used))
+        self._give_up_on_chunk(
+            chunk,
+            attempts=attempts_used,
+            resources_measured=outcome.resources,
+            traceback=outcome.traceback,
+            message=(
+                f"processor {self.processor_name!r} failed on "
+                f"{chunk.url}[{chunk.start}:{chunk.stop}] after "
+                f"{_plural(attempts_used, 'attempt')} (attempts={self._config.attempts}):\n"
+                f"{outcome.traceback}"
+            ),
+        )
 
     def _handle_chunk_resource_exhaustion(
         self, task: _ChunkTask, outcome: ResourceExhaustion
@@ -731,75 +668,28 @@ class Pipeline:
         chunk = task.chunk
         self._record_chunk_failure(chunk)
         current_size = self.chunksize if self.chunksize is not None else chunk.num_events
-        decision = _shrink_decision(task.size, current_size, self._minimum_chunksize)
+        decision = _shrink_decision(chunk.num_events, current_size, self._minimum_chunksize)
         if decision is _ShrinkDecision.REPOOL:
-            # See _shrink_decision - not evidence this chunk is too big. It
-            # will be re-split down to the current chunksize next time it's
-            # pulled off the retry queue - see _next_chunk.
+            # Re-split down to the current chunksize when retried (_next_chunk).
             self._retry_chunks.append(_ChunkTask(chunk, 0))
-            return
-        if decision is _ShrinkDecision.GIVE_UP:
-            if self._give_up_on_chunk(
+        elif decision is _ShrinkDecision.GIVE_UP:
+            self._give_up_on_chunk(
                 chunk,
                 attempts=task.attempts + 1,
                 resources_measured=outcome.resources,
                 traceback=None,
-            ):
-                raise VineReduceError(
+                message=(
                     f"processor {self.processor_name!r} exhausted resources on "
                     f"{chunk.url}[{chunk.start}:{chunk.stop}] at the minimum chunk "
                     f"size ({self._minimum_chunksize} events); cannot retry smaller."
-                )
-            return
-        # decision is SHRINK. Clamp to the floor rather than halving
-        # straight past it - a chunksize of 1500 with minimum_chunksize=1000
-        # must still try 1000 before giving up, not jump straight from 1500
-        # to 750 (Correctness #6).
-        self.chunksize = max(current_size // 2, self._minimum_chunksize)
-        # attempts carries over unchanged here - it is reset to 0 in
-        # _next_chunk once this chunk is actually split at the new,
-        # smaller chunksize (a halving is a fresh start, not a strike
-        # against the budget - see PoolItem.attempts's docstring for the
-        # equivalent reduction rule).
-        self._retry_chunks.append(_ChunkTask(chunk, task.attempts))
-
-    def _handle_chunk_success(self, task: _ChunkTask, outcome: Success) -> None:
-        chunk = task.chunk
-        self.counters.proc_tasks_completed += 1
-        self.counters.events_completed += chunk.num_events
-        _update_resource_max(self._processing_max, outcome.resources)
-        wall_time_s = outcome.resources.wall_time_s or 0.0
-        memory_mb = outcome.resources.memory_mb or 0.0
-
-        self.pool.append(
-            PoolItem(
-                handle=ResultHandle(outcome.result_id, outcome.file),
-                num_events=chunk.num_events,
-                wall_time_s=wall_time_s,
-                memory_mb=memory_mb,
-                covers={chunk.url: ((chunk.start, chunk.stop),)},
-                since_checkpoint_time=wall_time_s,
-                since_checkpoint_distance=0,
+                ),
             )
-        )
-
-    def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
-        chunk = task.chunk
-        self._report_task(
-            ReportKind.PROCESSOR,
-            f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]",
-            outcome,
-        )
-
-        if isinstance(outcome, RuntimeFailure):
-            self._handle_chunk_runtime_failure(task, outcome)
-            return
-        if isinstance(outcome, ResourceExhaustion):
-            self._handle_chunk_resource_exhaustion(task, outcome)
-            return
-
-        assert isinstance(outcome, Success)
-        self._handle_chunk_success(task, outcome)
+        else:
+            # Clamp to the floor so e.g. 1500 with a floor of 1000 still tries
+            # 1000 before giving up. attempts carries over; it resets once
+            # _next_chunk actually splits this chunk at the new size.
+            self.chunksize = max(current_size // 2, self._minimum_chunksize)
+            self._retry_chunks.append(_ChunkTask(chunk, task.attempts))
 
     def _give_up_on_chunk(
         self,
@@ -808,16 +698,13 @@ class Pipeline:
         attempts: int,
         resources_measured: ResourceUsage | None,
         traceback: str | None,
-    ) -> bool:
-        """A processor permanent failure: log it, drop just this chunk's
-        events (its file's other chunks carry on, so the file's results end
-        up with a hole), and return whether the whole run should abort, per
-        failure_proportion. Unlike a reducer permanent failure
-        (_give_up_on_reduction), this does NOT unconditionally signal
-        abort - the caller raises only when this returns True."""
+        message: str,
+    ) -> None:
+        """A processor permanent failure: log it and drop just this chunk's
+        events (its file's other chunks carry on, leaving a hole). Raises
+        VineReduceError(message) only if that trips failure_proportion."""
         self._failed_chunks.append(chunk)
         self._failed_events += chunk.num_events
-
         if self._failure_log is not None:
             self._failure_log.log(
                 FailureRecord(
@@ -831,72 +718,10 @@ class Pipeline:
                     traceback=traceback,
                 )
             )
+        if self._failed_events > self._config.failure_proportion * self.events_total:
+            raise VineReduceError(message)
 
-        return self._failed_events > self._failure_proportion * self.events_total
-
-    def _handle_reduce_resource_exhaustion(
-        self, task: _ReduceTask, outcome: ResourceExhaustion
-    ) -> None:
-        group = task.group
-        self.counters.reduce_tasks_failed += 1
-        decision = _shrink_decision(task.size, self.reduction_size, self._minimum_reduction_size)
-        if decision is _ShrinkDecision.GIVE_UP:
-            self._give_up_on_reduction(
-                group,
-                attempts=task.attempts + 1,
-                resources_measured=outcome.resources,
-                traceback=None,
-            )
-            raise VineReduceError(
-                f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
-                "resources at the minimum reduction_size "
-                f"({self._minimum_reduction_size}); cannot retry smaller."
-            )
-        if decision is _ShrinkDecision.SHRINK:
-            # Clamp to the floor rather than halving straight past it - a
-            # reduction_size of 3 with minimum_reduction_size=2 must still
-            # try 2 before giving up, not jump straight from 3 to 1.
-            self.reduction_size = max(self.reduction_size // 2, self._minimum_reduction_size)
-        # decision is REPOOL: group was never actually tried at the
-        # current reduction_size (see _shrink_decision) - falls straight
-        # through unshrunk.
-        # Any ResourceExhaustion is a fresh start for these items, not a
-        # strike against the budget - see PoolItem.attempts's docstring.
-        for item in group:
-            item.attempts = 0
-        self.pool[:0] = group  # re-split at the current reduction_size next cycle
-
-    def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
-        group = task.group
-        attempts_used = task.attempts + 1
-        self.counters.reduce_tasks_failed += 1
-        if attempts_used >= self._attempts:
-            self._give_up_on_reduction(
-                group,
-                attempts=attempts_used,
-                resources_measured=outcome.resources,
-                traceback=outcome.traceback,
-            )
-            raise VineReduceError(
-                f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
-                f"{attempts_used} attempt{'s' if attempts_used != 1 else ''} "
-                f"(attempts={self._attempts}):\n{outcome.traceback}"
-            )
-        for item in group:
-            item.attempts = attempts_used
-        # force_final must carry over - this may be the drain group (the
-        # last reduction of a dataset, forced final regardless of
-        # _is_result), and retrying without it would let _is_result
-        # recompute is_final and possibly say False, so the group's
-        # eventual success is never recognized as the dataset's final
-        self._submit_reduction(group, force_final=task.force_final)
-
-    def _reduce_kind_and_description(self, task: _ReduceTask) -> tuple[ReportKind, str]:
-        """The (kind, description) pair identifying one reduce task, for
-        _report_task - see TaskReport.kind/description."""
-        description = f"reduction of {len(task.group)} partial{'s' if len(task.group) != 1 else ''}"
-        if task.is_final:
-            description += " (final)"
+    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
         if task.force_final:
             kind = ReportKind.FINAL
         elif task.is_final:
@@ -905,55 +730,95 @@ class Pipeline:
             kind = ReportKind.CHECKPOINT
         else:
             kind = ReportKind.REDUCER
-        return kind, description
+        description = f"reduction of {_plural(len(task.group), 'partial')}"
+        if task.is_final:
+            description += " (final)"
+        self._report_task(kind, description, outcome)
+
+        if isinstance(outcome, RuntimeFailure):
+            self._handle_reduce_runtime_failure(task, outcome)
+        elif isinstance(outcome, ResourceExhaustion):
+            self._handle_reduce_resource_exhaustion(task, outcome)
+        else:
+            assert isinstance(outcome, Success)
+            self._handle_reduce_success(task, outcome)
 
     def _handle_reduce_success(self, task: _ReduceTask, outcome: Success) -> None:
-        """Fold a completed reduction's group into a new PoolItem.
-
-        group's own handles are deliberately not released here: new_item
-        isn't durable yet, so if it's lost before something checkpoints it,
-        group (kept below as new_item.inputs) is the only way to recover it
-        without recomputing everything from scratch. See _release_covered,
-        invoked from _checkpoint once new_item eventually does become
-        durable.
-        """
+        """Fold a completed reduction's group into a new PoolItem. The group
+        (and its lineage) is carried as the new item's lineage, and released
+        only once the new item (or a descendant) is checkpointed."""
         group = task.group
+        lineage = [ancestor for item in group for ancestor in (item, *item.lineage)]
         self.counters.reduce_tasks_completed += 1
         _update_resource_max(self._reduction_max, outcome.resources)
         wall_time_s = outcome.resources.wall_time_s or 0.0
-        memory_mb = outcome.resources.memory_mb or 0.0
         new_item = PoolItem(
             handle=ResultHandle(outcome.result_id, outcome.file),
             num_events=sum(item.num_events for item in group),
             wall_time_s=sum(item.wall_time_s for item in group) + wall_time_s,
-            memory_mb=sum(item.memory_mb for item in group) + memory_mb,
+            memory_mb=sum(item.memory_mb for item in group) + (outcome.resources.memory_mb or 0.0),
             covers=union_coverage(item.covers for item in group),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
             since_checkpoint_distance=max(item.since_checkpoint_distance for item in group) + 1,
-            inputs=group,
+            lineage=lineage,
         )
 
         if task.is_checkpoint:
-            self._checkpoint(new_item, group, task.is_final)
+            self._checkpoint(new_item, task.is_final)
 
         if task.is_final:
             self.final_results.append(new_item)
         else:
             self.pool.append(new_item)
 
-    def _handle_reduce_outcome(self, task: _ReduceTask, outcome: Outcome) -> None:
-        kind, description = self._reduce_kind_and_description(task)
-        self._report_task(kind, description, outcome)
+    def _handle_reduce_runtime_failure(self, task: _ReduceTask, outcome: RuntimeFailure) -> None:
+        group = task.group
+        attempts_used = task.attempts + 1
+        self.counters.reduce_tasks_failed += 1
+        if attempts_used >= self._config.attempts:
+            self._give_up_on_reduction(
+                group,
+                attempts=attempts_used,
+                resources_measured=outcome.resources,
+                traceback=outcome.traceback,
+                message=(
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} failed after "
+                    f"{_plural(attempts_used, 'attempt')} "
+                    f"(attempts={self._config.attempts}):\n{outcome.traceback}"
+                ),
+            )
+        for item in group:
+            item.attempts = attempts_used
+        # force_final must carry over: if this is the drain group, letting
+        # is_result recompute is_final could leave the dataset with no final.
+        self._submit_reduction(group, force_final=task.force_final)
 
-        if isinstance(outcome, RuntimeFailure):
-            self._handle_reduce_runtime_failure(task, outcome)
-            return
-        if isinstance(outcome, ResourceExhaustion):
-            self._handle_reduce_resource_exhaustion(task, outcome)
-            return
-
-        assert isinstance(outcome, Success)
-        self._handle_reduce_success(task, outcome)
+    def _handle_reduce_resource_exhaustion(
+        self, task: _ReduceTask, outcome: ResourceExhaustion
+    ) -> None:
+        group = task.group
+        self.counters.reduce_tasks_failed += 1
+        decision = _shrink_decision(len(group), self.reduction_size, self._minimum_reduction_size)
+        if decision is _ShrinkDecision.GIVE_UP:
+            self._give_up_on_reduction(
+                group,
+                attempts=task.attempts + 1,
+                resources_measured=outcome.resources,
+                traceback=None,
+                message=(
+                    f"reducer for {self.processor_name!r}/{self.dataset_name!r} exhausted "
+                    "resources at the minimum reduction_size "
+                    f"({self._minimum_reduction_size}); cannot retry smaller."
+                ),
+            )
+        if decision is _ShrinkDecision.SHRINK:
+            # Clamp to the floor so e.g. 3 with a floor of 2 still tries 2.
+            self.reduction_size = max(self.reduction_size // 2, self._minimum_reduction_size)
+        # SHRINK or REPOOL: requeue at the front, re-split at the current
+        # reduction_size next cycle. Exhaustion is a fresh start, not a strike.
+        for item in group:
+            item.attempts = 0
+        self.pool[:0] = group
 
     def _give_up_on_reduction(
         self,
@@ -962,14 +827,12 @@ class Pipeline:
         attempts: int,
         resources_measured: ResourceUsage | None,
         traceback: str | None,
-    ) -> None:
-        """A reducer permanent failure: log every file folded into the
-        failed group, with the event ranges the group held of it, and
-        release the group's own distributor-held results (they will never be
-        used again). Unlike a processor permanent
-        failure (_give_up_on_chunk), this never checks failure_proportion -
-        the caller always aborts the whole run right after this returns, since
-        a partially-folded result can't be trusted not to be corrupted."""
+        message: str,
+    ) -> NoReturn:
+        """A reducer permanent failure: log every file range the group held,
+        release the group's uncheckpointed items and lineage, and raise
+        VineReduceError(message). Always aborts, regardless of
+        failure_proportion: a partially folded result can't be trusted."""
         if self._failure_log is not None:
             allocated = self._distributor.resources(TaskKind.REDUCER)
             covers = union_coverage(item.covers for item in group)
@@ -986,86 +849,73 @@ class Pipeline:
                         traceback=traceback,
                     )
                 )
-        # Only the group's not-yet-checkpointed fallback lineage is ours to
-        # free here - it was never durable, so losing it is fine now that the
-        # group itself is being given up on. Any item that is ITSELF a
-        # checkpoint - whether at the top of the group or reached through a
-        # non-checkpointed intermediate - still has its own untouched DB row
-        # (this failure never superseded it - only a successful _checkpoint
-        # does that), so keep_checkpoints=True must stop _release_covered
-        # from deleting its durable file, which would leave the surviving
-        # row pointing at nothing and break adopting it on restart.
+        # Checkpoints keep their files: nothing supersedes their rows, which a
+        # restart still needs to adopt.
         for item in group:
-            self._release_covered(item, keep_checkpoints=True)
+            for ancestor in (item, *item.lineage):
+                if not ancestor.is_checkpointed:
+                    self._release(ancestor)
+        raise VineReduceError(message)
 
-    def _checkpoint_due(self, since_checkpoint_time: float, since_checkpoint_distance: int) -> bool:
-        """Whether enough work has piled up since the last checkpoint - in wall
-        time or in un-checkpointed accumulations - to be worth checkpointing
-        the reduction about to be submitted. Decided from the group's inputs
-        alone, before the reduction itself has run, so this reduction's own
-        cost is not part of the decision - only what the reduction it is
-        about to fold in already carries. since_checkpoint_time is summed
-        across the group (total wall time at stake), while
-        since_checkpoint_distance is the max across the group (the worst-off
-        ancestor's accumulations-since-checkpoint - "has some ancestor gone
-        checkpoint_distance accumulations without being checkpointed").
-        When checkpoint_accumulations is set, every accumulation (non-final
-        reduction) result is checkpointed regardless of the thresholds."""
-        if self._checkpoint_accumulations:
-            return True
-        if self._checkpoint_time is not None and since_checkpoint_time >= self._checkpoint_time:
-            return True
-        if (
-            self._checkpoint_distance is not None
-            and since_checkpoint_distance >= self._checkpoint_distance
-        ):
-            return True
-        return False
+    # -- checkpoints -----------------------------------------------------------
+
+    def _checkpoint(self, new_item: PoolItem, is_final: bool) -> None:
+        """Make new_item durable, record it, and release its lineage,
+        superseding the lineage's checkpoint rows. The new row and the
+        deletion of the superseded rows are one transaction, so a crash never
+        leaves both on file."""
+        path, offloaded = self._durable_path(new_item, is_final)
+        superseded = [item for item in new_item.lineage if item.is_checkpointed]
+        row_id = self._db.record(
+            processor=self.processor_name,
+            dataset=self.dataset_name,
+            covers=new_item.covers,
+            num_events=new_item.num_events,
+            wall_time_s=new_item.wall_time_s,
+            memory_mb=new_item.memory_mb,
+            is_final=is_final,
+            path=path,
+            supersedes=[item.checkpoint.row_id for item in superseded],
+            offloaded=offloaded,
+        )
+        self._events_safe += new_item.num_events - sum(item.num_events for item in superseded)
+        for item in new_item.lineage:
+            self._release(item)
+        new_item.lineage = []
+        new_item.checkpoint = CheckpointRef(row_id, path)
+        new_item.since_checkpoint_time = 0
+        new_item.since_checkpoint_distance = 0
 
     def _durable_path(self, new_item: PoolItem, is_final: bool) -> tuple[str, bool]:
-        """Locate or create new_item's durable on-disk copy. Returns
-        (path, offloaded) - offloaded is only ever True for a final result
-        produced under result_postprocess_offload=True (see
-        _write_offload_pointer); every other case is False.
+        """new_item's durable path, and whether it is an offload pointer file.
 
-        A final result is copied out to vine_reduce's own results_dir and
-        its distributor handle released immediately, since nothing will ever
-        reduce it further. A non-final checkpoint was already made durable
-        by the distributor at submit time (is_checkpoint=True - see
-        _submit_reduction), so only its path needs to be learned; the handle
-        stays live and reusable as input to a later reduction until a
-        further checkpoint covers this item (via _release_covered).
-        """
-        if is_final:
-            if self._result_postprocess_offload:
-                path = self._write_offload_pointer(new_item)
-            else:
-                path = os.path.join(
-                    self._results_dir, f"{self.processor_name}__{uuid4().hex}.pkl.zst"
-                )
-                self._distributor.retrieve(new_item.handle.result_id, path)
-            self._distributor.release_result(new_item.handle.result_id)
-            new_item.handle = None
-            return path, self._result_postprocess_offload
-        path = self._distributor.checkpoint_path(new_item.handle.result_id)
-        return path, False
+        A non-final checkpoint is already durable (submitted with
+        is_checkpoint=True), so its path is just looked up and its handle
+        stays live for later reductions. A final result is copied into
+        results_dir (or replaced by a pointer file, under
+        result_postprocess_offload) and its distributor copy released."""
+        if not is_final:
+            return self._distributor.checkpoint_path(new_item.handle.result_id), False
+        if self._config.result_postprocess_offload:
+            path = self._write_offload_pointer(new_item)
+        else:
+            path = self._new_result_path(".pkl.zst")
+            self._distributor.retrieve(new_item.handle.result_id, path)
+        self._distributor.release_result(new_item.handle.result_id)
+        new_item.handle = None
+        return path, self._config.result_postprocess_offload
+
+    def _new_result_path(self, suffix: str, prefix: str = "") -> str:
+        return os.path.join(
+            self._results_dir, f"{prefix}{self.processor_name}__{uuid4().hex}{suffix}"
+        )
 
     def _write_offload_pointer(self, new_item: PoolItem) -> str:
-        """Writes the pointer file for an offloaded final result (see
-        PLAN_results_dir_rework.md's "Offload case").
-
-        The locator result_postprocess returned already reached the driver
-        through the normal result-transport path, same as any other result
-        (dest_file -> distributor.retrieve() -> serialization.load()) - it
-        is trusted to be small, since offload means the real data was
-        already written elsewhere by the callback itself. Retrieved to a
-        throwaway temp file (never the final path) so a failed validation
-        below leaves nothing behind for a restart to mistake for a real
-        checkpoint.
-        """
-        tmp_path = os.path.join(
-            self._results_dir, f".{self.processor_name}__{uuid4().hex}.offload.tmp"
-        )
+        """Write the pointer file for an offloaded final result. The locator
+        result_postprocess returned is small by contract, and is retrieved to
+        a hidden temp file so a failed validation leaves nothing behind for a
+        restart to mistake for a result."""
+        tmp_path = self._new_result_path(".offload.tmp", prefix=".")
         self._distributor.retrieve(new_item.handle.result_id, tmp_path)
         try:
             locator = serialization.load(tmp_path)
@@ -1081,7 +931,7 @@ class Pipeline:
                 f"result_postprocess_offload=True; got {locator!r} ({type(locator).__name__}): {e}"
             ) from e
 
-        path = os.path.join(self._results_dir, f"{self.processor_name}__{uuid4().hex}.pointer.json")
+        path = self._new_result_path(".pointer.json")
         with open(path, "w") as f:
             json.dump(
                 {
@@ -1095,105 +945,17 @@ class Pipeline:
             )
         return path
 
-    def _mark_durable(
-        self, new_item: PoolItem, inputs: list[PoolItem], row_id: int, path: str
-    ) -> None:
-        """Free everything new_item's now-committed checkpoint supersedes.
+    def _release(self, item: PoolItem) -> None:
+        """Release item's distributor copy (for a checkpoint, its durable file
+        too). Clearing the handle makes a double release impossible."""
+        if item.handle is not None:
+            self._distributor.release_result(item.handle.result_id)
+            item.handle = None
 
-        Each input's not-yet-checkpointed lineage was only ever kept alive
-        as a fallback in case new_item was lost before being checkpointed -
-        now that the DB row above is committed, that lineage (and any
-        checkpoint reached through it, whose row was superseded above) is
-        safe to release.
-        """
-        for item in inputs:
-            self._release_covered(item)
-        new_item.inputs = []
-        new_item.checkpoint = CheckpointRef(row_id, path)
-        new_item.since_checkpoint_time = 0
-        new_item.since_checkpoint_distance = 0
-
-    def _checkpoint(self, new_item: PoolItem, inputs: list[PoolItem], is_final: bool) -> None:
-        path, offloaded = self._durable_path(new_item, is_final)
-
-        # Record durably, atomically superseding the rows this replaces: the
-        # new row and the superseded rows' deletes are one transaction, so
-        # this checkpoint event either fully lands or, on a crash mid-way,
-        # fully doesn't (never leaves both old and new rows covering the
-        # same files on disk). Walk each input's whole lineage, not just the
-        # direct inputs: _mark_durable below will free the durable file of
-        # every checkpoint it reaches, however deep, so every one of those
-        # rows must be superseded here too - otherwise a checkpoint folded
-        # in through a non-checkpointed intermediate would have its file
-        # deleted while its row stays on file, pointing nowhere.
-        superseded = [row_id for item in inputs for row_id in self._checkpoints_in(item)]
-        row_id = self._db.record(
-            processor=self.processor_name,
-            dataset=self.dataset_name,
-            covers=new_item.covers,
-            num_events=new_item.num_events,
-            wall_time_s=new_item.wall_time_s,
-            memory_mb=new_item.memory_mb,
-            is_final=is_final,
-            path=path,
-            supersedes=superseded,
-            offloaded=offloaded,
-        )
-
-        self._mark_durable(new_item, inputs, row_id, path)
-
-    @staticmethod
-    def _checkpoints_in(root: PoolItem) -> list[int]:
-        """Row ids of every checkpoint reachable from root that
-        _release_covered(root) will free the durable file of - same
-        traversal rule as _release_covered itself: descend through
-        not-yet-checkpointed items, but stop descending past a checkpointed
-        one (its own lineage was already freed when IT was checkpointed).
-        Used by _checkpoint to supersede every row whose file _mark_durable
-        is about to delete, not just root's."""
-        row_ids = []
-        stack = [root]
-        while stack:
-            item = stack.pop()
-            if item.is_checkpointed:
-                row_ids.append(item.checkpoint.row_id)
-            else:
-                stack.extend(item.inputs)
-        return row_ids
-
-    def _release_covered(self, root: PoolItem, *, keep_checkpoints: bool = False) -> None:
-        """Retention rule: a result may be freed only once a durable
-        checkpoint covers it downstream; this is called exactly when such a
-        checkpoint lands, once per item folded into it. Frees root and its
-        whole not-yet-checkpointed lineage, stopping its descent at any item
-        that is itself a checkpoint - that item's own lineage was already
-        freed when IT was checkpointed. An explicit stack, not recursion, so
-        an arbitrarily long uncheckpointed chain cannot hit Python's
-        recursion limit; clearing handle/inputs as it goes makes
-        double-release structurally impossible.
-
-        keep_checkpoints=True skips release_result on any item that is
-        itself a checkpoint (its handle and inputs are still cleared): used
-        by _give_up_on_reduction, where nothing supersedes those rows'
-        durable files the way a successful _checkpoint's _mark_durable does,
-        so deleting them here would strand a surviving DB row pointing at
-        nothing."""
-        stack = [root]
-        while stack:
-            item = stack.pop()
-            if item.handle is not None:
-                if not (keep_checkpoints and item.is_checkpointed):
-                    self._distributor.release_result(item.handle.result_id)
-                item.handle = None
-            if not item.is_checkpointed:
-                stack.extend(item.inputs)
-            item.inputs = []
+    # -- size.jsonl ------------------------------------------------------------
 
     def _log_size_once(self) -> None:
-        """Writes this pipeline's size.jsonl row (see size_log.py) the first
-        time it finishes - guarded by _size_logged since __init__ and
-        refresh_finished can both be the trigger, but a row must land
-        exactly once."""
+        """Write this pipeline's size.jsonl row (see size_log.py), exactly once."""
         if self._size_logged or self._size_log is None:
             return
         self._size_logged = True
@@ -1210,10 +972,8 @@ class Pipeline:
 
     @staticmethod
     def _rounded_max(maxes: dict[str, float]) -> dict[str, float] | None:
-        """None (not {}) when nothing of this kind was ever measured - e.g. a
-        restart that resumed entirely from checkpoints, running no fresh
-        processor/reducer task itself - so size.jsonl can tell "not measured
-        this run" apart from "measured, all zero"."""
+        """None (not {}) when nothing was measured this run, so size.jsonl can
+        tell "not measured" from "measured, all zero"."""
         if not maxes:
             return None
         return {key: round(value, 2) for key, value in maxes.items()}

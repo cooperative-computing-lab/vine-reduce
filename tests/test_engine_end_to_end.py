@@ -5,16 +5,11 @@ import os
 
 import pytest
 
-from vine_reduce import VineReduce, VineReduceError, defaults, serialization
+from vine_reduce import VineReduce, VineReduceError, serialization
 from vine_reduce.checkpoint_store import CheckpointStore, checksum_dataset
-from vine_reduce.engine import (
-    _resolve_minimum_chunksize,
-    _resolve_minimum_reduction_size,
-    _resolve_reduction_size,
-    _resolve_sized_config,
-)
 from vine_reduce.failure_log import FailureLog
 from vine_reduce.local_distributor import LocalDistributor
+from vine_reduce.pipeline import _resolve_reduction_size, _resolve_sized_config
 from vine_reduce.progress import NullProgressReporter
 from vine_reduce.size_log import SizeLog
 
@@ -82,34 +77,9 @@ def test_resolve_reduction_size_raises_on_too_small_value():
         _resolve_reduction_size({"default": 1}, "proc", "ds")
 
 
-def test_resolve_minimum_reduction_size_defaults_to_two_when_not_given():
-    assert _resolve_minimum_reduction_size(None, 10) == 2
-
-
-def test_resolve_minimum_reduction_size_raises_values_below_two_to_two():
-    assert _resolve_minimum_reduction_size(0, 10) == 2
-    assert _resolve_minimum_reduction_size(1, 10) == 2
-
-
-def test_resolve_minimum_reduction_size_caps_at_reduction_size():
-    assert _resolve_minimum_reduction_size(20, 10) == 10
-
-
-def test_resolve_minimum_reduction_size_passes_through_valid_value():
-    assert _resolve_minimum_reduction_size(4, 10) == 4
-
-
-def test_resolve_minimum_chunksize_defaults_to_1000_when_not_given():
-    assert _resolve_minimum_chunksize(None) == 1000
-
-
-def test_resolve_minimum_chunksize_raises_values_below_one_to_one():
-    assert _resolve_minimum_chunksize(0) == 1
-    assert _resolve_minimum_chunksize(-5) == 1
-
-
-def test_resolve_minimum_chunksize_passes_through_valid_value():
-    assert _resolve_minimum_chunksize(50) == 50
+def test_checkpoint_accumulations_sets_distance_zero():
+    vr = VineReduce(processors={}, input={}, checkpoint_accumulations=True, checkpoint_distance=5)
+    assert vr.checkpoint_distance == 0
 
 
 def test_reduction_size_dict_missing_default_raises_clearly(tmp_path, dataset_input, distributor):
@@ -497,7 +467,6 @@ def test_build_pipelines_priority_orders_by_processor_then_dataset(tmp_path, dis
             datasets,
             distributor,
             db,
-            defaults.default_datasets_to_chunks,
             NullProgressReporter(),
             FailureLog(str(tmp_path / "failed_files.log")),
             SizeLog(str(tmp_path / "size.jsonl")),

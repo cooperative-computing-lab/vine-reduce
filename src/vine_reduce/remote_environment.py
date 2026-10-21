@@ -1,40 +1,16 @@
-"""Build a relocatable, packed Python environment to ship to remote workers.
+"""Build a relocatable, packed conda environment tarball to ship to remote workers, e.g. via
+`TaskVineDistributor(environment=...)`. Not TaskVine-specific: get_environment() just returns a
+tarball path.
 
-Most commonly this is the poncho package handed to
-`TaskVineDistributor(environment=...)` (see taskvine_distributor.py and the
-README's "Packaging an environment for remote workers"), but nothing here
-is TaskVine-specific: `get_environment()` just resolves a conda environment
-to a tarball path on disk. Any current or future `Distributor` that wants a
-shipped environment can use it the same way; a distributor whose workers
-already share vine_reduce's filesystem (e.g. LocalDistributor) simply has
-no use for the result.
+Adapted from TopEFT/topcoffea's topcoffea/modules/remote_environment.py
+(https://github.com/TopEFT/topcoffea). Packs whatever is installed in the calling conda
+environment ($CONDA_PREFIX by default) with `poncho_package_create` (ndcctools; the `conda`
+extra).
 
-Adapted from TopEFT/topcoffea's `topcoffea/modules/remote_environment.py`
-(https://github.com/TopEFT/topcoffea), simplified to pack whatever is
-already installed in the calling conda environment (normally $CONDA_PREFIX)
-rather than resolving a separate package spec - add whatever your workers
-need by installing it into that environment before calling get_environment,
-not through this module.
-
-Building goes through `poncho_package_create` (part of `ndcctools`/cctools,
-same as TaskVine itself - see the `conda` extra in pyproject.toml), which
-packs a conda environment directory into a single relocatable tarball. Two
-things make repeated calls cheap:
-  - Results are cached on disk, keyed by a hash of the environment's
-    installed packages plus the state of any locally-editable packages (see
-    below). A cache hit just returns the existing tarball path immediately.
-  - Any locally-editable pip install found via `pip list --editable`
-    (vine_reduce itself by default, or whatever else is listed in
-    pip_editable) has its git commit hash folded into that cache key, and
-    unstaged changes to the paths being watched are treated as "always
-    rebuild" (or raise UnstagedChanges, depending on `unstaged=`) - so a
-    tarball never silently ships stale code from an editable checkout.
-
-Editable installs can't be packed as-is - conda-pack needs real files in
-site-packages, not a .pth pointing back at a checkout that won't exist on a
-remote worker - so any package currently installed editable is temporarily
-reinstalled non-editable for the pack step, then reinstalled editable again
-immediately afterwards (see _create_env).
+Tarballs are cached on disk, keyed by a hash of the environment's installed packages plus the
+git state of locally-editable installs (commit hash; uncommitted changes force a rebuild or raise
+UnstagedChanges), so a tarball never ships stale editable code. Editable installs can't be packed
+as-is, so they are temporarily reinstalled non-editable for packing, then restored.
 """
 
 from __future__ import annotations
@@ -57,16 +33,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CACHE_DIR = Path.cwd() / "vine_reduce-envs"
 
-# package name (as reported by `pip list --editable`, i.e. its distribution
-# name, not an install spec) -> paths relative to its repo root whose git
-# status decides whether an editable install of that package counts as
-# "changed" for the cache key - see _local_pip_commits.
+# package name (as in `pip list --editable`) -> paths, relative to its repo root, whose git status
+# marks an editable install as changed for the cache key.
 _DEFAULT_PIP_EDITABLE: dict[str, list[str]] = {"vine_reduce": ["src", "pyproject.toml"]}
 
-# Sentinel commit value meaning "treat as dirty, always rebuild" - used both
-# when a watched package has uncommitted changes and when its commit can't be
-# determined at all (e.g. not a git checkout). Deliberately not a real commit
-# hash so it can never collide with one.
+# Cache-key sentinel meaning "always rebuild": uncommitted changes, or a commit that can't be
+# determined. Not a real commit hash, so it can't collide with one.
 _DIRTY = "dirty"
 
 
@@ -90,18 +62,13 @@ def _current_conda_package_versions(conda_env_path: str | None = None) -> dict[s
 
 
 def _environment_state_hash(conda_env_path: str) -> str:
-    """Hash of every package currently installed in conda_env_path (conda
-    and pip packages alike - pip installs show up in `conda list` too), used
-    as part of the cache key so a rebuild is triggered whenever the
-    environment's contents change."""
+    """Hash of every package installed in conda_env_path (conda and pip), for the cache key."""
     versions = _current_conda_package_versions(conda_env_path)
     return hashlib.sha256("".join(sorted(versions.values())).encode()).hexdigest()[:8]
 
 
 def _check_pack_dependencies() -> None:
-    """Raise a clear error if poncho_package_create (from ndcctools) or its
-    conda-pack dependency aren't installed, rather than failing deep inside
-    a subprocess call with a cryptic error."""
+    """Raise a clear error if poncho_package_create or conda-pack is missing."""
     missing = []
     if shutil.which("poncho_package_create") is None:
         missing.append("ndcctools (provides poncho_package_create)")
@@ -165,8 +132,7 @@ def _create_env(
 
 
 def _find_editable_pip_installs() -> dict[str, str]:
-    """package name -> local checkout path, for every package currently
-    `pip install -e`d in this Python's environment."""
+    """package name -> checkout path for every editable pip install."""
     paths_by_package = {}
     for dist in importlib.metadata.distributions():
         raw_direct_url = dist.read_text("direct_url.json")
@@ -190,9 +156,8 @@ def _git_head(path: str) -> str:
 
 
 def _git_dirty(path: str, pathspecs: list[str]) -> str:
-    """`git status --porcelain` output for path, restricted to pathspecs -
-    empty means clean. Falls back to an unrestricted status check if the
-    pathspecs themselves are rejected by git (e.g. an unsupported magic)."""
+    """`git status --porcelain` for path restricted to pathspecs; empty means clean. Retries
+    unrestricted if git rejects the pathspecs."""
     status_cmd = ["git", "status", "--porcelain", "--untracked-files=no"]
     try:
         return (
@@ -214,9 +179,8 @@ def _git_dirty(path: str, pathspecs: list[str]) -> str:
 def _local_pip_commits(
     paths_by_package: dict[str, str], pip_editable: dict[str, list[str]]
 ) -> dict[str, str]:
-    """For each editable package, the git commit of its checkout, or the
-    sentinel _DIRTY if the watched paths have uncommitted changes (or the
-    checkout isn't a git repo at all - safest default is to always rebuild)."""
+    """Per editable package: its git commit, or _DIRTY if the watched paths have uncommitted
+    changes or the commit can't be determined (e.g. not a git repo)."""
     commits: dict[str, str] = {}
     for package, path in paths_by_package.items():
         try:
@@ -238,9 +202,8 @@ def _local_pip_commits(
 
 
 def _combined_commit_key(commits: dict[str, str]) -> str:
-    """The editable-installs half of the cache key: one hash over every
-    editable package's commit, or the _DIRTY sentinel if any of them has
-    uncommitted changes (see _local_pip_commits)."""
+    """Editable-installs half of the cache key: a hash of all commits, "fixed" if there are none,
+    or _DIRTY if any has uncommitted changes."""
     if not commits:
         return "fixed"
     values = list(commits.values())
@@ -268,29 +231,20 @@ def get_environment(
     unstaged: str = "rebuild",
     cache_size: int = 3,
 ) -> str:
-    """Resolve a packed environment tarball, building (or rebuilding) it
-    with poncho_package_create if needed, and return its path - suitable to
-    pass straight to `TaskVineDistributor(environment=...)`.
+    """Return the path of a packed environment tarball, building it with poncho_package_create
+    if not cached. Suitable for `TaskVineDistributor(environment=...)`.
 
-    conda_env_path defaults to $CONDA_PREFIX: the environment packed is
-    whatever is currently installed there, nothing more. Add packages your
-    workers need by installing them into that environment (conda install,
-    pip install, a pixi dependency, ...) before calling this.
+    conda_env_path defaults to $CONDA_PREFIX; exactly what is installed there is packed, so
+    install any packages workers need beforehand.
 
-    pip_editable merges on top of the default (vine_reduce's own
-    `src`/pyproject.toml): package name (as reported by
-    `pip list --editable`, not an install spec - see _find_editable_pip_installs)
-    -> list of paths, relative to that package's repo root, to `git status`.
-    Every package currently installed editable is reinstalled non-editable
-    for the pack step and back to editable afterwards, regardless of whether
-    it's named here; pip_editable only narrows which paths are watched to
-    decide if that package counts as "changed" for the cache key (a package
-    installed editable but not named here still gets watched, over its
-    whole repo).
+    pip_editable merges over the default (vine_reduce's `src`/pyproject.toml): package name (as in
+    `pip list --editable`) -> paths, relative to its repo root, whose `git status` decides
+    whether that package counts as changed for the cache key. Every editable install is repacked
+    non-editable and restored afterwards, whether or not it is named here; an unnamed one is
+    watched over its whole repo.
 
-    unstaged controls what happens when a watched editable install has
-    uncommitted changes: "rebuild" (default) forces a fresh build, "fail"
-    raises UnstagedChanges instead.
+    unstaged: "rebuild" (default) forces a fresh build when a watched editable install has
+    uncommitted changes; "fail" raises UnstagedChanges instead.
     """
     if unstaged not in ("rebuild", "fail"):
         raise ValueError(f"unstaged must be 'rebuild' or 'fail', not {unstaged!r}")

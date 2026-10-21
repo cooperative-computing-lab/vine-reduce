@@ -1,10 +1,5 @@
-"""Serialization for result files: cloudpickle wrapped in zstd compression.
-
-cloudpickle (rather than stdlib pickle) is used because results, and the
-functions that produce them, may be closures or lambdas. Compression is
-streamed through zstandard's compressor/decompressor file objects, so the
-pickled bytes are compressed and written (or read and decompressed) in
-chunks rather than held in memory as one large buffer.
+"""Result-file serialization: cloudpickle (results and functions may be closures or lambdas)
+streamed through zstd compression, so large pickles aren't held in memory as one buffer.
 """
 
 from __future__ import annotations

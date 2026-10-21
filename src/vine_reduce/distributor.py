@@ -1,16 +1,11 @@
 """The interface vine_reduce needs from a distributor.
 
-A distributor manages submitting calls to worker nodes and reporting their
-outcome back. It knows nothing about processors, chunks, or reductions -
-just opaque callables and their results.
+A distributor submits opaque callables to worker nodes and reports their outcome. It knows nothing
+about processors, chunks, or reductions.
 
-Convention for `func`: vine_reduce always submits `executor_wrapper` or
-`reducer_wrapper` from defaults.py, both of which take the worker-local
-destination file path as their *first* argument. A distributor is
-responsible for choosing that path and prepending it itself, i.e. it should
-call `func(dest_file, *args)`, not `func(*args)`. This is what "this file is
-entirely maintained by the distributor" means in PLAN.md: vine_reduce never
-picks the path, it only ever sees it echoed back on `Outcome.file`.
+`func` is always `executor_wrapper` or `reducer_wrapper` (defaults.py), which take the worker-local
+destination file as their first argument. The distributor chooses that path and calls
+`func(dest_file, *args)`; vine_reduce only ever sees it echoed back as `Outcome.file`.
 """
 
 from __future__ import annotations
@@ -30,9 +25,8 @@ class TaskKind(enum.StrEnum):
 
 
 class Distributor(abc.ABC):
-    """The interface VineReduce needs from a distributor. Implement this
-    protocol (see LocalDistributor and TaskVineDistributor for two examples)
-    to run vine_reduce against a different backend."""
+    """Implement this protocol (see LocalDistributor, TaskVineDistributor) to run vine_reduce on
+    another backend."""
 
     @abc.abstractmethod
     def submit(
@@ -45,21 +39,14 @@ class Distributor(abc.ABC):
         *args: Any,
         is_checkpoint: bool = False,
     ) -> None:
-        """Submit a call for remote execution, identified by result_id - a
-        caller-minted id (see PLAN.md), unique for the lifetime of this
-        distributor, that release_result/retrieve/checkpoint_path and the
-        matching Outcome.result_id will use to refer back to this call.
-        Larger priority runs first. category groups calls belonging to the
-        same processing/reduction set (e.g. for logging or scheduling
-        heuristics). kind says whether this is a processor or reducer call,
-        so a distributor can apply different resource requests to each.
-        is_checkpoint marks a call whose result vine_reduce needs to survive
-        independently of whatever produced it - a non-final checkpoint or a
-        final result (see PLAN.md's "Temporary Results, Checkpoints, and
-        Restart") - so a distributor that distinguishes durable from
-        disposable storage (e.g. TaskVineDistributor's declare_file(cache=True)
-        vs declare_temp()) knows which to use; a distributor with only one
-        kind of storage can ignore it."""
+        """Submit func(dest_file, *args) for remote execution under a caller-minted result_id,
+        unique for this distributor's lifetime and used by every later call and Outcome.result_id.
+
+        Larger priority runs first. category groups related calls (logging, scheduling); kind lets
+        the distributor apply different resources to processors and reducers. is_checkpoint marks a
+        result that must outlive its producer (a checkpoint or final result), so the distributor
+        should put it in durable rather than disposable storage; ignore it if there is only one
+        kind."""
         ...
 
     @abc.abstractmethod
@@ -70,40 +57,23 @@ class Distributor(abc.ABC):
 
     @abc.abstractmethod
     def release_result(self, result_id: str) -> None:
-        """Release any resources (e.g. worker-local files) held for
-        result_id. This is a hard requirement, not just cleanup: for a
-        result submitted with is_checkpoint=True (or adopted via
-        adopt_checkpoint), release_result must also remove the checkpoint's
-        durable on-disk copy - the distributor is the single owner of that
-        file. Both shipped distributors (LocalDistributor,
-        TaskVineDistributor) already behave this way; Pipeline relies on it
-        rather than deleting checkpoint files itself."""
+        """Release resources held for result_id. For a result submitted with
+        is_checkpoint=True (or adopted), this must also delete its durable on-disk copy; the
+        distributor is the sole owner of that file and Pipeline relies on it."""
         ...
 
     @abc.abstractmethod
     def adopt_checkpoint(self, result_id: str, path: str) -> str:
-        """Register `path` - an existing durable checkpoint file written by
-        a previous run and recorded in the checkpoint store - under
-        result_id, as if it were a completed Success result of this run
-        submitted with is_checkpoint=True. result_id becomes valid for
-        release_result/retrieve/checkpoint_path (checkpoint_path returns
-        `path`). Returns the distributor's own handle for the file - the
-        same kind of value as Outcome.file - which the caller wraps into a
-        ResultHandle for use inside a later submit()'s args."""
+        """Register `path`, a durable checkpoint file from a previous run, under result_id as if it
+        were a completed Success submitted with is_checkpoint=True. checkpoint_path() then returns
+        `path`. Returns the distributor's handle for the file (like Outcome.file)."""
         ...
 
     @abc.abstractmethod
     def resources(self, kind: TaskKind) -> dict[str, Any] | None:
-        """A default resource dict (e.g. {"cores": ...}) for calls of this
-        kind, or None if this distributor has no meaningful default. This is
-        a static cap known ahead of dispatch (e.g. TaskVineDistributor's
-        configured category limit) - vine_reduce passes it as
-        metadata["distributor"] into executor_wrapper (which also forwards
-        it to chunk_to_args and executor.submit), for use as a fallback
-        where the execution site itself doesn't report
-        a more precise, real allocation (e.g. TaskVine's worker setting the
-        CORES environment variable at dispatch time, which may be less than
-        this cap - see DaskExecutor's _num_workers)."""
+        """A static default resource dict (e.g. {"cores": ...}) for calls of this kind, or None.
+        Passed as metadata["distributor"] into executor_wrapper, as a fallback when the execution
+        site reports no more precise allocation (see DaskExecutor's _num_workers)."""
         ...
 
     @abc.abstractmethod
@@ -113,42 +83,28 @@ class Distributor(abc.ABC):
 
     @abc.abstractmethod
     def retrieve(self, result_id: str, dest_path: str) -> None:
-        """Copy the file for a completed (Success) result_id to dest_path, a
-        path local to the vine_reduce process. Used for final results, whose
-        location (results_dir) and naming are vine_reduce's own convention,
-        independent of the distributor."""
+        """Copy the file of a completed (Success) result_id to dest_path, local to the vine_reduce
+        process. Used for final results, whose location is vine_reduce's choice."""
         ...
 
     @abc.abstractmethod
     def checkpoint_path(self, result_id: str) -> str:
-        """Local, durable on-disk path for a completed (Success) result_id
-        that was submitted with is_checkpoint=True. Unlike retrieve(), the
-        distributor chooses this path itself (e.g. TaskVineDistributor's own
-        checkpoint_dir) - vine_reduce only needs to know where it ended up,
-        to record in the checkpoint db for restart. Only valid for a result
-        submitted with is_checkpoint=True."""
+        """Local durable path of a completed result_id submitted with is_checkpoint=True. The
+        distributor picks it (under set_checkpoint_dir's path); vine_reduce records it for
+        restart."""
         ...
 
     @abc.abstractmethod
     def set_checkpoint_dir(self, path: str) -> None:
-        """Tell this distributor where to durably write a checkpoint/final
-        result from now on - every checkpoint_path() return value for a
-        result submitted with is_checkpoint=True after this call must fall
-        under `path`. VineReduce owns this directory (it decides the path
-        and is responsible for removing individual checkpoint files under
-        it - see reset_if_dataset_changed), so a distributor should treat
-        `path` as given, not chosen; called once, before any work is
-        submitted, whether or not the distributor was supplied by the
-        caller or built by VineReduce itself."""
+        """Set the directory under which every checkpoint_path() will fall from now on. VineReduce
+        owns the directory, so the distributor takes `path` as given. Called once, before any
+        submit()."""
         ...
 
     @abc.abstractmethod
     def add_file(self, local_path: str, remote_path: str | None = None) -> None:
-        """Make local_path (readable from the vine_reduce process) available,
-        under remote_path (defaulting to local_path's basename), wherever
-        every processor/reducer call submitted after this point runs. For a
-        distributor whose workers already share vine_reduce's filesystem,
-        this can be a no-op."""
+        """Make local_path available as remote_path (default: its basename) to every call submitted
+        afterwards. May be a no-op if workers share vine_reduce's filesystem."""
         ...
 
     @abc.abstractmethod
@@ -159,9 +115,8 @@ class Distributor(abc.ABC):
 
     @abc.abstractmethod
     def shutdown(self) -> None:
-        """Release whatever resources this distributor owns (worker pools,
-        temp directories, ...). Also reachable via `with distributor: ...`,
-        which calls this on exit."""
+        """Release whatever this distributor owns (worker pools, temp directories). Also called
+        on exit from `with distributor: ...`."""
         ...
 
     def __enter__(self) -> "Distributor":

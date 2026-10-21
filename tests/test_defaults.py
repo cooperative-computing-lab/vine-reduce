@@ -24,9 +24,7 @@ from helpers import (
 
 def test_default_datasets_to_chunks_splits_by_chunksize():
     dataset = {"files": {"a.root": 10, "b.root": 5}}
-    chunks = list(
-        default_datasets_to_chunks(dataset, current_chunksize=lambda: 4, skip_files=set())
-    )
+    chunks = list(default_datasets_to_chunks(dataset, current_chunksize=lambda: 4))
     assert chunks == [
         Chunk("a.root", 0, 4),
         Chunk("a.root", 4, 8),
@@ -38,26 +36,14 @@ def test_default_datasets_to_chunks_splits_by_chunksize():
 
 def test_default_datasets_to_chunks_whole_file_when_chunksize_none():
     dataset = {"files": {"a.root": 10, "b.root": 5}}
-    chunks = list(
-        default_datasets_to_chunks(dataset, current_chunksize=lambda: None, skip_files=set())
-    )
+    chunks = list(default_datasets_to_chunks(dataset, current_chunksize=lambda: None))
     assert chunks == [Chunk("a.root", 0, 10), Chunk("b.root", 0, 5)]
-
-
-def test_default_datasets_to_chunks_skips_files():
-    dataset = {"files": {"a.root": 10, "b.root": 5}}
-    chunks = list(
-        default_datasets_to_chunks(dataset, current_chunksize=lambda: None, skip_files={"a.root"})
-    )
-    assert chunks == [Chunk("b.root", 0, 5)]
 
 
 def test_default_datasets_to_chunks_reads_chunksize_fresh_per_file():
     dataset = {"files": {"a.root": 10, "b.root": 10}}
     sizes = iter([5, 2])
-    chunks = list(
-        default_datasets_to_chunks(dataset, current_chunksize=lambda: next(sizes), skip_files=set())
-    )
+    chunks = list(default_datasets_to_chunks(dataset, current_chunksize=lambda: next(sizes)))
     a_chunks = [c for c in chunks if c.url == "a.root"]
     b_chunks = [c for c in chunks if c.url == "b.root"]
     assert [c.num_events for c in a_chunks] == [5, 5]
