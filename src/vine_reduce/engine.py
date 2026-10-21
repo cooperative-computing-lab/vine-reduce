@@ -182,7 +182,7 @@ class VineReduce:
         on resource exhaustion, taking effect for chunks not yet generated.
     minimum_chunksize: the floor chunksize is halved down to on resource
         exhaustion, below which a further ResourceExhaustion gives up on the
-        chunk's file for good instead of shrinking further (see attempts's
+        chunk for this run instead of shrinking further (see attempts's
         docstring). None (the default) means 1000. A value below 1 is raised
         to 1.
     max_chunks_active: cap on chunks in flight (submitted but not yet
@@ -213,25 +213,27 @@ class VineReduce:
         minimum size (minimum_chunksize / minimum_reduction_size) a further
         ResourceExhaustion raises immediately, since there is no smaller
         size left to retry at. Once the budget for a specific chunk is
-        exhausted, the file it belongs to is given up on for good (see
-        failure_proportion); once the budget for a reduction is exhausted,
-        VineReduceError is raised and the whole run stops, unconditionally
-        - see Pipeline._handle_chunk_outcome/_handle_reduce_outcome.
+        exhausted, that chunk is dropped for this run while the other chunks
+        of its file carry on (see failure_proportion); once the budget for a
+        reduction is exhausted, VineReduceError is raised and the whole run
+        stops, unconditionally - see
+        Pipeline._handle_chunk_outcome/_handle_reduce_outcome.
     failure_proportion: only applies to a processor permanent failure (a
         chunk that exhausted `attempts`) - a reducer permanent failure
         always stops the run, regardless of this setting, since a
         partially-folded reduction can't be trusted not to be corrupted.
-        A file whose chunk permanently fails is logged to failed_files.log
-        (dataset, filename, resources allocated/measured, last traceback)
-        the moment it happens and removed from that (processor, dataset)
-        pipeline for good - never retried, never pooled. The run only
-        aborts once, for some dataset, `permanently_failed_files /
-        total_files_in_dataset > failure_proportion`, where
-        total_files_in_dataset is that dataset's fixed file count (known
-        upfront, not how many have concluded so far). Must be in [0, 1).
-        The default, 0, reproduces the historical behavior: the very first
-        permanent processor failure aborts the run.
-        A run that finishes with any file left permanently unprocessed
+        A chunk that permanently fails is logged to failed_files.log
+        (dataset, filename, event range, resources allocated/measured, last
+        traceback) the moment it happens and dropped for this run: the rest
+        of its file is still processed, so the file's results have a hole.
+        A restart retries it. The run only aborts once, for some dataset,
+        `permanently_failed_events / total_events_in_dataset >
+        failure_proportion`, where total_events_in_dataset is the sum of the
+        dataset's num_entries (known upfront, not how many have concluded
+        so far). Must be in [0, 1). The default, 0, reproduces the
+        historical behavior: the very first permanent processor failure
+        aborts the run.
+        A run that finishes with any chunk left permanently unprocessed
         prints a warning in red naming failed_files.log.
     """
 
@@ -327,13 +329,14 @@ class VineReduce:
     @staticmethod
     def _warn_unprocessed(pipelines: list[Pipeline], failure_log_path: str) -> None:
         """Print a red warning naming `failure_log_path` if any pipeline
-        ended this run with files permanently skipped (see
+        ended this run with chunks permanently skipped (see
         failure_proportion's docstring above)."""
-        unprocessed = sum(len(p.failed_files) for p in pipelines)
-        if unprocessed:
+        failed = [chunk for p in pipelines for chunk in p.failed_chunks]
+        if failed:
+            events = sum(chunk.num_events for chunk in failed)
             Console().print(
-                f"WARNING: {unprocessed} file(s) were permanently skipped and left "
-                f"unprocessed; see {failure_log_path}",
+                f"WARNING: {len(failed)} chunk(s) ({events} event(s)) were permanently "
+                f"skipped and left unprocessed; see {failure_log_path}",
                 style="bold red",
             )
 

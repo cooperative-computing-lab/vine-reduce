@@ -23,8 +23,10 @@
 
 **Rule**
 
-- Pool: one per (processor, dataset). A file's chunk outputs join the pool only once *all* of that
-  file's chunks have succeeded - never reduced file-by-file first (invariant 1).
+- Pool: one per (processor, dataset). A chunk's output joins the pool as soon as that chunk
+  succeeds, in arrival order, so a file's chunks may be folded into different reductions,
+  checkpoints, and final results. Every result therefore records exactly which event ranges it
+  covers (see "The checkpoint store"), never just which files it touches.
 - Fold: whenever the pool holds `>= reduction_size` items, the oldest `reduction_size` are reduced
   together in one call. The pool always drains: once chunk generation is exhausted, whatever
   remains - even a single item - is reduced as a smaller final group.
@@ -53,6 +55,9 @@
 - Reduction pools rather than using a per-file tree, so a slow or oddly-sized file doesn't block
   progress: outputs join a shared pool the moment they're ready, and any `reduction_size` of them
   can be folded together regardless of which file they came from.
+- A final result may cover only part of a file - from a custom `is_result` firing mid-file, or from
+  a chunk that permanently failed (see "Failure Tolerance"). Users combine all of a dataset's
+  final results; per-result coverage lives only in the checkpoint store and is not exposed further.
 - The pool "always drains" so a small or oddly-shaped dataset still produces a result - a
   single-chunk dataset must not wait forever for siblings that don't exist.
 - `is_result` is checked on group totals *before* submission, not on the reduction's own output
@@ -80,34 +85,27 @@
 
 ### Invariants
 
-- Three rules govern pooling, durability, and release. The rest of this section, and the pipeline
+- Two rules govern durability and release. The rest of this section, and the pipeline
   implementation, refer back to them by number.
 
 **Rule**
 
-1. **Only completely processed files join the pool.** A file's chunk outputs are staged aside and
-   enter the reduction pool only once every chunk of that file has succeeded.
-2. **A checkpoint's inputs can be freed once it is durable.** When a reduction's output is
+1. **A checkpoint's inputs can be freed once it is durable.** When a reduction's output is
    checkpointed (or becomes a final result), everything folded into it is no longer needed for
    recovery and is released. A non-final checkpoint's *own* copy is not released then: it stays
    live as a possible input to later reductions, and is released only once a further checkpoint
    covers it.
-3. **An uncheckpointed accumulation's inputs are freed only when something downstream is
+2. **An uncheckpointed accumulation's inputs are freed only when something downstream is
    checkpointed** - recursively through its lineage, stopping at prior checkpoints (whose own
-   lineages were already freed when they were checkpointed, per invariant 2).
+   lineages were already freed when they were checkpointed, per invariant 1).
 
 **Mechanics** (all in `src/vine_reduce/pipeline.py`)
 
-- Invariant 1: `_handle_chunk_outcome` stages chunk results in a per-file
-  `_files_in_progress[url].staged_items` list and moves them into the pool only when the covered
-  events reach the file's `num_entries`. On restart, the invariant holds because a checkpoint row
-  only ever covers files whose chunks all succeeded (rows are only written for pool items, which
-  invariant 1 already gates), so the restart skip set can never skip a partially-processed file.
-- Invariant 2: `_checkpoint` releases a checkpoint's inputs only after durability is established
+- Invariant 1: `_checkpoint` releases a checkpoint's inputs only after durability is established
   (final: `retrieve()` into `results_dir` returned; non-final: the distributor made the copy
   durable at submit time per the `is_checkpoint=True` contract) and after the checkpoint store's
   atomic `record(...)` committed.
-- Invariant 3: a reduction's output keeps its whole input group alive as `PoolItem.inputs`; the
+- Invariant 2: a reduction's output keeps its whole input group alive as `PoolItem.inputs`; the
   *only* place anything is released is `_checkpoint`, via `_release_covered` - a walk that frees
   an item and descends into its `inputs` exactly while the item is not itself checkpointed. The
   walk uses an explicit stack, not recursion, so an arbitrarily long uncheckpointed chain cannot
@@ -163,7 +161,7 @@ out. What differs is *where* the durable copy lives and how vine_reduce learns i
   locally-accessible filesystem path, not an opaque distributor-internal handle. The distributor
   only picks the filename within it, and reports the result back via `checkpoint_path(result_id)`,
   to record in the checkpoint store. The distributor's copy stays live and reusable as a reduction
-  input (so the manager never re-sends a checkpoint it already generated), per invariant 2.
+  input (so the manager never re-sends a checkpoint it already generated), per invariant 1.
 
 **Why**
 
@@ -177,7 +175,7 @@ out. What differs is *where* the durable copy lives and how vine_reduce learns i
   (`CheckpointStore`, `src/vine_reduce/checkpoint_store.py`; the file defaults to
   `results_dir/vine_reduce.db`).
 
-**Rule** - schema, versioned via `PRAGMA user_version = 1`:
+**Rule** - schema, versioned via `PRAGMA user_version = 2`:
 
 ```sql
 CREATE TABLE checkpoints (
@@ -195,7 +193,9 @@ CREATE INDEX checkpoints_by_pair ON checkpoints(processor, dataset);
 CREATE TABLE checkpoint_files (
     checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,
     file_url      TEXT    NOT NULL,
-    PRIMARY KEY (checkpoint_id, file_url)
+    start         INTEGER NOT NULL,
+    stop          INTEGER NOT NULL,
+    PRIMARY KEY (checkpoint_id, file_url, start)
 );
 
 CREATE TABLE dataset_checksums (
@@ -205,9 +205,18 @@ CREATE TABLE dataset_checksums (
 ```
 
 - Rows are read back by column name (`sqlite3.Row`) into a frozen `CheckpointRecord` dataclass
-  (`id`, `processor`, `dataset`, `covers_files: frozenset[str]`, `num_events`, `wall_time_s`,
-  `memory_mb`, `is_final`, `path`), with `covers_files` coming from the `checkpoint_files` join
-  table - normalized rather than a JSON blob, so it is schema-enforced and cascade-deleted.
+  (`id`, `processor`, `dataset`, `covers: Coverage`, `num_events`, `wall_time_s`, `memory_mb`,
+  `is_final`, `path`), with `covers` coming from the `checkpoint_files` join table - normalized
+  rather than a JSON blob, so it is schema-enforced and cascade-deleted. One `checkpoint_files` row
+  per `[start, stop)` range.
+- `Coverage` (`src/vine_reduce/event_ranges.py`): `Mapping[str, Ranges]`, per dataset file URL the
+  sorted, disjoint, non-adjacent `[start, stop)` event ranges a result holds; files with nothing
+  covered are absent. `Ranges = tuple[tuple[int, int], ...]`. Helpers: `union_ranges`,
+  `union_coverage` (merge on fold), `uncovered_chunks` (trim a chunk on restart).
+- A `PoolItem` carries the same `covers`: `{url: ((start, stop),)}` for a chunk's output,
+  `union_coverage` of its group's `covers` for a fold. Pool items arrive interleaved, so a result's
+  coverage may be fragmented into many ranges per file; live `checkpoint_files` rows are still
+  bounded by the total number of chunks.
 
 Store semantics:
 
@@ -232,17 +241,31 @@ Store semantics:
 
 ### Restart
 
-**Rule** (`plan_restart(rows, dataset_files)`, a pure function stating the rules once)
+**Rule** (`plan_restart(rows, dataset_sizes)`, a pure function stating the rules once;
+`dataset_sizes` is `dataset["files"]`, `{url: num_entries}`)
 
 1. Every final row is replayed as a final result.
-2. The run is finished iff the final rows cover every dataset file; partial rows are then moot
-   and ignored.
+2. The run is finished iff the final rows cover every event `[0, num_entries)` of every dataset
+   file; partial rows are then moot and ignored.
 3. Otherwise every partial (non-final) row is replayed as a pool item.
-4. A file is skipped by chunk generation iff a replayed row covers it.
+4. Events a replayed row covers are never processed again: a file the replayed rows cover
+   entirely is in `skip_files` (not chunked at all), and chunks of a file they cover only in part
+   are trimmed to the uncovered events, so the file resumes where it left off whatever chunk
+   boundaries this run's `datasets_to_chunks` picks.
+5. Permanent failures are not persisted. A range that failed in an earlier run is uncovered, so a
+   restart processes it again with a fresh `attempts` budget. If the earlier run had already
+   produced its final result(s), the refilled ranges drain into an **additional** final result
+   covering just those ranges - existing final results are never reopened, merged, or deleted.
 
 **Mechanics**
 
 - `_seed_from_checkpoints` executes the plan above.
+- `RestartPlan` carries `skip_files: set[str]` (files fully covered) and
+  `covered: dict[str, Ranges]` (union of every replayed row's `covers`).
+- `Pipeline._trim_covered` wraps the `datasets_to_chunks` generator, replacing each chunk by
+  `uncovered_chunks(chunk, covered[url])`. Trimmed sub-chunks may be smaller than
+  `minimum_chunksize`; that floor only bounds halving, so this is allowed. The user's
+  `datasets_to_chunks` keeps its `skip_files` signature and never sees `covered`.
 - Every replayed **partial** row is handed to the distributor via
   `adopt_checkpoint(result_id, row.path)` - `result_id` freshly minted by vine_reduce itself, same
   as for `submit()` - which registers the on-disk file as if it were a completed Success result of
@@ -261,7 +284,7 @@ Store semantics:
 **Rule**
 
 A distributor-side result is only ever released once a checkpoint covers it - never merely
-because it was folded into a later reduction (invariants 2 and 3). Concretely, when
+because it was folded into a later reduction (invariants 1 and 2). Concretely, when
 `_checkpoint` runs for a new item:
 
 1. Locate/create the durable copy (final: retrieve into `results_dir`, release the distributor's
@@ -298,7 +321,8 @@ handle Optional[ResultHandle]: the item's live distributor identity - handle.fil
                                the distributor's copy again (a final result safely in
                                results_dir, a released item, or a restart-seeded final row).
 num_events / wall_time_s / memory_mb: totals accumulated into this item.
-files frozenset[str]: dataset file URLs whose data this item represents.
+covers Coverage: per dataset file URL, the [start, stop) event ranges this item
+                               represents - possibly only part of a file.
 since_checkpoint_time float: wall time accumulated since this lineage was last checkpointed.
 since_checkpoint_distance int: reduction folds since this lineage was last checkpointed.
 checkpoint Optional[CheckpointRef]: the durable identity (store row_id + on-disk path), present
@@ -306,7 +330,7 @@ checkpoint Optional[CheckpointRef]: the durable identity (store row_id + on-disk
 inputs List[PoolItem]: the items folded together to produce this one (empty for a chunk's
                                output). Kept so a lost, not-yet-durable item can be recovered by
                                re-folding its inputs instead of recomputing from scratch;
-                               cleared once a checkpoint covers it (invariant 3).
+                               cleared once a checkpoint covers it (invariant 2).
 attempts int: how many failed reduction attempts this item has survived while in its current
                                grouping, for the `attempts` retry budget (see "Attempts and
                                Retries"). 0 for a freshly produced item (a raw chunk's output, or a
@@ -396,43 +420,51 @@ was, and remains, the only behavior for a RuntimeFailure prior to this feature).
 Once a chunk's or reduction's `attempts` budget (see above) is exhausted, it is logged to
 `failed_files.log` - one shared, append-only, plain-text file for the whole run, at the directory
 `compute()` was called from, written to immediately as each permanent failure is found (dataset,
-filename, `kind` ("processor"|"reducer"), attempts made, `Distributor.resources(kind)` as the
+filename and `[start, stop)` event range, `kind` ("processor"|"reducer"), attempts made, `Distributor.resources(kind)` as the
 allocated cap, the last attempt's measured resource usage, and its traceback, whichever of these
 are available). What happens next depends on which kind of call it was:
 
 - **A processor (chunk) permanent failure**:
-  - Removes just that one dataset file from the `(processor, dataset)` pipeline going forward: it
-    is dropped from `_files_in_progress` (any already-staged sibling chunk results for it are
-    released back to the distributor, never pooled), purged from `_retry_chunks`, and skipped by
-    both `_next_chunk` and any of its own sibling chunks whose outcome arrives after the fact.
+  - Drops just that chunk's `[start, stop)` range - the chunk at the size it last failed at, after
+    any halving. Nothing else about its file changes: sibling chunks already pooled, folded,
+    checkpointed or final stay where they are, and sibling chunks still pending, in flight or
+    awaiting retry carry on normally. The file's results simply end up with a hole.
   - The run only aborts (`VineReduceError`) once, for some dataset,
-    `permanently_failed_files / total_files_in_dataset > failure_proportion`, where
-    `total_files_in_dataset` is that dataset's fixed file count (`len(dataset["files"])`.
+    `permanently_failed_events / total_events_in_dataset > failure_proportion`, where
+    `total_events_in_dataset` is `sum(dataset["files"].values())`, fixed at construction. Events,
+    not chunks, because the chunk count is neither known upfront nor stable under halving.
   - `failure_proportion` defaults to `0` with first permanent failure stopping the run.
+  - Failures are per run: nothing about them is written to the checkpoint store, so a restart
+    retries the failed ranges (see "Restart", rule 5).
 - **A reducer (reduction) permanent failure**:
   - Always aborts the whole run, unconditionally - `failure_proportion` is never consulted for it.
   - A partially-folded reduction result can't be trusted not to be corrupted, so there is no
     "skip and continue" for this case, same as before this feature.
-  - Every file folded into the failing group is logged (there is no attempt to attribute the
+  - Every file folded into the failing group is logged with the ranges the group held of it
+    (from the group's `covers`; there is no attempt to attribute the
     failure to one specific input with any precision - the run is stopping anyway), and the
     group's own distributor-held results are released (`Pipeline._release_covered`, the same
     cleanup a successful fold's inputs already get) before the `VineReduceError` propagates.
 
-If a run finishes with at least one file left permanently unprocessed, a warning is printed in red
-naming `failed_files.log`. The dataset's final result still comes out short of "every event of the
-dataset" in that case - the last group's `is_result` bypass (see "Reduction and Final Results")
+If a run finishes with at least one chunk left permanently unprocessed, a warning is printed in red
+giving the number of failed chunks and events and naming `failed_files.log`. The dataset's final
+result still comes out short of "every event of the dataset" in that case - the last group's `is_result` bypass (see "Reduction and Final Results")
 means this is no longer a deadlock, just a result computed over less data than the full dataset.
 
 **Mechanics** (`src/vine_reduce/pipeline.py`, `src/vine_reduce/failure_log.py`)
 
-- `Pipeline._give_up_on_file` handles the processor case (called from `_handle_chunk_outcome`);
+- `Pipeline._give_up_on_chunk` handles the processor case (called from `_handle_chunk_outcome`):
+  log, add the chunk to `_failed_chunks`, add its events to `_failed_events`, return whether the
+  ratio trips;
   `Pipeline._give_up_on_reduction` handles the reducer case (called from `_handle_reduce_outcome`,
   immediately before each of its two `raise VineReduceError` sites).
 - `FailureLog` (`failure_log.py`) is the shared log writer, one instance per `VineReduce.compute()`
   call, passed to every `Pipeline` alongside `task_reporter`.
-- `Pipeline.failed_files` exposes the set of permanently-failed files for this (processor,
-  dataset) pair, read by `VineReduce.compute()` after `_run()` returns to decide whether to print
-  the end-of-run warning.
+- `Pipeline.failed_chunks: frozenset[Chunk]` exposes the permanently-failed chunks for this (processor, dataset) pair, read by `VineReduce.compute()` after `_run()`
+  returns to decide whether to print the end-of-run warning.
+- `FailureRecord.ranges: tuple[tuple[int, int], ...]` holds the `[start, stop)` event ranges of
+  `filename` given up on: a processor failure's one chunk, or what a failed reduction's group held
+  of that file (one record per file). `failed_files.log` prints them on an `events:` line.
 
 ## Data Flow
 
@@ -757,9 +789,9 @@ attempts int = 3: Total tries for a single chunk (processor call) or reduction (
 failure_proportion float = 0.0: Only applies to a processor permanent failure - a reducer
                                permanent failure always aborts the run, regardless of this
                                setting. The run aborts once, for some dataset,
-                               permanently_failed_files / total_files_in_dataset is greater than
-                               this value, where total_files_in_dataset is that dataset's fixed
-                               file count, known upfront. Must be in [0, 1); 0 (default) aborts on
+                               permanently_failed_events / total_events_in_dataset is greater
+                               than this value, where total_events_in_dataset is the sum of the
+                               dataset's num_entries, known upfront. Must be in [0, 1); 0 (default) aborts on
                                the very first permanent processor failure, matching the
                                historical behavior. See "Failure Tolerance" above.
 ```

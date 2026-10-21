@@ -15,6 +15,7 @@ from uuid import uuid4
 from . import defaults, serialization
 from .checkpoint_store import CheckpointRecord, CheckpointStore
 from .distributor import Distributor, TaskKind
+from .event_ranges import Coverage, Ranges, uncovered_chunks, union_coverage
 from .executor import Executor
 from .failure_log import FailureLog, FailureRecord
 from .size_log import SizeLog, SizeRecord
@@ -156,7 +157,8 @@ class PoolItem:
         A non-final checkpoint keeps its handle live so it can still be
         folded into a later reduction without the manager re-sending it.
     num_events / wall_time_s / memory_mb: totals accumulated into this item.
-    files: dataset file URLs whose data this item represents.
+    covers: the event ranges, per dataset file URL, this item represents -
+        possibly only part of a file.
     since_checkpoint_time: wall time accumulated since this item (or one of
         its inputs) was last checkpointed - reset to 0 whenever a checkpoint
         is written (see Pipeline._checkpoint).
@@ -187,7 +189,7 @@ class PoolItem:
     num_events: int
     wall_time_s: float
     memory_mb: float
-    files: frozenset[str]
+    covers: Coverage
     since_checkpoint_time: float
     since_checkpoint_distance: int
     checkpoint: CheckpointRef | None = None
@@ -207,7 +209,8 @@ class RestartPlan:
     finished: bool
     final_rows: list[CheckpointRecord]
     pool_rows: list[CheckpointRecord]  # empty when finished (partials are moot)
-    skip_files: set[str]
+    skip_files: set[str]  # files fully covered by the replayed rows
+    covered: dict[str, Ranges]  # what the replayed rows cover, per file
 
 
 def next_result_id() -> str:
@@ -216,39 +219,47 @@ def next_result_id() -> str:
     return uuid4().hex
 
 
-def plan_restart(rows: list[CheckpointRecord], dataset_files: set[str]) -> RestartPlan:
+def plan_restart(rows: list[CheckpointRecord], dataset_sizes: dict[str, int]) -> RestartPlan:
     """The restart rules, stated once:
     1. Every final row is replayed as a final result.
-    2. The run is finished iff the final rows cover every dataset file;
-       partial rows are then moot and ignored.
+    2. The run is finished iff the final rows cover every event of every
+       dataset file; partial rows are then moot and ignored.
     3. Otherwise every partial row is replayed as a pool item.
-    4. A file is skipped iff a replayed row covers it."""
+    4. The events the replayed rows cover are not processed again: a file
+       they cover entirely is skipped, and chunks of a file they cover in
+       part are trimmed to the events left (see Pipeline._trim_covered)."""
     final_rows = [row for row in rows if row.is_final]
     partial_rows = [row for row in rows if not row.is_final]
 
-    finalized_files = {url for row in final_rows for url in row.covers_files}
-    if dataset_files <= finalized_files:
+    finalized = union_coverage(row.covers for row in final_rows)
+    if _fully_covers(finalized, dataset_sizes):
         return RestartPlan(
             finished=True,
             final_rows=final_rows,
             pool_rows=[],
-            skip_files=set(dataset_files),
+            skip_files=set(dataset_sizes),
+            covered=finalized,
         )
 
-    covered_by_partial = {url for row in partial_rows for url in row.covers_files}
+    covered = union_coverage(row.covers for row in rows)
     return RestartPlan(
         finished=False,
         final_rows=final_rows,
         pool_rows=partial_rows,
-        skip_files=finalized_files | covered_by_partial,
+        skip_files={
+            url for url in dataset_sizes if _is_whole(covered.get(url, ()), dataset_sizes[url])
+        },
+        covered=covered,
     )
 
 
-@dataclass
-class _FileProgress:
-    num_entries: int
-    covered_events: int = 0
-    staged_items: list[PoolItem] = field(default_factory=list)
+def _is_whole(ranges: Ranges, size: int) -> bool:
+    """Whether ranges cover all `size` events of a file (a 0-entry file is always covered)."""
+    return size == 0 or ranges == ((0, size),)
+
+
+def _fully_covers(coverage: Coverage, dataset_sizes: dict[str, int]) -> bool:
+    return all(_is_whole(coverage.get(url, ()), size) for url, size in dataset_sizes.items())
 
 
 @dataclass
@@ -379,25 +390,24 @@ class Pipeline:
 
         self.pool: list[PoolItem] = []
         self.final_results: list[PoolItem] = []
-        self._files_in_progress: dict[str, _FileProgress] = {}
         self._retry_chunks: list[_ChunkTask] = []
         self._in_flight: dict[str, _ChunkTask | _ReduceTask] = {}
         self._generator_exhausted = False
         self._generator: Iterator[Chunk] | None = None
         self._skip_files: set[str] = set()
+        self._covered: dict[str, Ranges] = {}
         self.finished = False
 
-        # Failure tolerance: files given up on during preprocessing (see
-        # _give_up_on_file) are removed from the pool going forward, never
-        # retried, and counted against failure_proportion - whose denominator
-        # is the dataset's total file count (fixed here, at construction; see
-        # PLAN.md's "Attempts and Retries").
-        self._failed_files: set[str] = set()
-        self._total_files = len(dataset["files"])
+        # Failure tolerance: chunks given up on (see _give_up_on_chunk) leave
+        # a hole in their file's results and count, by their events, against
+        # failure_proportion - whose denominator is events_total.
+        self._failed_chunks: list[Chunk] = []
+        self._failed_events = 0
 
         # events_total is fixed at construction; the dataset dict is never
-        # mutated after this. The rest of the progress-bar counters live on
-        # self.counters (see ProgressCounters), read directly by progress.py.
+        # mutated after this. It is also failure_proportion's denominator.
+        # The rest of the progress-bar counters live on self.counters (see
+        # ProgressCounters), read directly by progress.py.
         self.events_total = sum(dataset["files"].values())
         self.counters = ProgressCounters()
 
@@ -423,7 +433,7 @@ class Pipeline:
             num_events=row.num_events,
             wall_time_s=row.wall_time_s,
             memory_mb=row.memory_mb,
-            files=row.covers_files,
+            covers=row.covers,
             since_checkpoint_time=0,
             since_checkpoint_distance=0,
             checkpoint=CheckpointRef(row.id, row.path),
@@ -432,16 +442,18 @@ class Pipeline:
     def _seed_from_checkpoints(self) -> None:
         """Restart support: replay the checkpoint rows on file (per
         plan_restart's rules) as final results and pool items, and record
-        which dataset files they already cover so chunk generation can skip
-        them. A replayed pool item is adopted by the distributor
-        (adopt_checkpoint), so from here on it is indistinguishable from a
-        result this run produced itself: same handle for resubmission, same
-        release_result for cleanup. A replayed final row gets no handle -
-        a final result is never resubmitted."""
+        which events they already cover so chunk generation skips files they
+        cover entirely and trims the chunks of files they cover in part. A
+        replayed pool item is adopted by the distributor (adopt_checkpoint),
+        so from here on it is indistinguishable from a result this run
+        produced itself: same handle for resubmission, same release_result
+        for cleanup. A replayed final row gets no handle - a final result is
+        never resubmitted."""
         rows = self._db.checkpoints_for(self.processor_name, self.dataset_name)
-        plan = plan_restart(rows, set(self._dataset["files"]))
+        plan = plan_restart(rows, self._dataset["files"])
         self.final_results = [self._seeded_item(row, handle=None) for row in plan.final_rows]
         self._skip_files = plan.skip_files
+        self._covered = plan.covered
         self.finished = plan.finished
         for row in plan.pool_rows:
             result_id = next_result_id()
@@ -467,12 +479,12 @@ class Pipeline:
         )
 
     @property
-    def failed_files(self) -> frozenset[str]:
-        """Dataset file URLs permanently given up on during preprocessing -
-        see _give_up_on_file. Does not include files caught up in a reducer
+    def failed_chunks(self) -> frozenset[Chunk]:
+        """Chunks permanently given up on during processing - see
+        _give_up_on_chunk. Does not include chunks caught up in a reducer
         permanent failure, since that always aborts the whole run instead
         (see _give_up_on_reduction)."""
-        return frozenset(self._failed_files)
+        return frozenset(self._failed_chunks)
 
     @property
     def in_flight_count(self) -> int:
@@ -492,34 +504,9 @@ class Pipeline:
         e.g. an empty dataset, or one covered by seeded checkpoints for every
         file but not yet marked finished at construction."""
         if not self.finished:
-            self._check_chunk_coverage()
             self.finished = self.chunks_all_done and not self.pool and self.in_flight_count == 0
             if self.finished:
                 self._log_size_once()
-
-    def _check_chunk_coverage(self) -> None:
-        """Once chunk generation is exhausted and no chunk task (fresh or
-        retry) is pending or in flight, every file must be gone from
-        _files_in_progress - a file only leaves it once covered_events
-        reaches num_entries (see _handle_chunk_success). A custom
-        datasets_to_chunks that under-covers a file (or omits it entirely)
-        would otherwise leave it there forever: chunks_all_done never
-        becomes True and the run hangs with no diagnostic (Correctness
-        #11)."""
-        if (
-            self._generator_exhausted
-            and not self._retry_chunks
-            and not any(isinstance(t, _ChunkTask) for t in self._in_flight.values())
-            and self._files_in_progress
-        ):
-            under_covered = ", ".join(
-                f"{url!r} ({progress.covered_events}/{progress.num_entries} events)"
-                for url, progress in sorted(self._files_in_progress.items())
-            )
-            raise VineReduceError(
-                f"datasets_to_chunks for processor {self.processor_name!r}, "
-                f"dataset {self.dataset_name!r} exhausted without covering: {under_covered}"
-            )
 
     @property
     def chunks_all_done(self) -> bool:
@@ -529,7 +516,6 @@ class Pipeline:
         return (
             self._generator_exhausted
             and not self._retry_chunks
-            and not self._files_in_progress
             and not any(isinstance(t, _ChunkTask) for t in self._in_flight.values())
         )
 
@@ -539,8 +525,8 @@ class Pipeline:
         if self.finished or budget <= 0:
             return 0
         if self._generator is None:
-            self._generator = self._datasets_to_chunks(
-                self._dataset, lambda: self.chunksize, self._skip_files
+            self._generator = self._trim_covered(
+                self._datasets_to_chunks(self._dataset, lambda: self.chunksize, self._skip_files)
             )
 
         submitted = 0
@@ -551,6 +537,13 @@ class Pipeline:
             self._submit_chunk(next_task)
             submitted += 1
         return submitted
+
+    def _trim_covered(self, chunks: Iterator[Chunk]) -> Iterator[Chunk]:
+        """chunks cut down to the events no restart-seeded row covers yet - a
+        file the rows cover in part resumes where they left off, whatever
+        chunk boundaries this run's datasets_to_chunks picks."""
+        for chunk in chunks:
+            yield from uncovered_chunks(chunk, self._covered.get(chunk.url, ()))
 
     def _next_chunk(self) -> _ChunkTask | None:
         """The next chunk to submit (with the attempts already used against
@@ -572,22 +565,14 @@ class Pipeline:
 
         if self._generator_exhausted:
             return None
-        while True:
-            chunk = next(self._generator, None)
-            if chunk is None:
-                self._generator_exhausted = True
-                return None
-            # A file already given up on (see _give_up_on_file) may still
-            # have chunks left to yield from the generator's current
-            # position - skip them without submitting.
-            if chunk.url not in self._failed_files:
-                return _ChunkTask(chunk, 0)
+        chunk = next(self._generator, None)
+        if chunk is None:
+            self._generator_exhausted = True
+            return None
+        return _ChunkTask(chunk, 0)
 
     def _submit_chunk(self, task: _ChunkTask) -> None:
         chunk = task.chunk
-        self._files_in_progress.setdefault(
-            chunk.url, _FileProgress(num_entries=self._dataset["files"][chunk.url])
-        )
         result_id = next_result_id()
         self._distributor.submit(
             result_id,
@@ -705,7 +690,7 @@ class Pipeline:
         chunksize/reduction_size on ResourceExhaustion). VineReduceError is
         only raised once retries are exhausted - a chunk's RuntimeFailure or
         minimum-size ResourceExhaustion raises only if that also trips
-        failure_proportion (see _give_up_on_file); a reduction's always
+        failure_proportion (see _give_up_on_chunk); a reduction's always
         raises once its attempts run out, since a reducer permanent failure
         always stops the run. Updates `finished` once nothing is left to
         do."""
@@ -725,7 +710,7 @@ class Pipeline:
         attempts_used = task.attempts + 1
         self._record_chunk_failure(chunk)
         if attempts_used >= self._attempts:
-            if self._give_up_on_file(
+            if self._give_up_on_chunk(
                 chunk,
                 attempts=attempts_used,
                 resources_measured=outcome.resources,
@@ -754,7 +739,7 @@ class Pipeline:
             self._retry_chunks.append(_ChunkTask(chunk, 0))
             return
         if decision is _ShrinkDecision.GIVE_UP:
-            if self._give_up_on_file(
+            if self._give_up_on_chunk(
                 chunk,
                 attempts=task.attempts + 1,
                 resources_measured=outcome.resources,
@@ -786,22 +771,17 @@ class Pipeline:
         wall_time_s = outcome.resources.wall_time_s or 0.0
         memory_mb = outcome.resources.memory_mb or 0.0
 
-        progress = self._files_in_progress[chunk.url]
-        progress.covered_events += chunk.num_events
-        progress.staged_items.append(
+        self.pool.append(
             PoolItem(
                 handle=ResultHandle(outcome.result_id, outcome.file),
                 num_events=chunk.num_events,
                 wall_time_s=wall_time_s,
                 memory_mb=memory_mb,
-                files=frozenset({chunk.url}),
+                covers={chunk.url: ((chunk.start, chunk.stop),)},
                 since_checkpoint_time=wall_time_s,
                 since_checkpoint_distance=0,
             )
         )
-        if progress.covered_events >= progress.num_entries:
-            self.pool.extend(progress.staged_items)
-            del self._files_in_progress[chunk.url]
 
     def _handle_chunk_outcome(self, task: _ChunkTask, outcome: Outcome) -> None:
         chunk = task.chunk
@@ -810,15 +790,6 @@ class Pipeline:
             f"{_truncate_name(chunk.url)}[{chunk.start}:{chunk.stop}]",
             outcome,
         )
-
-        if chunk.url in self._failed_files:
-            # A sibling chunk of this (now abandoned) file already exhausted
-            # its attempts and gave up on the whole file - see
-            # _give_up_on_file. Discard whatever this one produced instead
-            # of staging or retrying it.
-            if isinstance(outcome, Success):
-                self._distributor.release_result(outcome.result_id)
-            return
 
         if isinstance(outcome, RuntimeFailure):
             self._handle_chunk_runtime_failure(task, outcome)
@@ -830,7 +801,7 @@ class Pipeline:
         assert isinstance(outcome, Success)
         self._handle_chunk_success(task, outcome)
 
-    def _give_up_on_file(
+    def _give_up_on_chunk(
         self,
         chunk: Chunk,
         *,
@@ -838,20 +809,21 @@ class Pipeline:
         resources_measured: ResourceUsage | None,
         traceback: str | None,
     ) -> bool:
-        """A processor permanent failure: log it, drop the file from the
-        pool for good (it is never retried or staged), and return whether
-        the whole run should abort, per failure_proportion.
-        Unlike a reducer permanent failure
+        """A processor permanent failure: log it, drop just this chunk's
+        events (its file's other chunks carry on, so the file's results end
+        up with a hole), and return whether the whole run should abort, per
+        failure_proportion. Unlike a reducer permanent failure
         (_give_up_on_reduction), this does NOT unconditionally signal
         abort - the caller raises only when this returns True."""
-        url = chunk.url
-        self._failed_files.add(url)
+        self._failed_chunks.append(chunk)
+        self._failed_events += chunk.num_events
 
         if self._failure_log is not None:
             self._failure_log.log(
                 FailureRecord(
                     dataset_name=self.dataset_name,
-                    filename=url,
+                    filename=chunk.url,
+                    ranges=((chunk.start, chunk.stop),),
                     kind=TaskKind.PROCESSOR,
                     attempts=attempts,
                     resources_allocated=self._distributor.resources(TaskKind.PROCESSOR),
@@ -860,18 +832,7 @@ class Pipeline:
                 )
             )
 
-        # This file will never be pooled - release any sibling chunks of it
-        # already staged (partial progress, now moot) instead of leaking
-        # them at the distributor.
-        progress = self._files_in_progress.pop(url, None)
-        if progress is not None:
-            for item in progress.staged_items:
-                assert item.handle is not None
-                self._distributor.release_result(item.handle.result_id)
-        self._retry_chunks = [t for t in self._retry_chunks if t.chunk.url != url]
-
-        ratio = len(self._failed_files) / self._total_files
-        return ratio > self._failure_proportion
+        return self._failed_events > self._failure_proportion * self.events_total
 
     def _handle_reduce_resource_exhaustion(
         self, task: _ReduceTask, outcome: ResourceExhaustion
@@ -966,7 +927,7 @@ class Pipeline:
             num_events=sum(item.num_events for item in group),
             wall_time_s=sum(item.wall_time_s for item in group) + wall_time_s,
             memory_mb=sum(item.memory_mb for item in group) + memory_mb,
-            files=frozenset().union(*(item.files for item in group)),
+            covers=union_coverage(item.covers for item in group),
             since_checkpoint_time=sum(item.since_checkpoint_time for item in group) + wall_time_s,
             since_checkpoint_distance=max(item.since_checkpoint_distance for item in group) + 1,
             inputs=group,
@@ -1003,19 +964,21 @@ class Pipeline:
         traceback: str | None,
     ) -> None:
         """A reducer permanent failure: log every file folded into the
-        failed group and release the group's own distributor-held results
-        (they will never be used again). Unlike a processor permanent
-        failure (_give_up_on_file), this never checks failure_proportion -
+        failed group, with the event ranges the group held of it, and
+        release the group's own distributor-held results (they will never be
+        used again). Unlike a processor permanent
+        failure (_give_up_on_chunk), this never checks failure_proportion -
         the caller always aborts the whole run right after this returns, since
         a partially-folded result can't be trusted not to be corrupted."""
         if self._failure_log is not None:
             allocated = self._distributor.resources(TaskKind.REDUCER)
-            files = frozenset().union(*(item.files for item in group))
-            for url in sorted(files):
+            covers = union_coverage(item.covers for item in group)
+            for url in sorted(covers):
                 self._failure_log.log(
                     FailureRecord(
                         dataset_name=self.dataset_name,
                         filename=url,
+                        ranges=covers[url],
                         kind=TaskKind.REDUCER,
                         attempts=attempts,
                         resources_allocated=allocated,
@@ -1167,7 +1130,7 @@ class Pipeline:
         row_id = self._db.record(
             processor=self.processor_name,
             dataset=self.dataset_name,
-            covers_files=new_item.files,
+            covers=new_item.covers,
             num_events=new_item.num_events,
             wall_time_s=new_item.wall_time_s,
             memory_mb=new_item.memory_mb,

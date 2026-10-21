@@ -15,6 +15,7 @@ def test_failure_log_creates_file_lazily(tmp_path):
         FailureRecord(
             dataset_name="ds",
             filename="a.root",
+            ranges=((0, 5),),
             kind="processor",
             attempts=1,
             resources_allocated=None,
@@ -33,6 +34,7 @@ def test_failure_log_appends_readable_blocks_in_order(tmp_path):
         FailureRecord(
             dataset_name="ds1",
             filename="a.root",
+            ranges=((0, 5),),
             kind="processor",
             attempts=3,
             resources_allocated={"cores": 1},
@@ -44,6 +46,7 @@ def test_failure_log_appends_readable_blocks_in_order(tmp_path):
         FailureRecord(
             dataset_name="ds1",
             filename="b.root",
+            ranges=((0, 2), (4, 6)),
             kind="reducer",
             attempts=1,
             resources_allocated=None,
@@ -53,7 +56,16 @@ def test_failure_log_appends_readable_blocks_in_order(tmp_path):
     )
 
     contents = open(path).read()
-    for expected in ("ds1", "a.root", "b.root", "processor", "reducer", "ValueError: boom"):
+    for expected in (
+        "ds1",
+        "a.root",
+        "b.root",
+        "[0:5]",
+        "[0:2] [4:6]",
+        "processor",
+        "reducer",
+        "ValueError: boom",
+    ):
         assert expected in contents
     # each record is its own block, appended in the order logged
     assert contents.index("a.root") < contents.index("b.root")

@@ -13,11 +13,13 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
+
+from .event_ranges import Coverage
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def checksum_dataset(dataset: dict[str, Any]) -> str:
@@ -35,8 +37,8 @@ class CheckpointRecord:
     id: row id (sqlite primary key).
     processor / dataset: the (processor, dataset) pair this checkpoint
         belongs to.
-    covers_files: dataset file URLs whose data this checkpoint's result
-        represents.
+    covers: the event ranges, per dataset file URL, whose data this
+        checkpoint's result represents - possibly only part of a file.
     num_events / wall_time_s / memory_mb: totals accumulated into this
         checkpoint's result.
     is_final: whether this is a final result (results_dir) or an
@@ -55,7 +57,7 @@ class CheckpointRecord:
     id: int
     processor: str
     dataset: str
-    covers_files: frozenset[str]
+    covers: Coverage
     num_events: int
     wall_time_s: float
     memory_mb: float
@@ -132,7 +134,9 @@ class CheckpointStore:
             CREATE TABLE checkpoint_files (
                 checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,
                 file_url      TEXT    NOT NULL,
-                PRIMARY KEY (checkpoint_id, file_url)
+                start         INTEGER NOT NULL,
+                stop          INTEGER NOT NULL,
+                PRIMARY KEY (checkpoint_id, file_url, start)
             )
             """)
         self._conn.execute("""
@@ -178,7 +182,7 @@ class CheckpointStore:
         *,
         processor: str,
         dataset: str,
-        covers_files: Iterable[str],
+        covers: Coverage,
         num_events: int,
         wall_time_s: float,
         memory_mb: float,
@@ -189,7 +193,6 @@ class CheckpointStore:
     ) -> int:
         """Insert this checkpoint and delete the rows it supersedes, in ONE
         transaction. Returns the new row id."""
-        covers_files = sorted(covers_files)
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO checkpoints"
@@ -209,8 +212,13 @@ class CheckpointStore:
             )
             row_id = cur.lastrowid
             self._conn.executemany(
-                "INSERT INTO checkpoint_files (checkpoint_id, file_url) VALUES (?, ?)",
-                [(row_id, file_url) for file_url in covers_files],
+                "INSERT INTO checkpoint_files (checkpoint_id, file_url, start, stop)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (row_id, file_url, start, stop)
+                    for file_url, ranges in covers.items()
+                    for start, stop in ranges
+                ],
             )
             for superseded_id in supersedes:
                 # ON DELETE CASCADE clears the matching checkpoint_files rows too.
@@ -229,14 +237,19 @@ class CheckpointStore:
         return [self._record_from_row(row) for row in rows]
 
     def _record_from_row(self, row: sqlite3.Row) -> CheckpointRecord:
-        files = self._conn.execute(
-            "SELECT file_url FROM checkpoint_files WHERE checkpoint_id = ?", (row["id"],)
+        ranges = self._conn.execute(
+            "SELECT file_url, start, stop FROM checkpoint_files"
+            " WHERE checkpoint_id = ? ORDER BY file_url, start",
+            (row["id"],),
         ).fetchall()
+        covers: dict[str, list[tuple[int, int]]] = {}
+        for r in ranges:
+            covers.setdefault(r["file_url"], []).append((r["start"], r["stop"]))
         return CheckpointRecord(
             id=row["id"],
             processor=row["processor"],
             dataset=row["dataset"],
-            covers_files=frozenset(f["file_url"] for f in files),
+            covers={url: tuple(pairs) for url, pairs in covers.items()},
             num_events=row["num_events"],
             wall_time_s=row["wall_time_s"],
             memory_mb=row["memory_mb"],

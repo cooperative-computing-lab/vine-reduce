@@ -303,7 +303,7 @@ def test_restart_skips_already_finalized_dataset(tmp_path, dataset_input, distri
     db.record(
         processor="count",
         dataset="numbers",
-        covers_files=["a.root", "b.root"],
+        covers={"a.root": ((0, 7),), "b.root": ((0, 3),)},
         num_events=10,
         wall_time_s=1.0,
         memory_mb=1.0,
@@ -350,7 +350,7 @@ def test_dataset_change_deletes_the_stale_final_result_file(tmp_path, dataset_in
     db.record(
         processor="count",
         dataset="numbers",
-        covers_files=["a.root", "b.root"],
+        covers={"a.root": ((0, 7),), "b.root": ((0, 3),)},
         num_events=10,
         wall_time_s=1.0,
         memory_mb=1.0,

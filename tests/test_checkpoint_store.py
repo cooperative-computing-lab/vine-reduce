@@ -14,7 +14,7 @@ def test_record_and_checkpoints_for_round_trip(tmp_path):
     row_id = store.record(
         processor="proc",
         dataset="ds",
-        covers_files=["a.root"],
+        covers={"a.root": ((0, 4), (6, 10)), "b.root": ((0, 3),)},
         num_events=10,
         wall_time_s=1.5,
         memory_mb=2.5,
@@ -28,7 +28,7 @@ def test_record_and_checkpoints_for_round_trip(tmp_path):
     assert row.id == row_id
     assert row.processor == "proc"
     assert row.dataset == "ds"
-    assert row.covers_files == frozenset({"a.root"})
+    assert row.covers == {"a.root": ((0, 4), (6, 10)), "b.root": ((0, 3),)}
     assert row.num_events == 10
     assert row.wall_time_s == 1.5
     assert row.memory_mb == 2.5
@@ -44,7 +44,7 @@ def test_record_supersedes_deletes_old_rows_and_cascades_files(tmp_path):
     old_id = store.record(
         processor="proc",
         dataset="ds",
-        covers_files=["a.root"],
+        covers={"a.root": ((0, 5),)},
         num_events=5,
         wall_time_s=1.0,
         memory_mb=1.0,
@@ -55,7 +55,7 @@ def test_record_supersedes_deletes_old_rows_and_cascades_files(tmp_path):
     new_id = store.record(
         processor="proc",
         dataset="ds",
-        covers_files=["a.root", "b.root"],
+        covers={"a.root": ((0, 5),), "b.root": ((0, 5),)},
         num_events=10,
         wall_time_s=2.0,
         memory_mb=2.0,
@@ -80,7 +80,7 @@ def test_record_is_atomic_when_insert_fails(tmp_path):
     old_id = store.record(
         processor="proc",
         dataset="ds",
-        covers_files=["a.root"],
+        covers={"a.root": ((0, 5),)},
         num_events=5,
         wall_time_s=1.0,
         memory_mb=1.0,
@@ -92,7 +92,7 @@ def test_record_is_atomic_when_insert_fails(tmp_path):
         store.record(
             processor="proc",
             dataset="ds",
-            covers_files=["a.root", "b.root"],
+            covers={"a.root": ((0, 5),), "b.root": ((0, 5),)},
             num_events=10,
             wall_time_s=2.0,
             memory_mb=2.0,
@@ -127,7 +127,7 @@ def test_reset_if_dataset_changed_wipes_checkpoints_for_that_dataset_only(tmp_pa
     store.record(
         processor="proc",
         dataset="ds1",
-        covers_files=["a.root"],
+        covers={"a.root": ((0, 5),)},
         num_events=10,
         wall_time_s=1.0,
         memory_mb=1.0,
@@ -137,7 +137,7 @@ def test_reset_if_dataset_changed_wipes_checkpoints_for_that_dataset_only(tmp_pa
     store.record(
         processor="proc",
         dataset="ds2",
-        covers_files=["b.root"],
+        covers={"b.root": ((0, 5),)},
         num_events=10,
         wall_time_s=1.0,
         memory_mb=1.0,
