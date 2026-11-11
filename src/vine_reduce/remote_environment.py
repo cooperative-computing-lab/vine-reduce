@@ -48,17 +48,23 @@ class UnstagedChanges(Exception):
 
 
 def _current_conda_package_versions(conda_env_path: str | None = None) -> dict[str, str]:
-    conda_env_path = conda_env_path or os.environ.get("CONDA_PREFIX")
+    """name -> "name=version=build" for every package in the environment: conda packages from
+    its conda-meta records, pip packages from its site-packages. Read directly rather than via
+    `conda list`, so it needs no `conda` executable (pixi envs have none, and `pixi run` drops
+    conda from PATH)."""
+    prefix = Path(conda_env_path or os.environ.get("CONDA_PREFIX") or sys.prefix)
 
-    cmd = ["conda", "list", "--export", "--json"]
-    if conda_env_path:
-        cmd += ["--prefix", conda_env_path]
-    proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
-    raw_pkgs = json.loads(proc.stdout.decode())
+    versions = {}
+    for record in (prefix / "conda-meta").glob("*.json"):
+        pkg = json.loads(record.read_text())
+        versions[pkg["name"]] = f"{pkg['name']}={pkg['version']}={pkg['build']}"
 
-    return {
-        pkg["name"]: f"{pkg['name']}={pkg['version']}={pkg['build_string']}" for pkg in raw_pkgs
-    }
+    site_packages = glob.glob(str(prefix / "lib" / "python*" / "site-packages"))
+    for dist in importlib.metadata.distributions(path=site_packages):
+        name = f"pypi:{dist.metadata['Name']}"
+        versions[name] = f"{name}={dist.version}"
+
+    return versions
 
 
 def _environment_state_hash(conda_env_path: str) -> str:
